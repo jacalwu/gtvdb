@@ -21,13 +21,15 @@
 
 ```text
 crates/
-├── gtv-core/   # Arrow RecordBatch primitives, Temporal-CSR graph, memory layouts
-├── gtv-array/  # kdb+-style vectorized array ops (asof / mavg / msum / deltas)
-├── gtv-engine/ # DataFusion integration: GtvContext, WindowUDFs, table functions
-└── gtv-cli/    # interactive SQL REPL (bin: gtv)
+├── gtv-core/    # Arrow RecordBatch primitives, Temporal-CSR graph, memory layouts
+├── gtv-array/   # kdb+-style vectorized array ops (asof / mavg / msum / deltas)
+├── gtv-engine/  # DataFusion integration: GtvContext, WindowUDFs, table functions
+├── gtv-index/   # vector search: FlatIndex (exact) + HnswIndex (approx, bitmask pruning)
+├── gtv-storage/ # Arrow ↔ Parquet + SnapshotStore (multi-version time-travel)
+└── gtv-cli/     # interactive SQL REPL (bin: gtv)
 ```
 
-Planned (P3–P5): HNSW vector index, Parquet/LSM storage tiering, and WASM UDF sandbox.
+Planned (P4–P5): WASM UDF sandbox and LSM delta storage tiering.
 
 ---
 
@@ -53,4 +55,13 @@ SELECT * FROM neighbors(0, 100);
 
 -- as-of join against the price series
 SELECT * FROM asof_join(0, 5, 15, 25, 35, 45, 55, 60);
+```
+
+Beyond SQL there are also shell commands:
+
+```text
+knn <node> [k] [--mask a,b,c]  HNSW K-NN vector search (with optional bitmask filter)
+save <table> <path>            write a table to Parquet
+load <table> <path>            load a Parquet file as a new table
+tt <table> <T>                 time-travel: read the snapshot at or before T
 ```

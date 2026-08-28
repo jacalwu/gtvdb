@@ -9,6 +9,7 @@ license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 arrow = { version = "59", features = ["prettyprint"] }
+parquet = { version = "59", features = ["arrow"] }
 datafusion = "55"
 thiserror = "2"
 anyhow = "1"

@@ -26,13 +26,15 @@
 
 ```text
 crates/
-├── gtv-core/   # Arrow 記憶體佈局與 Temporal-CSR（主體）
-├── gtv-array/  # kdb+ 風格向量化陣列算子（asof / mavg / msum / deltas）
-├── gtv-engine/ # DataFusion 整合：GtvContext、WindowUDF、table function
-└── gtv-cli/    # 互動式 SQL REPL（bin: gtv）
+├── gtv-core/    # Arrow 記憶體佈局與 Temporal-CSR（主體）
+├── gtv-array/   # kdb+ 風格向量化陣列算子（asof / mavg / msum / deltas）
+├── gtv-engine/  # DataFusion 整合：GtvContext、WindowUDF、table function
+├── gtv-index/   # 向量檢索：FlatIndex（精確）+ HnswIndex（近似，bitmask 剪枝）
+├── gtv-storage/ # Arrow ↔ Parquet + SnapshotStore（time-travel 多版本）
+└── gtv-cli/     # 互動式 SQL REPL（bin: gtv）
 ```
 
-後續（P3–P5）：HNSW 向量索引、Parquet/LSM 分層、WASM UDF 沙盒。
+後續（P4–P5）：WASM UDF 沙盒、LSM Delta 分層。
 
 ---
 
@@ -57,4 +59,13 @@ SELECT * FROM neighbors(0, 100);
 
 -- as-of join 對齊價格序列
 SELECT * FROM asof_join(0, 5, 15, 25, 35, 45, 55, 60);
+```
+
+除 SQL 之外亦有 shell 指令：
+
+```text
+knn <node> [k] [--mask a,b,c]  HNSW K-NN 向量檢索（可加 bitmask 過濾）
+save <table> <path>            將表寫成 Parquet
+load <table> <path>            載入 Parquet 成為新表
+tt <table> <T>                 time-travel：讀取 T 時間點（或之前）嘅快照
 ```

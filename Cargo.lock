@@ -1619,6 +1619,8 @@ dependencies = [
  "gtv-array",
  "gtv-core",
  "gtv-engine",
+ "gtv-index",
+ "gtv-storage",
  "rustyline",
  "tokio",
 ]
@@ -1639,6 +1641,24 @@ dependencies = [
  "datafusion",
  "gtv-array",
  "gtv-core",
+ "thiserror",
+]
+
+[[package]]
+name = "gtv-index"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "gtv-core",
+ "thiserror",
+]
+
+[[package]]
+name = "gtv-storage"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "parquet",
  "thiserror",
 ]
 

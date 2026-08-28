@@ -1,0 +1,10 @@
+[package]
+name = "gtv-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+arrow.workspace = true
+parquet.workspace = true
+thiserror.workspace = true

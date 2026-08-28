@@ -7,15 +7,19 @@
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
-use arrow::array::{ArrayRef, Float64Array, Int64Array, RecordBatch, UInt64Array};
-use arrow::compute::cast;
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::array::{
+    ArrayRef, BooleanArray, Float64Array, Int64Array, RecordBatch, UInt64Array,
+};
+use arrow::compute::{cast, filter_record_batch};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::util::pretty::print_batches;
 use rustyline::DefaultEditor;
 
 use gtv_array::{asof, window};
-use gtv_core::{EdgeTable, NodeTable, TemporalGraph};
+use gtv_core::{EdgeTable, NodeTable, TemporalGraph, VectorIndex};
 use gtv_engine::GtvContext;
+use gtv_index::HnswIndex;
+use gtv_storage::{parquet, SnapshotStore};
 
 const DEFAULT_T: i64 = 0;
 
@@ -28,6 +32,12 @@ struct Demo {
     graph: TemporalGraph,
     times: Vec<i64>,
     prices: Vec<f64>,
+    /// Per-node embeddings (one row per node, aligned with node id).
+    embeddings: Vec<Vec<f32>>,
+    /// Approximate K-NN index over the embeddings.
+    hnsw: HnswIndex,
+    /// Time-travel store seeded with point-in-time edge snapshots.
+    store: SnapshotStore,
 }
 
 #[tokio::main]
@@ -86,12 +96,35 @@ fn build_demo() -> Result<Demo> {
         vec![100, 200, 100, 300, 300, 400],
     )?;
 
-    let graph = TemporalGraph::new(nodes, edges)?;
+    let graph = TemporalGraph::new(nodes, edges.clone())?;
+
+    // Deterministic 4-dim node embeddings (aligned with node id 0..5).
+    let embeddings: Vec<Vec<f32>> = (0..6u64)
+        .map(|i| {
+            vec![
+                (i & 1) as f32,
+                ((i >> 1) & 1) as f32,
+                ((i >> 2) & 1) as f32,
+                0.0,
+            ]
+        })
+        .collect();
+    let ids: Vec<u64> = (0..6).collect();
+    let hnsw = HnswIndex::build(ids, embeddings.clone(), 4, 16, 16)?;
+
+    // Seed the time-travel store with point-in-time edge snapshots.
+    let mut store = SnapshotStore::new();
+    for t in [0i64, 100, 200] {
+        store.insert("edges", t, vec![edges_active_at(&edges, t)])?;
+    }
 
     Ok(Demo {
         graph,
         times: vec![0, 10, 20, 30, 40, 50],
         prices: vec![100.0, 101.0, 99.0, 102.0, 103.0, 104.0],
+        embeddings,
+        hnsw,
+        store,
     })
 }
 
@@ -103,16 +136,28 @@ fn register_tables(ctx: &GtvContext, demo: &Demo) -> Result<()> {
     )?;
     // Expose temporal columns as Int64 nanoseconds so SQL slicing is ergonomic
     // (kdb convention: raw timestamp counts), rather than the Arrow Timestamp type.
-    let edges = demo.graph.edges();
-    let edge_schema = Arc::new(Schema::new(vec![
+    let (edge_schema, edges_batch) = edges_int64_batch(demo.graph.edges())?;
+    ctx.register_batches("edges", edge_schema, vec![edges_batch])?;
+
+    let (price_schema, price_batch) = prices_batch(&demo.times, &demo.prices)?;
+    ctx.register_batches("prices", price_schema, vec![price_batch])?;
+
+    ctx.register_neighbors(demo.graph.csr());
+    ctx.register_asof_join(demo.times.clone(), demo.prices.clone());
+    Ok(())
+}
+
+/// Edge table with temporal columns as `Int64` nanoseconds (ergonomic for SQL).
+fn edges_int64_batch(edges: &EdgeTable) -> Result<(SchemaRef, RecordBatch)> {
+    let schema = Arc::new(Schema::new(vec![
         Field::new("src", DataType::UInt64, false),
         Field::new("dst", DataType::UInt64, false),
         Field::new("edge_type", DataType::UInt16, false),
         Field::new("valid_from", DataType::Int64, false),
         Field::new("valid_to", DataType::Int64, false),
     ]));
-    let edges_batch = RecordBatch::try_new(
-        edge_schema.clone(),
+    let batch = RecordBatch::try_new(
+        schema.clone(),
         vec![
             Arc::new(edges.src().clone()) as ArrayRef,
             Arc::new(edges.dst().clone()) as ArrayRef,
@@ -121,24 +166,63 @@ fn register_tables(ctx: &GtvContext, demo: &Demo) -> Result<()> {
             cast(edges.valid_to(), &DataType::Int64)?,
         ],
     )?;
-    ctx.register_batches("edges", edge_schema, vec![edges_batch])?;
+    Ok((schema, batch))
+}
 
-    let price_schema = Arc::new(Schema::new(vec![
+/// Price series as a two-column `(t, price)` batch.
+fn prices_batch(times: &[i64], prices: &[f64]) -> Result<(SchemaRef, RecordBatch)> {
+    let schema = Arc::new(Schema::new(vec![
         Field::new("t", DataType::Int64, false),
         Field::new("price", DataType::Float64, false),
     ]));
-    let price_batch = RecordBatch::try_new(
-        price_schema.clone(),
+    let batch = RecordBatch::try_new(
+        schema.clone(),
         vec![
-            Arc::new(Int64Array::from(demo.times.clone())) as ArrayRef,
-            Arc::new(Float64Array::from(demo.prices.clone())) as ArrayRef,
+            Arc::new(Int64Array::from(times.to_vec())) as ArrayRef,
+            Arc::new(Float64Array::from(prices.to_vec())) as ArrayRef,
         ],
     )?;
-    ctx.register_batches("prices", price_schema, vec![price_batch])?;
+    Ok((schema, batch))
+}
 
-    ctx.register_neighbors(demo.graph.csr());
-    ctx.register_asof_join(demo.times.clone(), demo.prices.clone());
-    Ok(())
+/// The subset of edges active at time `t` (`valid_from <= t < valid_to`).
+fn edges_active_at(edges: &EdgeTable, t: i64) -> RecordBatch {
+    let mask: BooleanArray = (0..edges.len())
+        .map(|i| {
+            let from = edges.valid_from().value(i);
+            let to = edges.valid_to().value(i);
+            from <= t && t < to
+        })
+        .collect();
+    filter_record_batch(edges.batch(), &mask).expect("filter preserves schema")
+}
+
+/// Fetch a demo table by name (for `save`).
+fn demo_batch(demo: &Demo, name: &str) -> Result<RecordBatch> {
+    match name {
+        "nodes" => Ok(demo.graph.nodes().batch().clone()),
+        "edges" => Ok(edges_int64_batch(demo.graph.edges())?.1),
+        "prices" => Ok(prices_batch(&demo.times, &demo.prices)?.1),
+        _ => Err(anyhow!("unknown table `{name}` (try nodes|edges|prices)")),
+    }
+}
+
+/// Parse an optional `--mask a,b,c` flag into allowed node ids, if present.
+fn parse_mask(tokens: &[&str]) -> Result<Option<Vec<u64>>> {
+    let Some(pos) = tokens.iter().position(|&t| t == "--mask") else {
+        return Ok(None);
+    };
+    let raw = tokens
+        .get(pos + 1)
+        .ok_or_else(|| anyhow!("usage: knn <node> [k] [--mask a,b,c]"))?;
+    raw.split(',')
+        .map(|s| {
+            s.trim()
+                .parse::<u64>()
+                .map_err(|_| anyhow!("invalid mask id `{s}`"))
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(Some)
 }
 
 async fn run(demo: &Demo, ctx: &GtvContext, line: &str) -> Result<Action> {
@@ -182,6 +266,52 @@ async fn run(demo: &Demo, ctx: &GtvContext, line: &str) -> Result<Action> {
             let left = parse_left_times(&tokens[1..])?;
             let got = asof::asof_join_f64(&left, &demo.times, &demo.prices);
             print_asof(&left, &got);
+        }
+        "knn" => {
+            let node = require_arg(&tokens, 1, "knn <node> [k] [--mask a,b,c]")?.parse::<u64>()?;
+            let k = optional_arg(&tokens, 2)
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(3);
+            let mask_ids = parse_mask(&tokens)?;
+            let query = demo
+                .embeddings
+                .get(node as usize)
+                .cloned()
+                .ok_or_else(|| anyhow!("node {node} out of range"))?;
+            let mask = mask_ids.as_ref().map(|allowed| {
+                BooleanArray::from(
+                    (0..demo.embeddings.len())
+                        .map(|i| allowed.contains(&(i as u64)))
+                        .collect::<Vec<bool>>(),
+                )
+            });
+            let got = demo.hnsw.search_knn(&query, k, mask.as_ref())?;
+            println!("knn(node {node}, k={k}) = {:?}", got.values().as_ref());
+        }
+        "save" => {
+            let table = require_arg(&tokens, 1, "save <table> <path>")?;
+            let path = require_arg(&tokens, 2, "save <table> <path>")?;
+            let batch = demo_batch(demo, table)?;
+            parquet::write_batch(path, &batch)?;
+            println!("wrote `{table}` ({} rows) -> {path}", batch.num_rows());
+        }
+        "load" => {
+            let table = require_arg(&tokens, 1, "load <table> <path>")?;
+            let path = require_arg(&tokens, 2, "load <table> <path>")?;
+            let batches = parquet::read_batches(path)?;
+            let Some(first) = batches.first() else {
+                return Err(anyhow!("`{path}` contains no batches"));
+            };
+            ctx.register_batches(table, first.schema(), batches)?;
+            println!("loaded `{table}` from {path}");
+        }
+        "tt" => {
+            let table = require_arg(&tokens, 1, "tt <table> <T>")?;
+            let t = require_arg(&tokens, 2, "tt <table> <T>")?.parse::<i64>()?;
+            let batches = demo.store.as_of(table, t)?;
+            let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            println!("{table} as-of T={t} ({rows} rows):");
+            let _ = print_batches(&batches);
         }
         "quit" | "exit" => return Ok(Action::Quit),
         "sql" => {
@@ -247,6 +377,10 @@ fn print_help() {
          \x20 mavg <n> / msum <n>   rolling average/sum over the price series\n\
          \x20 deltas                successive differences\n\
          \x20 asof [t ...]          as-of join against the price series\n\
+         \x20 knn <node> [k] [--mask a,b,c]  HNSW K-NN over node embeddings\n\
+         \x20 save <table> <path>   write a table to a Parquet file\n\
+         \x20 load <table> <path>   load a Parquet file as a table\n\
+         \x20 tt <table> <T>        time-travel: table snapshot as-of T\n\
          \x20 quit | exit\n\
          \n\
          SQL: any other input is executed as SQL over the `nodes`, `edges` and\n\

@@ -1,0 +1,10 @@
+[package]
+name = "gtv-index"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+arrow.workspace = true
+thiserror.workspace = true
+gtv-core = { path = "../gtv-core" }
