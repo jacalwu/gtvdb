@@ -137,6 +137,7 @@ fn register_tables(ctx: &GtvContext, demo: &Demo) -> Result<()> {
     ctx.register_batches("prices", price_schema, vec![price_batch])?;
 
     ctx.register_neighbors(demo.graph.csr());
+    ctx.register_asof_join(demo.times.clone(), demo.prices.clone());
     Ok(())
 }
 
@@ -253,7 +254,8 @@ fn print_help() {
          \x20 SELECT src, dst FROM edges WHERE valid_from <= 150 AND 150 < valid_to;\n\
          \x20 SELECT t, mavg(price, 3) OVER (ORDER BY t) FROM prices;\n\
          \x20 SELECT t, msum(price, 2) OVER (ORDER BY t), deltas(price) OVER (ORDER BY t) FROM prices;\n\
-         \x20 SELECT * FROM neighbors(0, 100);"
+         \x20 SELECT * FROM neighbors(0, 100);\n\
+         \x20 SELECT * FROM asof_join(0, 5, 15, 25, 35, 45, 55, 60);"
     );
 }
 

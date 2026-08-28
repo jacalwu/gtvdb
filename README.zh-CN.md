@@ -25,9 +25,36 @@
 ### 架構全貌（武器零件圖）
 
 ```text
-gtvdb/
-├── gtvdb-core/       # Arrow 記憶體佈局與 Temporal-CSR（主體）
-├── gtvdb-query/      # DataFusion 查詢優化器（開關）
-├── gtvdb-index/      # HNSW 向量與時序索引（瞄準器）
-├── gtvdb-storage/    # LSM Dynamic Delta & Parquet/Lance 分層（彈藥庫）
-└── gtvdb-plugin/     # WASM 零拷貝 UDF 沙盒（附加配件）
+crates/
+├── gtv-core/   # Arrow 記憶體佈局與 Temporal-CSR（主體）
+├── gtv-array/  # kdb+ 風格向量化陣列算子（asof / mavg / msum / deltas）
+├── gtv-engine/ # DataFusion 整合：GtvContext、WindowUDF、table function
+└── gtv-cli/    # 互動式 SQL REPL（bin: gtv）
+```
+
+後續（P3–P5）：HNSW 向量索引、Parquet/LSM 分層、WASM UDF 沙盒。
+
+---
+
+### SQL REPL（撳個掣即用）
+
+```sh
+cargo run -p gtv-cli --bin gtv
+```
+
+直接打 SQL 查 demo 表（`nodes`、`edges`、`prices`）；時間欄位係 `Int64` 奈秒，
+邊嘅有效期係半開區間 `[valid_from, valid_to)`。
+
+```sql
+-- 時序切片：T = 150 仍生效嘅邊
+SELECT src, dst FROM edges WHERE valid_from <= 150 AND 150 < valid_to;
+
+-- kdb+ 風格窗口函數
+SELECT t, mavg(price, 3) OVER (ORDER BY t) FROM prices;
+
+-- 時序圖走訪
+SELECT * FROM neighbors(0, 100);
+
+-- as-of join 對齊價格序列
+SELECT * FROM asof_join(0, 5, 15, 25, 35, 45, 55, 60);
+```

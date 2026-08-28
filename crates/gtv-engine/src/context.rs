@@ -53,6 +53,18 @@ impl GtvContext {
             Arc::new(crate::graph::NeighborsTableFunction::new(csr)),
         );
     }
+
+    /// Register the `asof_join(t0, t1, ...)` table function against a
+    /// right-side time series (times + values, equally long).
+    pub fn register_asof_join(&self, right_times: Vec<i64>, right_values: Vec<f64>) {
+        self.ctx.register_udtf(
+            "asof_join",
+            Arc::new(crate::asof::AsofJoinTableFunction::new(
+                right_times,
+                right_values,
+            )),
+        );
+    }
 }
 
 impl Default for GtvContext {

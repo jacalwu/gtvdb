@@ -20,9 +20,37 @@
 ## Architecture Overview
 
 ```text
-gtvdb/
-├── gtvdb-core/       # Arrow RecordBatch primitives, Temporal-CSR, memory layouts
-├── gtvdb-query/      # DataFusion execution extensions, custom logical/physical plans
-├── gtvdb-index/      # Pluggable HNSW vector index & temporal index implementations
-├── gtvdb-storage/    # LSM dynamic delta buffer, Parquet/Lance tiering, WAL recovery
-└── gtvdb-plugin/     # Wasmtime runtime for sandboxed Zero-Copy UDF execution
+crates/
+├── gtv-core/   # Arrow RecordBatch primitives, Temporal-CSR graph, memory layouts
+├── gtv-array/  # kdb+-style vectorized array ops (asof / mavg / msum / deltas)
+├── gtv-engine/ # DataFusion integration: GtvContext, WindowUDFs, table functions
+└── gtv-cli/    # interactive SQL REPL (bin: gtv)
+```
+
+Planned (P3–P5): HNSW vector index, Parquet/LSM storage tiering, and WASM UDF sandbox.
+
+---
+
+## Quick Start (SQL REPL)
+
+```sh
+cargo run -p gtv-cli --bin gtv
+```
+
+Type SQL over the demo tables (`nodes`, `edges`, `prices`); temporal columns are
+`Int64` nanoseconds and edge validity is the half-open interval
+`[valid_from, valid_to)`.
+
+```sql
+-- temporal slice: edges active at T = 150
+SELECT src, dst FROM edges WHERE valid_from <= 150 AND 150 < valid_to;
+
+-- kdb+-style window functions
+SELECT t, mavg(price, 3) OVER (ORDER BY t) FROM prices;
+
+-- temporal graph traversal
+SELECT * FROM neighbors(0, 100);
+
+-- as-of join against the price series
+SELECT * FROM asof_join(0, 5, 15, 25, 35, 45, 55, 60);
+```

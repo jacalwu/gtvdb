@@ -11,9 +11,9 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::catalog::{TableFunctionArgs, TableFunctionImpl};
 use datafusion::datasource::{MemTable, TableProvider};
 use datafusion::error::{DataFusionError, Result};
-use datafusion::logical_expr::Expr;
-use datafusion::scalar::ScalarValue;
 use gtv_core::TemporalCSR;
+
+use crate::expr_util::{expr_to_i64, expr_to_u64};
 
 /// Table function over a snapshot of the temporal CSR.
 #[derive(Debug)]
@@ -82,33 +82,5 @@ impl TableFunctionImpl for NeighborsTableFunction {
         )?;
 
         Ok(Arc::new(MemTable::try_new(Self::schema(), vec![vec![batch]])?))
-    }
-}
-
-fn expr_to_u64(expr: &Expr) -> Result<u64> {
-    match expr {
-        Expr::Literal(sv, _) => match sv.clone().cast_to(&DataType::UInt64)? {
-            ScalarValue::UInt64(Some(v)) => Ok(v),
-            other => Err(DataFusionError::Execution(format!(
-                "neighbors(): expected an integer, got {other:?}"
-            ))),
-        },
-        _ => Err(DataFusionError::Execution(
-            "neighbors(): arguments must be literals".into(),
-        )),
-    }
-}
-
-fn expr_to_i64(expr: &Expr) -> Result<i64> {
-    match expr {
-        Expr::Literal(sv, _) => match sv.clone().cast_to(&DataType::Int64)? {
-            ScalarValue::Int64(Some(v)) => Ok(v),
-            other => Err(DataFusionError::Execution(format!(
-                "neighbors(): expected an integer, got {other:?}"
-            ))),
-        },
-        _ => Err(DataFusionError::Execution(
-            "neighbors(): arguments must be literals".into(),
-        )),
     }
 }
