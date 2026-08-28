@@ -1,18 +1,21 @@
 //! `gtv` — interactive REPL for the Temporal-Columnar Graph-Vector engine.
 //!
-//! Phase 1 exposes the in-memory primitives through a small command language.
-//! Phase 2 will layer a full SQL REPL on top of DataFusion.
+//! Phase 1 exposed the in-memory primitives through a small command language.
+//! Phase 2 layers a SQL REPL (DataFusion) on top: any input that is not a
+//! built-in command is executed as SQL.
 
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
-use arrow::array::{ArrayRef, Float64Array, RecordBatch, UInt64Array};
+use arrow::array::{ArrayRef, Float64Array, Int64Array, RecordBatch, UInt64Array};
+use arrow::compute::cast;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::util::pretty::print_batches;
 use rustyline::DefaultEditor;
 
 use gtv_array::{asof, window};
 use gtv_core::{EdgeTable, NodeTable, TemporalGraph};
+use gtv_engine::GtvContext;
 
 const DEFAULT_T: i64 = 0;
 
@@ -27,10 +30,14 @@ struct Demo {
     prices: Vec<f64>,
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let demo = build_demo()?;
+    let ctx = GtvContext::new();
+    register_tables(&ctx, &demo)?;
+
     let mut rl = DefaultEditor::new()?;
-    println!("gtv — temporal graph/array shell (in-memory MVP). Type `help` for commands.");
+    println!("gtv — temporal graph/array shell (SQL enabled). Type `help` for commands.");
     loop {
         match rl.readline("gtv> ") {
             Ok(line) => {
@@ -39,7 +46,7 @@ fn main() -> Result<()> {
                     continue;
                 }
                 let _ = rl.add_history_entry(&line);
-                match run(&demo, &line) {
+                match run(&demo, &ctx, &line).await {
                     Ok(Action::Continue) => {}
                     Ok(Action::Quit) => break,
                     Err(e) => eprintln!("error: {e:#}"),
@@ -88,7 +95,52 @@ fn build_demo() -> Result<Demo> {
     })
 }
 
-fn run(demo: &Demo, line: &str) -> Result<Action> {
+fn register_tables(ctx: &GtvContext, demo: &Demo) -> Result<()> {
+    ctx.register_batches(
+        "nodes",
+        demo.graph.nodes().batch().schema(),
+        vec![demo.graph.nodes().batch().clone()],
+    )?;
+    // Expose temporal columns as Int64 nanoseconds so SQL slicing is ergonomic
+    // (kdb convention: raw timestamp counts), rather than the Arrow Timestamp type.
+    let edges = demo.graph.edges();
+    let edge_schema = Arc::new(Schema::new(vec![
+        Field::new("src", DataType::UInt64, false),
+        Field::new("dst", DataType::UInt64, false),
+        Field::new("edge_type", DataType::UInt16, false),
+        Field::new("valid_from", DataType::Int64, false),
+        Field::new("valid_to", DataType::Int64, false),
+    ]));
+    let edges_batch = RecordBatch::try_new(
+        edge_schema.clone(),
+        vec![
+            Arc::new(edges.src().clone()) as ArrayRef,
+            Arc::new(edges.dst().clone()) as ArrayRef,
+            Arc::new(edges.edge_type().clone()) as ArrayRef,
+            cast(edges.valid_from(), &DataType::Int64)?,
+            cast(edges.valid_to(), &DataType::Int64)?,
+        ],
+    )?;
+    ctx.register_batches("edges", edge_schema, vec![edges_batch])?;
+
+    let price_schema = Arc::new(Schema::new(vec![
+        Field::new("t", DataType::Int64, false),
+        Field::new("price", DataType::Float64, false),
+    ]));
+    let price_batch = RecordBatch::try_new(
+        price_schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(demo.times.clone())) as ArrayRef,
+            Arc::new(Float64Array::from(demo.prices.clone())) as ArrayRef,
+        ],
+    )?;
+    ctx.register_batches("prices", price_schema, vec![price_batch])?;
+
+    ctx.register_neighbors(demo.graph.csr());
+    Ok(())
+}
+
+async fn run(demo: &Demo, ctx: &GtvContext, line: &str) -> Result<Action> {
     let tokens: Vec<&str> = line.split_whitespace().collect();
     let Some(cmd) = tokens.first().copied() else {
         return Ok(Action::Continue);
@@ -131,17 +183,37 @@ fn run(demo: &Demo, line: &str) -> Result<Action> {
             print_asof(&left, &got);
         }
         "quit" | "exit" => return Ok(Action::Quit),
-        "" => {}
-        other => eprintln!("unknown command `{other}`; type `help`"),
+        "sql" => {
+            let q = line.get(3..).unwrap_or("").trim();
+            run_sql(ctx, q).await?;
+        }
+        _ => {
+            // Any other input is executed as SQL.
+            run_sql(ctx, line).await?;
+        }
     }
     Ok(Action::Continue)
+}
+
+async fn run_sql(ctx: &GtvContext, query: &str) -> Result<()> {
+    if query.trim().is_empty() {
+        eprintln!("usage: `sql <query>`, or type a query directly (e.g. `SELECT * FROM prices`)");
+        return Ok(());
+    }
+    let batches = ctx.sql(query).await?;
+    if !batches.is_empty() {
+        let _ = print_batches(&batches);
+    }
+    Ok(())
 }
 
 fn parse_left_times(args: &[&str]) -> Result<Vec<i64>> {
     if args.is_empty() {
         return Ok(vec![0, 5, 15, 25, 35, 45, 55, 60]);
     }
-    args.iter().map(|s| s.parse::<i64>().map_err(|_| anyhow!("invalid time `{s}`"))).collect()
+    args.iter()
+        .map(|s| s.parse::<i64>().map_err(|_| anyhow!("invalid time `{s}`")))
+        .collect()
 }
 
 fn print_asof(left: &[i64], got: &[Option<f64>]) {
@@ -171,11 +243,17 @@ fn print_help() {
          \x20 tables                show node/edge tables and price series\n\
          \x20 neighbors <node> [T]  temporal neighbors at time T (default 0)\n\
          \x20 khop <node> <k> [T]   k-hop traversal at time T\n\
-         \x20 mavg <n>              moving average over the price series\n\
-         \x20 msum <n>              moving sum over the price series\n\
+         \x20 mavg <n> / msum <n>   rolling average/sum over the price series\n\
          \x20 deltas                successive differences\n\
          \x20 asof [t ...]          as-of join against the price series\n\
-         \x20 quit | exit"
+         \x20 quit | exit\n\
+         \n\
+         SQL: any other input is executed as SQL over the `nodes`, `edges` and\n\
+         `prices` tables. Temporal columns are Int64 nanoseconds.\n\
+         \x20 SELECT src, dst FROM edges WHERE valid_from <= 150 AND 150 < valid_to;\n\
+         \x20 SELECT t, mavg(price, 3) OVER (ORDER BY t) FROM prices;\n\
+         \x20 SELECT t, msum(price, 2) OVER (ORDER BY t), deltas(price) OVER (ORDER BY t) FROM prices;\n\
+         \x20 SELECT * FROM neighbors(0, 100);"
     );
 }
 
