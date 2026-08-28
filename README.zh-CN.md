@@ -16,14 +16,16 @@ Columnar (Apache Arrow + DataFusion)：火藥加毒藥！全 Zero-Copy 記憶體
 
 「每樣嘢單獨拎出嚟都已經獨當一面，但係集合埋喺同一個引擎裡面，問你死未？！」
 
+
 架構全貌（武器零件圖）
 Plaintext
 gtvdb/
-├── gtvdb-core/       # Arrow 記憶體佈局與 Temporal-CSR（主體）
-├── gtvdb-query/      # DataFusion 查詢優化器（開關）
-├── gtvdb-index/      # HNSW 向量與時序索引（瞄準器）
-├── gtvdb-storage/    # LSM Dynamic Delta & Parquet 分層（彈藥庫）
-└── gtvdb-plugin/     # WASM 零拷貝 UDF 沙盒（附加配件）
+    ├── gtvdb-core/       # Arrow 記憶體佈局與 Temporal-CSR（主體）
+    ├── gtvdb-query/      # DataFusion 查詢優化器（開關）
+    ├── gtvdb-index/      # HNSW 向量與時序索引（瞄準器）
+    ├── gtvdb-storage/    # LSM Dynamic Delta & Parquet 分層（彈藥庫）
+    └── gtvdb-plugin/     # WASM 零拷貝 UDF 沙盒（附加配件）
+
 快速上手（攞起即用）
 喺你嘅 Cargo.toml 加入零件：
 
