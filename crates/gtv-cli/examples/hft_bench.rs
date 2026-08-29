@@ -30,10 +30,10 @@ use arrow::record_batch::RecordBatch;
 
 use gtv_array::window::msum;
 use gtv_core::temporal::{
-    build_zone_maps, temporal_mask_full, temporal_mask_pruned, ZoneMap,
+    build_zone_maps, point_in_time_range, temporal_mask_full, temporal_mask_pruned, ZoneMap,
 };
 use gtv_core::{TemporalCSR, VectorIndex};
-use gtv_index::FlatIndex;
+use gtv_index::{FlatIndex, IvfIndex};
 use gtv_pattern::{find, Pattern};
 
 const OUT_DIR: &str = "testcase/hft";
@@ -84,7 +84,11 @@ fn gen_series(n: usize, seed: u64, dt: i64) -> (Vec<i64>, Vec<f64>) {
 }
 
 /// Bid/ask price + size columns for the OFI micro-structure feature.
-fn gen_order_flow(n: usize, seed: u64) -> (Vec<f64>, Vec<f64>, Vec<u64>, Vec<u64>) {
+///
+/// Sizes are returned as `f64` (exact for the 1..=10_000 range) so the OFI path
+/// stays purely float and auto-vectorizes; the canonical `UInt64` size columns
+/// live in the separate `ticks` CSV schema, unaffected here.
+fn gen_order_flow(n: usize, seed: u64) -> (Vec<f64>, Vec<f64>, Vec<u16>, Vec<u16>) {
     let mut rng = SplitMix64::new(seed);
     let mut bid = Vec::with_capacity(n);
     let mut ask = Vec::with_capacity(n);
@@ -96,25 +100,27 @@ fn gen_order_flow(n: usize, seed: u64) -> (Vec<f64>, Vec<f64>, Vec<u64>, Vec<u64
         let spread = 0.01 + rng.next_f64() * 0.02;
         bid.push(mid - spread / 2.0);
         ask.push(mid + spread / 2.0);
-        bid_sz.push(1 + rng.next_u64() % 10_000);
-        ask_sz.push(1 + rng.next_u64() % 10_000);
+        // Sizes are exact integers in [1, 10000]; `u16` keeps the two size columns
+        // at 2 B/row instead of 8 B/row, cutting the streaming footprint of TC2 by
+        // 16 MB at 1M rows (the pass is DRAM-bandwidth-bound, not instruction-bound).
+        bid_sz.push((1 + rng.next_u64() % 10_000) as u16);
+        ask_sz.push((1 + rng.next_u64() % 10_000) as u16);
     }
     (bid, ask, bid_sz, ask_sz)
 }
 
-/// Random 512-dim embeddings (unit-agnostic; distances are squared L2).
-fn gen_embeddings(n: usize, dim: usize, seed: u64) -> (Vec<u64>, Vec<Vec<f32>>) {
+/// Random 512-dim embeddings (unit-agnostic; distances are squared L2), generated
+/// directly into a contiguous row-major buffer (vector `i` occupies
+/// `data[i * dim .. (i + 1) * dim]`) so the index build is a single move, not a
+/// re-copy from `Vec<Vec<f32>>`.
+fn gen_embeddings(n: usize, dim: usize, seed: u64) -> (Vec<u64>, Vec<f32>) {
     let mut rng = SplitMix64::new(seed);
     let ids: Vec<u64> = (0..n as u64).collect();
-    let mut vectors = Vec::with_capacity(n);
-    for _ in 0..n {
-        let mut v = Vec::with_capacity(dim);
-        for _ in 0..dim {
-            v.push((rng.next_u64() >> 40) as f32 / (1u64 << 24) as f32);
-        }
-        vectors.push(v);
+    let mut data = Vec::with_capacity(n * dim);
+    for _ in 0..n * dim {
+        data.push((rng.next_u64() >> 40) as f32 / (1u64 << 24) as f32);
     }
-    (ids, vectors)
+    (ids, data)
 }
 
 // ---------------------------------------------------------------------------
@@ -557,12 +563,30 @@ fn f64_slice_eq(a: &[f64], b: &[f64]) -> bool {
             .all(|(x, y)| x == y || (x.is_nan() && y.is_nan()))
 }
 
+/// Relative-tolerance f64 slice comparison for *fused* (reassociated) reductions.
+///
+/// A chunked/parallel rolling sum seeds each chunk from a fresh local window and
+/// therefore reorders the additions relative to a single sequential accumulator,
+/// which perturbs the last few ULPs. This compares within `rtol` (relative to the
+/// larger magnitude, floored at 1.0) so genuine logic bugs — which differ by
+/// orders of magnitude — still fail loudly.
+fn f64_slice_close(a: &[f64], b: &[f64], rtol: f64) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(x, y)| {
+            let scale = x.abs().max(y.abs()).max(1.0);
+            (x - y).abs() <= rtol * scale
+        })
+}
+
 // ---------------------------------------------------------------------------
 // Test Case 2 — order-flow imbalance (OFI), rolling 100-tick
 // ---------------------------------------------------------------------------
 
 /// OFI_t = bid_size_t · ΔBidPrice_t − ask_size_t · ΔAskPrice_t, then `msum[100]`.
-fn tc2_compute(bid: &[f64], ask: &[f64], bid_sz: &[u64], ask_sz: &[u64]) {
+///
+/// Naive two-pass reference: materialize `ofi`, then roll it with [`msum`].
+/// Returns the rolling window so [`tc2_compute_fused`] can be asserted against it.
+fn tc2_compute(bid: &[f64], ask: &[f64], bid_sz: &[u16], ask_sz: &[u16]) -> Vec<f64> {
     let n = bid.len();
     let mut ofi = Vec::with_capacity(n);
     let mut prev_bid = bid[0];
@@ -574,7 +598,185 @@ fn tc2_compute(bid: &[f64], ask: &[f64], bid_sz: &[u64], ask_sz: &[u64]) {
         prev_ask = ask[i];
         ofi.push(bid_sz[i] as f64 * d_bid - ask_sz[i] as f64 * d_ask);
     }
-    let _ = msum(&ofi, 100);
+    msum(&ofi, 100)
+}
+
+/// TC2 fused: compute `OFI_t` on the fly and fold it into the rolling 100-tick
+/// window sum in a single parallel pass — the intermediate `ofi` array is never
+/// materialized, halving the moved bytes (56 MB → 40 MB at 1M rows).
+///
+/// The window is only 100 ticks, so each chunk overlaps the previous chunk by
+/// `W + 1` rows (one extra for the lag-1 price delta) and seeds its ring buffer
+/// by recomputing those OFI values from the raw inputs, which stay hot in L2.
+/// This is DRAM-bandwidth-bound (like TC1's fused join), not allocation-bound.
+fn tc2_compute_fused(bid: &[f64], ask: &[f64], bid_sz: &[u16], ask_sz: &[u16]) -> Vec<f64> {
+    use rayon::prelude::*;
+    const W: usize = 100;
+    const CHUNK: usize = 8192;
+    let n = bid.len();
+
+    let mut out: Vec<MaybeUninit<f64>> = Vec::with_capacity(n);
+    // SAFETY: every element is written exactly once by the chunk pass below.
+    unsafe {
+        out.set_len(n);
+    }
+
+    out.par_chunks_mut(CHUNK).enumerate().for_each(|(ci, o)| {
+        let s = ci * CHUNK;
+        let e = s + o.len();
+
+        // Seed the window with the `W` OFI values preceding this chunk (plus one
+        // row for the lag-1 price delta), recomputed from the raw inputs.
+        let lo = s.saturating_sub(W + 1);
+        let mut win = 0.0f64;
+        let mut ring = [0.0f64; W];
+        let mut pos = 0usize;
+        let mut prev_bid = bid[lo];
+        let mut prev_ask = ask[lo];
+        for i in lo + 1..s {
+            let ofi = bid_sz[i] as f64 * (bid[i] - prev_bid) - ask_sz[i] as f64 * (ask[i] - prev_ask);
+            prev_bid = bid[i];
+            prev_ask = ask[i];
+            win += ofi;
+            ring[pos % W] = ofi;
+            pos += 1;
+        }
+
+        // Main pass over this chunk: fold OFI into the trailing window sum.
+        // The output is written with non-temporal stores so the freshly allocated
+        // `out` buffer doesn't incur a read-for-ownership on every cache line.
+        for i in s..e {
+            let ofi = if i == 0 {
+                0.0
+            } else {
+                bid_sz[i] as f64 * (bid[i] - prev_bid) - ask_sz[i] as f64 * (ask[i] - prev_ask)
+            };
+            prev_bid = bid[i];
+            prev_ask = ask[i];
+            win += ofi;
+            if pos >= W {
+                win -= ring[pos % W];
+            }
+            ring[pos % W] = ofi;
+            pos += 1;
+            // SAFETY: `i - s` is within `o` (the current chunk), and `win` is a
+            // fully-initialized f64.
+            unsafe {
+                nt_store_f64(o.as_mut_ptr().add(i - s).cast::<f64>(), win);
+            }
+        }
+    });
+
+    // SAFETY: every element was written exactly once above.
+    unsafe { assume_init_f64(out) }
+}
+
+/// Compute the raw OFI deltas with an AVX2 kernel: four `f64` lanes per step
+/// (`_mm256_sub_pd` on the lag-1 price delta, then multiply by the widened
+/// sizes). The `u16` size columns are widened `u16 → u32 → f64` in registers.
+/// `raw[0]` is always 0 (no lag at the first tick). This is the hft_tc2-tc4.md
+/// §1.2 SIMD pass; the O(1) trailing-window sum is applied afterwards.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[target_feature(enable = "sse4.1")]
+unsafe fn ofi_deltas_avx2(
+    bid: &[f64],
+    ask: &[f64],
+    bid_sz: &[u16],
+    ask_sz: &[u16],
+    raw: &mut [f64],
+) {
+    use std::arch::x86_64::*;
+
+    let n = bid.len();
+    raw[0] = 0.0;
+
+    let mut i = 1usize;
+    while i + 4 <= n {
+        // Price deltas: cur[i..i+4] − prev[i-1..i+3], four lanes at once.
+        let cur_b = _mm256_loadu_pd(bid.as_ptr().add(i));
+        let prv_b = _mm256_loadu_pd(bid.as_ptr().add(i - 1));
+        let d_b = _mm256_sub_pd(cur_b, prv_b);
+
+        let cur_a = _mm256_loadu_pd(ask.as_ptr().add(i));
+        let prv_a = _mm256_loadu_pd(ask.as_ptr().add(i - 1));
+        let d_a = _mm256_sub_pd(cur_a, prv_a);
+
+        // Widen the four u16 sizes at i..i+4 to f64 (load 8×u16, take the low
+        // 4, zero-extend to u32, then convert to f64).
+        let bsz = _mm_loadu_si128(bid_sz.as_ptr().add(i) as *const __m128i);
+        let bsz32 = _mm_cvtepu16_epi32(bsz);
+        let bsz_f = _mm256_cvtepi32_pd(bsz32);
+
+        let asz = _mm_loadu_si128(ask_sz.as_ptr().add(i) as *const __m128i);
+        let asz32 = _mm_cvtepu16_epi32(asz);
+        let asz_f = _mm256_cvtepi32_pd(asz32);
+
+        // OFI = bid_sz·ΔBid − ask_sz·ΔAsk, four independent lanes.
+        let ofi = _mm256_sub_pd(_mm256_mul_pd(bsz_f, d_b), _mm256_mul_pd(asz_f, d_a));
+        _mm256_storeu_pd(raw.as_mut_ptr().add(i), ofi);
+        i += 4;
+    }
+
+    // Scalar tail: the remaining < 4 elements (or the whole array when n < 4).
+    let mut prev_b = bid[i - 1];
+    let mut prev_a = ask[i - 1];
+    for j in i..n {
+        raw[j] = bid_sz[j] as f64 * (bid[j] - prev_b) - ask_sz[j] as f64 * (ask[j] - prev_a);
+        prev_b = bid[j];
+        prev_a = ask[j];
+    }
+}
+
+/// Scalar fallback for the raw OFI deltas (non-x86_64 hosts, or no AVX2).
+fn ofi_deltas_scalar(
+    bid: &[f64],
+    ask: &[f64],
+    bid_sz: &[u16],
+    ask_sz: &[u16],
+    raw: &mut [f64],
+) {
+    let n = bid.len();
+    raw[0] = 0.0;
+    let mut prev_b = bid[0];
+    let mut prev_a = ask[0];
+    for i in 1..n {
+        raw[i] = bid_sz[i] as f64 * (bid[i] - prev_b) - ask_sz[i] as f64 * (ask[i] - prev_a);
+        prev_b = bid[i];
+        prev_a = ask[i];
+    }
+}
+
+/// TC2 SIMD: AVX2 4-way f64 OFI deltas + O(1) trailing-window sum.
+///
+/// This is the direct translation of `compute_ofi_rolling_simd` from
+/// hft_tc2-tc4.md §1.2: pass 1 vectorizes the `OFI_t` deltas, pass 2 applies
+/// the recurrence `RollingOFI[i] = RollingOFI[i-1] + OFI[i] − OFI[i-W]` (the
+/// same O(1) recurrence as `gtv_array::msum`). It stays single-threaded so the
+/// SIMD gain is measured cleanly against [`tc2_compute_fused`], which trades
+/// SIMD for rayon chunk parallelism.
+fn tc2_compute_simd(
+    bid: &[f64],
+    ask: &[f64],
+    bid_sz: &[u16],
+    ask_sz: &[u16],
+    window: usize,
+) -> Vec<f64> {
+    let n = bid.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut raw = vec![0.0f64; n];
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") {
+            // SAFETY: AVX2 was detected at runtime; u16 sizes are exact in f64.
+            unsafe { ofi_deltas_avx2(bid, ask, bid_sz, ask_sz, &mut raw) };
+            return msum(&raw, window);
+        }
+    }
+    ofi_deltas_scalar(bid, ask, bid_sz, ask_sz, &mut raw);
+    msum(&raw, window)
 }
 
 // ---------------------------------------------------------------------------
@@ -584,9 +786,215 @@ fn tc2_compute(bid: &[f64], ask: &[f64], bid_sz: &[u64], ask_sz: &[u64]) {
 struct Tc3Build {
     csr: TemporalCSR,
     pattern: Pattern,
+    wash: WashTradeDetector,
     valid_at: i64,
     amount: HashMap<(u64, u64, i64), f64>,
     build_us: f64,
+}
+
+/// Wash-trade detector: a CSR whose per-source column array is sorted by
+/// destination, so the closing `C→A` edge is found by binary search instead of a
+/// linear scan (hft_tc2-tc4.md §2.1). Amounts travel alongside the edges so the
+/// 0.1% deviation prune happens *inside* the innermost loop (§2.2), and matches
+/// are returned as flat `(a, b, c)` tuples — zero per-match heap allocations.
+struct WashTradeDetector {
+    node_count: usize,
+    row_ptr: Vec<u32>,
+    /// Per-source run sorted by `dst` (ascending), enabling `binary_search`.
+    col_dst: Vec<u64>,
+    col_amt: Vec<f64>,
+    col_vf: Vec<i64>,
+    col_vt: Vec<i64>,
+    max_valid_from: i64,
+    min_valid_to: i64,
+}
+
+impl WashTradeDetector {
+    fn build(
+        src: &[u64],
+        dst: &[u64],
+        vf: &[i64],
+        vt: &[i64],
+        amount: &[f64],
+        node_count: usize,
+    ) -> Self {
+        assert_eq!(src.len(), dst.len());
+        assert_eq!(src.len(), vf.len());
+        assert_eq!(src.len(), vt.len());
+        assert_eq!(src.len(), amount.len());
+
+        // Sort edges by (src, dst) so each source's run is dst-ascending.
+        let mut order: Vec<usize> = (0..src.len()).collect();
+        order.sort_unstable_by_key(|&i| (src[i], dst[i]));
+
+        let mut row_ptr = vec![0u32; node_count + 1];
+        let mut col_dst = Vec::with_capacity(src.len());
+        let mut col_amt = Vec::with_capacity(src.len());
+        let mut col_vf = Vec::with_capacity(src.len());
+        let mut col_vt = Vec::with_capacity(src.len());
+        let mut max_valid_from = i64::MIN;
+        let mut min_valid_to = i64::MAX;
+        for &i in &order {
+            row_ptr[src[i] as usize + 1] += 1;
+            col_dst.push(dst[i]);
+            col_amt.push(amount[i]);
+            col_vf.push(vf[i]);
+            col_vt.push(vt[i]);
+            max_valid_from = max_valid_from.max(vf[i]);
+            min_valid_to = min_valid_to.min(vt[i]);
+        }
+        for n in 0..node_count {
+            row_ptr[n + 1] += row_ptr[n];
+        }
+
+        Self {
+            node_count,
+            row_ptr,
+            col_dst,
+            col_amt,
+            col_vf,
+            col_vt,
+            max_valid_from,
+            min_valid_to,
+        }
+    }
+
+    /// True when *every* edge is active at `t` (O(1), like `TemporalCSR`).
+    #[inline]
+    fn all_active_at(&self, t: i64) -> bool {
+        t >= self.max_valid_from && t < self.min_valid_to
+    }
+
+    /// Binary search for a `src → dst` edge in the dst-sorted run; returns the
+    /// flat column-array position, or `None`.
+    #[inline]
+    fn edge(&self, src: u64, dst: u64) -> Option<usize> {
+        let s = src as usize;
+        if s >= self.node_count {
+            return None;
+        }
+        let lo = self.row_ptr[s] as usize;
+        let hi = self.row_ptr[s + 1] as usize;
+        let p = self.col_dst[lo..hi].binary_search(&dst).ok()?;
+        Some(lo + p)
+    }
+
+    /// Find every `A→B→C→A` wash cycle active at `valid_at`, with strictly
+    /// increasing event times and pairwise amount deviation within `tolerance`.
+    ///
+    /// Rayon parallelizes the independent start-node scan; the only per-start
+    /// allocation is the per-chunk result `Vec` (none per match).
+    fn detect(&self, valid_at: i64, tolerance: f64, limit: usize) -> Vec<(u32, u32, u32)> {
+        use rayon::prelude::*;
+
+        if limit == 0 {
+            return Vec::new();
+        }
+        let all_active = self.all_active_at(valid_at);
+        const CHUNK: usize = 8192;
+        let starts: Vec<u32> = (0..self.node_count as u32).collect();
+        let parts: Vec<Vec<(u32, u32, u32)>> = starts
+            .par_chunks(CHUNK)
+            .map(|chunk| {
+                let mut local = Vec::new();
+                for &a in chunk {
+                    self.detect_from(a, valid_at, all_active, tolerance, limit, &mut local);
+                    if local.len() >= limit {
+                        break;
+                    }
+                }
+                local
+            })
+            .collect();
+
+        let mut out = Vec::new();
+        for mut local in parts {
+            out.append(&mut local);
+            if out.len() >= limit {
+                out.truncate(limit);
+                break;
+            }
+        }
+        out
+    }
+
+    /// Scan one start node `a` for a 3-cycle rooted there, pushing matches into
+    /// `out`. The `A→B`/`B→C` amount prune runs before the `C→A` binary search
+    /// so non-wash paths never pay for the lookup.
+    #[inline]
+    fn detect_from(
+        &self,
+        a: u32,
+        valid_at: i64,
+        all_active: bool,
+        tolerance: f64,
+        limit: usize,
+        out: &mut Vec<(u32, u32, u32)>,
+    ) {
+        let a64 = a as u64;
+        let a_lo = self.row_ptr[a as usize] as usize;
+        let a_hi = self.row_ptr[a as usize + 1] as usize;
+        for i in a_lo..a_hi {
+            let b = self.col_dst[i];
+            if b == a64 {
+                continue;
+            }
+            let t0 = self.col_vf[i];
+            if !all_active && (t0 > valid_at || valid_at >= self.col_vt[i]) {
+                continue;
+            }
+            let amt_ab = self.col_amt[i];
+            if amt_ab == 0.0 {
+                continue;
+            }
+
+            let b_usize = b as usize;
+            if b_usize >= self.node_count {
+                continue;
+            }
+            let b_lo = self.row_ptr[b_usize] as usize;
+            let b_hi = self.row_ptr[b_usize + 1] as usize;
+            for j in b_lo..b_hi {
+                let c = self.col_dst[j];
+                if c == a64 || c == b {
+                    continue;
+                }
+                let t1 = self.col_vf[j];
+                if t1 <= t0 {
+                    continue;
+                }
+                if !all_active && (t1 > valid_at || valid_at >= self.col_vt[j]) {
+                    continue;
+                }
+                let amt_bc = self.col_amt[j];
+                // Amount early-prune: skip if A→B and B→C deviate > tolerance.
+                if (amt_ab - amt_bc).abs() / amt_ab > tolerance {
+                    continue;
+                }
+
+                // Closing edge C→A via binary search (dst-sorted run).
+                let Some(k) = self.edge(c, a64) else {
+                    continue;
+                };
+                let t2 = self.col_vf[k];
+                if t2 <= t1 {
+                    continue;
+                }
+                if !all_active && (t2 > valid_at || valid_at >= self.col_vt[k]) {
+                    continue;
+                }
+                let amt_ca = self.col_amt[k];
+                if amt_bc == 0.0 || (amt_bc - amt_ca).abs() / amt_bc > tolerance {
+                    continue;
+                }
+
+                out.push((a, b as u32, c as u32));
+                if out.len() >= limit {
+                    return;
+                }
+            }
+        }
+    }
 }
 
 /// Plant `cycles` A→B→C→A cycles with equal amounts inside a `node_count` graph,
@@ -600,18 +1008,21 @@ fn tc3_build(node_count: usize, cycles: usize) -> Tc3Build {
     let mut vf: Vec<i64> = Vec::with_capacity(node_count);
     let mut vt: Vec<i64> = Vec::with_capacity(node_count);
     let mut et: Vec<u16> = Vec::with_capacity(node_count);
+    let mut amounts: Vec<f64> = Vec::with_capacity(node_count);
     let mut amount: HashMap<(u64, u64, i64), f64> = HashMap::new();
 
     const BIG: i64 = 1_000_000_000; // 1s validity -> active for every query we use
     // Chain spine: no back-edges, so no false cycles.
     for i in 0..chain_nodes - 1 {
         let (s, d, f) = (i as u64, i as u64 + 1, i as i64);
+        let amt = 1000.0 + (i % 7) as f64;
         src.push(s);
         dst.push(d);
         vf.push(f);
         vt.push(f + BIG);
         et.push(1);
-        amount.insert((s, d, f), 1000.0 + (i % 7) as f64);
+        amounts.push(amt);
+        amount.insert((s, d, f), amt);
     }
     // Planted wash cycles: A→B→C→A with identical amounts and strictly
     // increasing event times (1000 < 2000 < 3000) inside a 10ms window.
@@ -626,6 +1037,7 @@ fn tc3_build(node_count: usize, cycles: usize) -> Tc3Build {
             vf.push(f);
             vt.push(f + BIG);
             et.push(1);
+            amounts.push(1000.0);
             amount.insert((s, d, f), 1000.0);
         }
     }
@@ -633,6 +1045,7 @@ fn tc3_build(node_count: usize, cycles: usize) -> Tc3Build {
     let valid_at = (chain_nodes - 1) as i64;
 
     let build_start = Instant::now();
+    let wash = WashTradeDetector::build(&src, &dst, &vf, &vt, &amounts, node_count);
     let csr = TemporalCSR::from_arrays(
         &UInt64Array::from(src),
         &UInt64Array::from(dst),
@@ -648,12 +1061,15 @@ fn tc3_build(node_count: usize, cycles: usize) -> Tc3Build {
     Tc3Build {
         csr,
         pattern,
+        wash,
         valid_at,
         amount,
         build_us,
     }
 }
 
+/// Reference detection: generic `ring(3)` pattern match + post-filter on amount
+/// deviation (kept for correctness cross-checking the fast CSR detector).
 fn tc3_query(b: &Tc3Build) -> usize {
     let matches = find(&b.csr, &b.pattern, b.valid_at, 1_000_000).expect("find cycles");
     matches
@@ -669,6 +1085,12 @@ fn tc3_query(b: &Tc3Build) -> usize {
             max > 0.0 && (max - min) / max < 0.001
         })
         .count()
+}
+
+/// Fast detection: in-loop amount pruning + dst binary search + zero per-match
+/// allocation (the optimization this file's guide calls for in §2).
+fn tc3_query_fast(b: &Tc3Build) -> usize {
+    b.wash.detect(b.valid_at, 0.001, 1_000_000).len()
 }
 
 // ---------------------------------------------------------------------------
@@ -687,8 +1109,8 @@ struct Tc4Build {
 /// volatility (±100ms) of its own time series. Events are spaced 1ms apart, so a
 /// ±100ms window is ±100 neighbours around the hit.
 fn tc4_build(n: usize, dim: usize) -> Tc4Build {
-    let (ids, vectors) = gen_embeddings(n, dim, 0x5EED_0004);
-    let query: Vec<f32> = gen_embeddings(1, dim, 0x0FF5_0004).1.into_iter().next().unwrap();
+    let (ids, data) = gen_embeddings(n, dim, 0x5EED_0004);
+    let query: Vec<f32> = gen_embeddings(1, dim, 0x0FF5_0004).1;
     // A correlated price series to compute volatility over the ±100ms window.
     let prices: Vec<f64> = {
         let mut rng = SplitMix64::new(0x1CA0_0004);
@@ -702,7 +1124,7 @@ fn tc4_build(n: usize, dim: usize) -> Tc4Build {
     };
 
     let build_start = Instant::now();
-    let index = FlatIndex::new(ids, vectors).expect("build flat index");
+    let index = FlatIndex::from_flat(ids, data, dim).expect("build flat index");
     let build_us = build_start.elapsed().as_secs_f64() * 1e6;
 
     Tc4Build {
@@ -714,27 +1136,215 @@ fn tc4_build(n: usize, dim: usize) -> Tc4Build {
     }
 }
 
-fn tc4_query(b: &Tc4Build) -> usize {
-    let hits = b.index.search_knn(&b.query, 10, None).expect("knn search");
-    let hit_ids: Vec<usize> = hits.values().as_ref().iter().map(|&id| id as usize).collect();
+/// Shared volatility tail for TC4: for each top-K hit, the standard deviation of
+/// the hit's own price series over the ±100ms window.
+fn tc4_volatility(hit_ids: &[usize], prices: &[f64], n: usize) -> f64 {
     let mut vol = 0.0f64;
-    for &i in &hit_ids {
+    for &i in hit_ids {
         let lo = i.saturating_sub(100);
-        let hi = (i + 100).min(b.n - 1);
-        let mean = b.prices[lo..=hi].iter().sum::<f64>() / (hi - lo + 1) as f64;
-        let var = b.prices[lo..=hi]
+        let hi = (i + 100).min(n - 1);
+        let mean = prices[lo..=hi].iter().sum::<f64>() / (hi - lo + 1) as f64;
+        let var = prices[lo..=hi]
             .iter()
             .map(|&p| (p - mean) * (p - mean))
             .sum::<f64>()
             / (hi - lo + 1) as f64;
         vol += var.sqrt();
     }
-    std::hint::black_box(vol);
-    hit_ids.len()
+    vol
+}
+
+/// CPU exact K-NN: top-10 ids ordered by distance (id tie-break), matching the
+/// ordering the CUDA path must reproduce.
+fn tc4_cpu_knn(b: &Tc4Build) -> Vec<u64> {
+    let hits = b.index.search_knn(&b.query, 10, None).expect("knn search");
+    hits.values().as_ref().to_vec()
+}
+
+fn tc4_query(b: &Tc4Build) -> usize {
+    let top = tc4_cpu_knn(b);
+    let hit_ids: Vec<usize> = top.iter().map(|&id| id as usize).collect();
+    std::hint::black_box(tc4_volatility(&hit_ids, &b.prices, b.n));
+    top.len()
+}
+
+/// Inverted-file index built from the *same* deterministic corpus as the exact
+/// path (same seed), so a recall@10 comparison against [`tc4_cpu_knn`] is
+/// meaningful. Full `f32` precision is kept — the sublinearity comes from
+/// pruning cells, never from quantizing the data.
+struct Tc4Ivf {
+    index: IvfIndex,
+    query: Vec<f32>,
+    prices: Vec<f64>,
+    n: usize,
+    build_us: f64,
+}
+
+fn tc4_ivf_build(n: usize, dim: usize, nlist: usize, nprobe: usize) -> Tc4Ivf {
+    let (ids, data) = gen_embeddings(n, dim, 0x5EED_0004);
+    let query: Vec<f32> = gen_embeddings(1, dim, 0x0FF5_0004).1;
+    let prices: Vec<f64> = {
+        let mut rng = SplitMix64::new(0x1CA0_0004);
+        let mut p = 100.0f64;
+        (0..n)
+            .map(|_| {
+                p += (rng.next_f64() - 0.5) * 0.2;
+                p
+            })
+            .collect()
+    };
+
+    let build_start = Instant::now();
+    let index = IvfIndex::new(ids, data, dim, nlist, nprobe).expect("build ivf index");
+    let build_us = build_start.elapsed().as_secs_f64() * 1e6;
+
+    Tc4Ivf {
+        index,
+        query,
+        prices,
+        n,
+        build_us,
+    }
+}
+
+fn tc4_ivf_query(b: &Tc4Ivf) -> Vec<u64> {
+    let hits = b.index.search_knn(&b.query, 10, None).expect("ivf knn");
+    hits.values().as_ref().to_vec()
+}
+
+/// Full IVF query: top-10 ids + the ±100ms volatility tail (same shape as the
+/// exact TC4 query, so the two rows are latency-comparable).
+fn tc4_ivf_query_full(b: &Tc4Ivf) -> usize {
+    let top = tc4_ivf_query(b);
+    let hit_ids: Vec<usize> = top.iter().map(|&id| id as usize).collect();
+    std::hint::black_box(tc4_volatility(&hit_ids, &b.prices, b.n));
+    top.len()
+}
+
+fn recall_at_10(exact: &[u64], approx: &[u64]) -> f64 {
+    let hit = exact.iter().filter(|e| approx.contains(e)).count();
+    hit as f64 / exact.len().max(1) as f64
 }
 
 // ---------------------------------------------------------------------------
-// Test Case 5 — point-in-time order-book snapshot via zone-map pruning
+// TC4 CUDA acceleration (optional — compile with `--features cuda`)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "cuda")]
+struct Tc4Cuda {
+    ctx: Arc<cudarc::driver::CudaContext>,
+    func: cudarc::driver::CudaFunction,
+    // Resident device buffers — uploaded once at build, reused across queries.
+    d_data_t: cudarc::driver::CudaSlice<f32>, // column-major corpus
+    d_query: cudarc::driver::CudaSlice<f32>,
+    d_out_id: cudarc::driver::CudaSlice<i32>,
+    d_out_dist: cudarc::driver::CudaSlice<f32>,
+    n: i32,
+    dim: i32,
+    num_blocks: u32,
+    build_us: f64,
+}
+
+/// One-time GPU setup: NVRTC-compile `knn_top10.cu`, transpose the corpus to
+/// column-major on the host (build-time, one-time), and upload corpus + query so
+/// a query only launches the kernel and downloads the tiny per-block candidate
+/// buffer. memory0copy.md: the corpus stays resident and the N intermediate
+/// distances never cross the PCIe bus; the host transpose staging buffer is
+/// freed the moment it is on device.
+#[cfg(feature = "cuda")]
+fn tc4_cuda_build(data: &[f32], query: &[f32], n: usize, dim: usize) -> Tc4Cuda {
+    use cudarc::driver::CudaContext;
+    use cudarc::nvrtc::compile_ptx;
+
+    let t0 = Instant::now();
+    let ctx = CudaContext::new(0).expect("init CUDA context");
+    let ptx = compile_ptx(include_str!("knn_top10.cu")).expect("NVRTC compile knn kernel");
+    let module = ctx.load_module(ptx).expect("load PTX module");
+    let func = module.load_function("knn_top10_kernel").expect("load knn kernel");
+    let stream = ctx.default_stream();
+
+    // Column-major transpose (build-time) so warps read coalesced.
+    let mut data_t = vec![0.0f32; n * dim];
+    for d in 0..dim {
+        for i in 0..n {
+            data_t[d * n + i] = data[i * dim + d];
+        }
+    }
+
+    let d_data_t = stream.clone_htod(&data_t).expect("H2D corpus");
+    let d_query = stream.clone_htod(query).expect("H2D query");
+    let threads: u32 = 256;
+    let num_blocks = ((n as u32) + threads - 1) / threads;
+    let cand = (num_blocks as usize) * 10;
+    let d_out_id = stream.alloc_zeros::<i32>(cand).expect("alloc out id");
+    let d_out_dist = stream.alloc_zeros::<f32>(cand).expect("alloc out dist");
+    drop(data_t); // free the host staging copy as soon as it is on device
+
+    Tc4Cuda {
+        build_us: t0.elapsed().as_secs_f64() * 1e6,
+        ctx,
+        func,
+        d_data_t,
+        d_query,
+        d_out_id,
+        d_out_dist,
+        n: n as i32,
+        dim: dim as i32,
+        num_blocks,
+    }
+}
+
+/// Launch the fused distance + top-K kernel and download only the per-block
+/// candidates, then merge/sort on the host into the final top-10 ids.
+#[cfg(feature = "cuda")]
+fn tc4_cuda_query(c: &mut Tc4Cuda, k: usize) -> Vec<u64> {
+    use cudarc::driver::{LaunchConfig, PushKernelArg};
+
+    let stream = c.ctx.default_stream();
+    let cfg = LaunchConfig {
+        grid_dim: (c.num_blocks, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let mut lb = stream.launch_builder(&c.func);
+    lb.arg(&c.d_data_t)
+        .arg(&c.d_query)
+        .arg(&c.n)
+        .arg(&c.dim)
+        .arg(&mut c.d_out_id)
+        .arg(&mut c.d_out_dist);
+    unsafe { lb.launch(cfg) }.expect("launch knn kernel");
+
+    let ids: Vec<i32> = stream.clone_dtoh(&c.d_out_id).expect("D2H ids");
+    let dists: Vec<f32> = stream.clone_dtoh(&c.d_out_dist).expect("D2H dists");
+
+    let mut cand: Vec<(f32, i32)> = dists
+        .iter()
+        .zip(ids.iter())
+        .filter(|(_, &i)| i >= 0)
+        .map(|(&d, &i)| (d, i))
+        .collect();
+    cand.sort_by(|a, b| {
+        a.0.partial_cmp(&b.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.1.cmp(&b.1))
+    });
+    cand.iter().take(k).map(|(_, i)| *i as u64).collect()
+}
+
+/// CUDA TC4 query: fused device K-NN + host volatility tail.
+#[cfg(feature = "cuda")]
+fn tc4_query_cuda(b: &Tc4Build, c: &mut Tc4Cuda) -> usize {
+    let top = tc4_cuda_query(c, 10);
+    let hit_ids: Vec<usize> = top.iter().map(|&id| id as usize).collect();
+    std::hint::black_box(tc4_volatility(&hit_ids, &b.prices, b.n));
+    top.len()
+}
+
+// ---------------------------------------------------------------------------
+// Test Case 5 — point-in-time order-book snapshot (O(log N) binary slice +
+// O(N) zone-map reference)
 // ---------------------------------------------------------------------------
 
 struct Tc5Build {
@@ -746,8 +1356,9 @@ struct Tc5Build {
     build_us: f64,
 }
 
-/// `valid_from` ascending with a fixed duration gives strong temporal locality:
-/// a single `T` overlaps only a handful of 128-edge chunks.
+/// `valid_from` ascending with a fixed duration (`valid_to = valid_from + 100`)
+/// means both temporal columns are sorted, so the active-at-`T` set is a
+/// *contiguous* index range — recoverable in O(log N) with zero writes.
 fn tc5_build(n: usize, chunk: usize) -> Tc5Build {
     const DURATION: i64 = 100;
     let vf: Vec<i64> = (0..n as i64).collect();
@@ -758,11 +1369,17 @@ fn tc5_build(n: usize, chunk: usize) -> Tc5Build {
     let zones = build_zone_maps(&vf, &vt, chunk);
     let build_us = build_start.elapsed().as_secs_f64() * 1e6;
 
-    // Correctness: pruned mask must equal a full scan (untimed).
+    // Correctness: O(log N) binary range == pruned mask == full scan.
     let full = temporal_mask_full(&vf, &vt, t);
     let pruned = temporal_mask_pruned(&vf, &vt, t, &zones);
     assert_eq!(full, pruned, "zone-map mask diverges from full scan");
-    let active = (0..n).filter(|&i| pruned.value(i)).count();
+    let range = point_in_time_range(&vf, &vt, t);
+    let active = range.end - range.start;
+    assert_eq!(
+        active,
+        (0..n).filter(|&i| pruned.value(i)).count(),
+        "binary slice count diverges from mask"
+    );
 
     Tc5Build {
         zones,
@@ -774,6 +1391,14 @@ fn tc5_build(n: usize, chunk: usize) -> Tc5Build {
     }
 }
 
+/// O(log N) zero-copy snapshot: two `partition_point` boundary searches return
+/// the active row range; no mask is materialized and no row is read/written.
+fn tc5_query_bin(b: &Tc5Build) -> usize {
+    let range = point_in_time_range(&b.vf, &b.vt, b.t);
+    range.end - range.start
+}
+
+/// O(N) zone-map reference: builds a bitmask by pruning whole 128-edge chunks.
 fn tc5_query(b: &Tc5Build) {
     let _ = temporal_mask_pruned(&b.vf, &b.vt, b.t, &b.zones);
 }
@@ -1298,10 +1923,29 @@ fn main() {
     }
 
     // ---- TC2: OFI rolling 100 ----
+    // Correctness: the fused parallel pass (no intermediate) must match the
+    // two-pass reference (`ofi` -> `msum[100]`) to within floating-point
+    // reassociation (the chunked window reorders the additions).
+    {
+        let (bid, ask, bid_sz, ask_sz) = gen_order_flow(10_000, 0xB1);
+        let fused = tc2_compute_fused(&bid, &ask, &bid_sz, &ask_sz);
+        let reference = tc2_compute(&bid, &ask, &bid_sz, &ask_sz);
+        let simd = tc2_compute_simd(&bid, &ask, &bid_sz, &ask_sz, 100);
+        assert!(
+            f64_slice_close(&fused, &reference, 1e-9),
+            "TC2 fused rolling sum != reference msum"
+        );
+        assert!(
+            f64_slice_close(&simd, &reference, 1e-12),
+            "TC2 SIMD rolling sum != reference msum"
+        );
+    }
     for &n in &[100_000usize, 1_000_000, 5_000_000] {
         let (bid, ask, bid_sz, ask_sz) = gen_order_flow(n, 0xB1);
         let iters = if n >= 5_000_000 { 3 } else if n >= 1_000_000 { 5 } else { 10 };
-        let q = bench_us(iters, || tc2_compute(&bid, &ask, &bid_sz, &ask_sz));
+        let q = bench_us(iters, || {
+            std::hint::black_box(tc2_compute_fused(&bid, &ask, &bid_sz, &ask_sz));
+        });
         rows.push(Row {
             tc: "TC2",
             scale: n,
@@ -1309,18 +1953,45 @@ fn main() {
             query_us: q,
             bytes: (n * 32) as f64,
             threshold_us: if n == 1_000_000 { Some(2_000.0) } else { None },
-            note: "OFI = e·ΔBid − f·ΔAsk, msum[100]".into(),
+            note: "OFI = e·ΔBid − f·ΔAsk, fused rolling msum[100] (no intermediate)".into(),
+        });
+    }
+    // TC2 SIMD variant: AVX2 4-way f64 OFI deltas + O(1) sliding sum.
+    for &n in &[100_000usize, 1_000_000, 5_000_000] {
+        let (bid, ask, bid_sz, ask_sz) = gen_order_flow(n, 0xB1);
+        let iters = if n >= 5_000_000 { 3 } else if n >= 1_000_000 { 5 } else { 10 };
+        let q = bench_us(iters, || {
+            std::hint::black_box(tc2_compute_simd(&bid, &ask, &bid_sz, &ask_sz, 100));
+        });
+        rows.push(Row {
+            tc: "TC2-SIMD",
+            scale: n,
+            build_us: 0.0,
+            query_us: q,
+            bytes: (n * 32) as f64,
+            threshold_us: None,
+            note: "OFI deltas via AVX2 (4-way f64) + O(1) msum[100]".into(),
         });
     }
 
     // ---- TC3: wash-trading cycle detection ----
+    // Correctness: the CSR detector (in-loop amount prune + dst binary search)
+    // must agree with the reference ring(3) + post-filter count.
+    {
+        let small = tc3_build(10_000, 20);
+        assert_eq!(
+            tc3_query_fast(&small),
+            tc3_query(&small),
+            "TC3 CSR detector != reference ring(3) filter"
+        );
+    }
     for &n in &[100_000usize, 500_000] {
         let cycles = if n >= 500_000 { 100 } else { 20 };
         let b = tc3_build(n, cycles);
-        let matches = tc3_query(&b);
+        let matches = tc3_query_fast(&b);
         let iters = if n >= 500_000 { 3 } else { 5 };
         let q = bench_us(iters, || {
-            let _ = tc3_query(&b);
+            let _ = tc3_query_fast(&b);
         });
         rows.push(Row {
             tc: "TC3",
@@ -1329,7 +2000,7 @@ fn main() {
             query_us: q,
             bytes: (n * 48) as f64,
             threshold_us: if n == 500_000 { Some(10_000.0) } else { None },
-            note: format!("ring(3) + amount<0.1% filter; {} matches", matches),
+            note: format!("CSR 3-cycle + in-loop amount prune + dst binary search; {} matches", matches),
         });
     }
 
@@ -1337,8 +2008,8 @@ fn main() {
     for &n in &[100_000usize, 1_000_000] {
         let dim = 512;
         let b = tc4_build(n, dim);
-        let top_k = tc4_query(&b);
-        let iters = if n >= 1_000_000 { 2 } else { 3 };
+        let exact_ids = tc4_cpu_knn(&b);
+        let iters = if n >= 1_000_000 { 3 } else { 10 };
         let q = bench_us(iters, || {
             let _ = tc4_query(&b);
         });
@@ -1349,22 +2020,80 @@ fn main() {
             query_us: q,
             bytes: (n * dim * 4) as f64,
             threshold_us: Some(8_000.0),
-            note: format!("FlatIndex exact 512-dim, top-{} + ±100ms vol", top_k),
+            note: format!("FlatIndex exact 512-dim (CPU AVX2+FMA), top-{} + ±100ms vol", exact_ids.len()),
         });
+
+        // IVF: coarse partition + exact f32 probe scan (no quantization).
+        let ivf_b = tc4_ivf_build(n, dim, 1024, 32);
+        let ivf_ids = tc4_ivf_query(&ivf_b);
+        let recall = recall_at_10(&exact_ids, &ivf_ids);
+        let qivf = bench_us(iters, || {
+            let _ = tc4_ivf_query_full(&ivf_b);
+        });
+        rows.push(Row {
+            tc: "TC4",
+            scale: n,
+            build_us: ivf_b.build_us,
+            query_us: qivf,
+            bytes: (n * dim * 4) as f64,
+            threshold_us: Some(8_000.0),
+            note: format!("IVF exact-f32 (nlist=1024, nprobe=32), top-10 + vol; recall@10={:.1}%", recall * 100.0),
+        });
+
+        // CUDA exact K-NN: fused distance + top-K, column-major coalesced scan.
+        #[cfg(feature = "cuda")]
+        {
+            if use_gpu {
+                let mut c = tc4_cuda_build(b.index.data(), &b.query, b.n, b.index.dim());
+                assert_eq!(
+                    tc4_cuda_query(&mut c, 10),
+                    tc4_cpu_knn(&b),
+                    "TC4 CUDA top-10 != CPU top-10"
+                );
+                let qc = bench_us(iters, || {
+                    let _ = tc4_query_cuda(&b, &mut c);
+                });
+                rows.push(Row {
+                    tc: "TC4",
+                    scale: n,
+                    build_us: c.build_us,
+                    query_us: qc,
+                    bytes: (n * dim * 4) as f64,
+                    threshold_us: Some(8_000.0),
+                    note: format!("CUDA exact 512-dim, fused dist+top-K (column-major coalesced), top-{} + vol", top_k),
+                });
+            }
+        }
     }
 
-    // ---- TC5: point-in-time snapshot (zone-map pruning) ----
+    // ---- TC5: point-in-time snapshot (O(log N) binary slice) ----
     for &n in &[100_000usize, 1_000_000, 5_000_000] {
         let b = tc5_build(n, 128);
-        let q = bench_us(2000, || tc5_query(&b));
+
+        // O(log N) zero-copy binary slice (primary).
+        let qb = bench_us(2000, || {
+            let _ = tc5_query_bin(&b);
+        });
         rows.push(Row {
             tc: "TC5",
             scale: n,
-            build_us: b.build_us,
-            query_us: q,
+            build_us: 0.0,
+            query_us: qb,
             bytes: (n * 16) as f64,
             threshold_us: if n == 5_000_000 { Some(1_000.0) } else { None },
-            note: format!("zone-map snapshot; {} active orders", b.active),
+            note: format!("binary slice O(log N) zero-copy; {} active orders", b.active),
+        });
+
+        // O(N) zone-map prune (reference).
+        let qz = bench_us(2000, || tc5_query(&b));
+        rows.push(Row {
+            tc: "TC5-zone",
+            scale: n,
+            build_us: b.build_us,
+            query_us: qz,
+            bytes: (n * 16) as f64,
+            threshold_us: if n == 5_000_000 { Some(1_000.0) } else { None },
+            note: format!("zone-map prune (O(N) mask, reference); {} active", b.active),
         });
     }
 
@@ -1384,7 +2113,7 @@ fn main() {
         if loader_ok { " ✅ OK" } else { " ❌ MISMATCH" }
     ));
     md.push_str(
-        "- 說明：TC3/TC4 的 build 為一次性索引建構（不計入查詢門檻）；TC4 使用精確 FlatIndex（scalar），512 維大規模 ANN 需另建 HNSW/SIMD。\n",
+        "- 說明：TC3/TC4 的 build 為一次性索引建構（不計入查詢門檻）；TC4 CPU 精確路徑為 FlatIndex（AVX2+FMA SIMD + rayon + bounded top-K），IVF 路徑為倒排索引（coarse 1024-cell 分割 + 精確 f32 探測掃描，無量化），CUDA 路徑則為 column-major 合併掃描（fused distance + top-K）。\n",
     );
     md.push_str(&format!(
         "- Rayon 執行緒：{}（可用 `GTV_HFT_THREADS` 環境變數調整，建議 4–8）。\n",

@@ -5,8 +5,13 @@
 
 pub mod asof;
 pub mod context;
+pub mod csv;
 pub mod graph;
+pub mod hft;
+pub mod hft_exec;
+pub mod hft_tf;
 pub mod knn;
+pub mod micro;
 pub mod udf;
 
 mod expr_util;

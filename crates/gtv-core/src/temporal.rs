@@ -6,6 +6,8 @@
 //! whose interval does not contain `T`, dropping the work to O(chunks + active)
 //! without changing the result.
 
+use std::ops::Range;
+
 use arrow::array::BooleanArray;
 use arrow::buffer::{BooleanBuffer, MutableBuffer};
 
@@ -100,6 +102,66 @@ pub fn temporal_mask_pruned(
     BooleanArray::new(BooleanBuffer::new(bytes.into(), 0, n), None)
 }
 
+/// O(log N) point-in-time snapshot for temporally-sorted inputs.
+///
+/// When `valid_from` and `valid_to` are both sorted ascending (the common HFT
+/// case: time-ordered records), the set of edges active at `valid_at`
+/// (`valid_from <= valid_at < valid_to`) is a *contiguous* index range:
+/// `valid_from <= valid_at` selects a prefix `[0, hi)` and `valid_to > valid_at`
+/// selects a suffix `[lo, n)`. Two branchless [`slice::partition_point`] calls
+/// locate the boundaries with **zero writes** — no bitmask is materialized and
+/// only ~2·log₂(n) cache lines are touched (memory0copy.md: index-only,
+/// zero-copy).
+///
+/// Returns the half-open `[lo, hi)` range of active rows (empty when `lo >= hi`).
+pub fn point_in_time_range(
+    valid_from: &[i64],
+    valid_to: &[i64],
+    valid_at: i64,
+) -> Range<usize> {
+    debug_assert_eq!(valid_from.len(), valid_to.len());
+    // Exclusive upper bound: first index where valid_from > valid_at.
+    let hi = valid_from.partition_point(|&f| f <= valid_at);
+    // Exclusive lower bound: rows with valid_to <= valid_at are inactive; the
+    // active rows (valid_to > valid_at) begin at this index.
+    let lo = valid_to.partition_point(|&v| v <= valid_at);
+    lo..hi
+}
+
+/// Zero-copy payload slice for the active-at-`valid_at` window.
+///
+/// Same sortedness requirement as [`point_in_time_range`]. `payloads` is
+/// indexed by row (aligned with `valid_from`/`valid_to`); the returned slice
+/// borrows the active rows — no allocation, no copy, no write-back.
+pub fn point_in_time_slice<'a, T>(
+    valid_from: &[i64],
+    valid_to: &[i64],
+    payloads: &'a [T],
+    valid_at: i64,
+) -> &'a [T] {
+    debug_assert_eq!(valid_from.len(), payloads.len());
+    let range = point_in_time_range(valid_from, valid_to, valid_at);
+    &payloads[range]
+}
+
+/// Generic zero-copy slice over monotonic keys.
+///
+/// Returns the contiguous `payloads` run whose keys fall in the inclusive
+/// `[start_key, end_key]` range, located with two `partition_point` binary
+/// searches (O(log n), ~2·log₂(n) cache-line reads, zero writes). `keys` must
+/// be sorted ascending and aligned with `payloads`.
+pub fn binary_slice<'a, K: Ord, T>(
+    keys: &[K],
+    payloads: &'a [T],
+    start_key: &K,
+    end_key: &K,
+) -> &'a [T] {
+    debug_assert_eq!(keys.len(), payloads.len());
+    let start = keys.partition_point(|x| x < start_key);
+    let end = keys[start..].partition_point(|x| x <= end_key) + start;
+    &payloads[start..end]
+}
+
 /// Unpruned baseline: the same predicate over every edge, no zone map.
 pub fn temporal_mask_full(valid_from: &[i64], valid_to: &[i64], valid_at: i64) -> BooleanArray {
     let n = valid_from.len();
@@ -169,5 +231,48 @@ mod tests {
         assert_eq!(zones.len(), 2);
         assert_eq!((zones[0].min_from, zones[0].max_to), (1, 20));
         assert_eq!((zones[1].min_from, zones[1].max_to), (3, 30));
+    }
+
+    #[test]
+    fn point_in_time_range_matches_full_mask() {
+        let n = 10_000i64;
+        let duration = 100i64;
+        let from: Vec<i64> = (0..n).collect();
+        let to: Vec<i64> = from.iter().map(|&f| f + duration).collect();
+        let payloads: Vec<i64> = (1000..1000 + n).collect();
+
+        for t in [-10, 0, 1, 99, 100, 101, n / 2, n + duration + 5] {
+            let full = temporal_mask_full(&from, &to, t);
+            let (f_lo, f_hi) = (0..full.len() as usize).fold(
+                (usize::MAX, 0usize),
+                |(lo, hi), i| {
+                    if full.value(i) {
+                        (lo.min(i), hi.max(i + 1))
+                    } else {
+                        (lo, hi)
+                    }
+                },
+            );
+            let range = point_in_time_range(&from, &to, t);
+            if f_lo == usize::MAX {
+                assert!(range.is_empty(), "range not empty at T={t}");
+            } else {
+                assert_eq!(range, f_lo..f_hi, "range mismatch at T={t}");
+            }
+            // Zero-copy slice must match the contiguous payload run.
+            let slice = point_in_time_slice(&from, &to, &payloads, t);
+            assert_eq!(slice.len(), range.len());
+            assert_eq!(slice, &payloads[range.clone()]);
+        }
+    }
+
+    #[test]
+    fn binary_slice_locates_inclusive_bounds() {
+        let keys = vec![0i64, 5, 10, 15, 20, 25];
+        let payloads = vec!["a", "b", "c", "d", "e", "f"];
+        assert_eq!(binary_slice(&keys, &payloads, &10, &20), &["c", "d", "e"]);
+        assert_eq!(binary_slice(&keys, &payloads, &6, &14), &["c"]);
+        assert_eq!(binary_slice(&keys, &payloads, &21, &30), &["f"]);
+        assert!(binary_slice(&keys, &payloads, &26, &30).is_empty());
     }
 }

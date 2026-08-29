@@ -8,7 +8,7 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
-arrow = { version = "59", features = ["prettyprint"] }
+arrow = { version = "59", features = ["prettyprint", "csv"] }
 parquet = { version = "59", features = ["arrow"] }
 datafusion = "55"
 thiserror = "2"

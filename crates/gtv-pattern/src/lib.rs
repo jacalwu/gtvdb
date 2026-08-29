@@ -142,20 +142,173 @@ pub fn find_from(
     Ok(matches)
 }
 
+/// True when `pattern` is the 3-cycle `v0 → v1 → v2 → v0` (the wash-trade ring).
+fn is_ring3(pattern: &Pattern) -> bool {
+    pattern.num_vars == 3
+        && pattern.edges.len() == 3
+        && pattern.edges[0]
+            == PatternEdge {
+                from: 0,
+                to: 1,
+                edge_type: None,
+            }
+        && pattern.edges[1]
+            == PatternEdge {
+                from: 1,
+                to: 2,
+                edge_type: None,
+            }
+        && pattern.edges[2]
+            == PatternEdge {
+                from: 2,
+                to: 0,
+                edge_type: None,
+            }
+}
+
+/// Recursion-free 3-cycle matcher (`A→B→C→A` with strictly increasing event
+/// times).
+///
+/// The generic DFS pays a function call and a `Result` unwind per level; across
+/// a 500k-node scan that overhead dominates. This runs three tight loops,
+/// parallelizes the independent start-node scan with rayon, and — when every
+/// edge is active at `valid_at` — drops the per-edge validity test entirely.
+fn find_ring3(csr: &TemporalCSR, valid_at: i64, limit: usize) -> Result<Vec<Match>> {
+    use rayon::prelude::*;
+
+    let n = csr.node_count();
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let all_active = csr.all_active_at(valid_at);
+
+    // Start nodes are scanned independently, so split them across the pool. Each
+    // chunk collects its own matches; the results are concatenated and truncated
+    // to `limit` (the ordering is unspecified, matching the generic `find`).
+    const CHUNK: usize = 8192;
+    let starts: Vec<u64> = (0..n as u64).collect();
+    let parts: Result<Vec<Vec<Match>>> = starts
+        .par_chunks(CHUNK)
+        .map(|chunk| {
+            let mut local = Vec::new();
+            for &a in chunk {
+                if local.len() >= limit {
+                    break;
+                }
+                ring3_from(csr, a, valid_at, all_active, limit, &mut local)?;
+            }
+            Ok(local)
+        })
+        .collect();
+
+    let mut out = Vec::new();
+    for mut local in parts? {
+        out.append(&mut local);
+        if out.len() >= limit {
+            out.truncate(limit);
+            break;
+        }
+    }
+    Ok(out)
+}
+
+/// Scan one start node `a` for a 3-cycle rooted there, pushing matches into `out`.
+#[inline]
+fn ring3_from(
+    csr: &TemporalCSR,
+    a: u64,
+    valid_at: i64,
+    all_active: bool,
+    limit: usize,
+    out: &mut Vec<Match>,
+) -> Result<()> {
+    let (da, vfa, vta, eta) = csr.edge_slices(a)?;
+    for i in 0..da.len() {
+        let b = da[i];
+        let t0 = vfa[i];
+        if b == a || (!all_active && (t0 > valid_at || valid_at >= vta[i])) {
+            continue;
+        }
+        let (db, vfb, vtb, etb) = csr.edge_slices(b)?;
+        for j in 0..db.len() {
+            let c = db[j];
+            if c == a || c == b {
+                continue;
+            }
+            let t1 = vfb[j];
+            if t1 <= t0 || (!all_active && (t1 > valid_at || valid_at >= vtb[j])) {
+                continue;
+            }
+            let (dc, vfc, vtc, etc_) = csr.edge_slices(c)?;
+            for k in 0..dc.len() {
+                if dc[k] != a {
+                    continue;
+                }
+                let t2 = vfc[k];
+                if t2 <= t1 || (!all_active && (t2 > valid_at || valid_at >= vtc[k])) {
+                    continue;
+                }
+                out.push(Match {
+                    nodes: vec![a, b, c],
+                    edges: vec![
+                        MatchedEdge {
+                            src: a,
+                            dst: b,
+                            edge_type: eta[i],
+                            valid_from: t0,
+                            valid_to: vta[i],
+                        },
+                        MatchedEdge {
+                            src: b,
+                            dst: c,
+                            edge_type: etb[j],
+                            valid_from: t1,
+                            valid_to: vtb[j],
+                        },
+                        MatchedEdge {
+                            src: c,
+                            dst: a,
+                            edge_type: etc_[k],
+                            valid_from: t2,
+                            valid_to: vtc[k],
+                        },
+                    ],
+                });
+                if out.len() >= limit {
+                    return Ok(());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Find up to `limit` matches over *all* possible start nodes, at time `valid_at`.
+///
+/// Allocation-free hot path: a single [`DfsState`] is reused across every start
+/// node, and the 3-cycle (wash-trade) shape is dispatched to a dedicated
+/// recursion-free matcher. [`find_from`] allocates a fresh state (three `Vec`s)
+/// per start, which turns a 500k-node scan into ~1.5M heap allocations.
 pub fn find(
     csr: &TemporalCSR,
     pattern: &Pattern,
     valid_at: i64,
     limit: usize,
 ) -> Result<Vec<Match>> {
+    if limit == 0 || pattern.num_vars == 0 {
+        return Ok(Vec::new());
+    }
+    if is_ring3(pattern) {
+        return find_ring3(csr, valid_at, limit);
+    }
     let mut out = Vec::new();
+    let mut state = DfsState::new(pattern);
     for start in 0..csr.node_count() as u64 {
         if out.len() >= limit {
             break;
         }
-        let got = find_from(csr, pattern, start, valid_at, limit - out.len())?;
-        out.extend(got);
+        state.nodes[0] = start;
+        dfs(csr, pattern, valid_at, 0, &mut state, &mut out, limit)?;
     }
     Ok(out)
 }
@@ -231,30 +384,46 @@ fn dfs(
 
     let to_bound = state.nodes[e.to] != u64::MAX;
 
-    for nb in csr.neighbors(from_node, valid_at)? {
+    // Direct slice access — skips the `neighbors` iterator's per-edge `Neighbor`
+    // struct and closure overhead, which dominates a multi-million-node scan.
+    let (dst, vf, vt, et) = csr.edge_slices(from_node)?;
+    for idx in 0..dst.len() {
+        // Active at `valid_at`: `valid_from <= valid_at < valid_to`.
+        let vf_i = vf[idx];
+        if vf_i > valid_at || valid_at >= vt[idx] {
+            continue;
+        }
         if let Some(t) = e.edge_type {
-            if nb.edge_type != t {
+            if et[idx] != t {
                 continue;
             }
         }
+        let dst_i = dst[idx];
         if to_bound {
             // The destination is already fixed: only edges into it count.
-            if nb.dst != state.nodes[e.to] {
+            if dst_i != state.nodes[e.to] {
                 continue;
             }
-            state.valid_from[ei] = nb.valid_from;
-            state.valid_to[ei] = nb.valid_to;
-            state.edge_type[ei] = nb.edge_type;
+            state.valid_from[ei] = vf_i;
+            state.valid_to[ei] = vt[idx];
+            state.edge_type[ei] = et[idx];
             dfs(csr, pattern, valid_at, ei + 1, state, matches, limit)?;
         } else {
             // Bind a fresh variable: keep node assignments distinct.
-            if state.nodes[..pattern.num_vars].contains(&nb.dst) {
+            let mut dup = false;
+            for k in 0..pattern.num_vars {
+                if state.nodes[k] == dst_i {
+                    dup = true;
+                    break;
+                }
+            }
+            if dup {
                 continue;
             }
-            state.nodes[e.to] = nb.dst;
-            state.valid_from[ei] = nb.valid_from;
-            state.valid_to[ei] = nb.valid_to;
-            state.edge_type[ei] = nb.edge_type;
+            state.nodes[e.to] = dst_i;
+            state.valid_from[ei] = vf_i;
+            state.valid_to[ei] = vt[idx];
+            state.edge_type[ei] = et[idx];
             dfs(csr, pattern, valid_at, ei + 1, state, matches, limit)?;
             state.nodes[e.to] = u64::MAX;
         }

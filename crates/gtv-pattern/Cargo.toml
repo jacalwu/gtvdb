@@ -6,4 +6,5 @@ license.workspace = true
 
 [dependencies]
 arrow.workspace = true
+rayon.workspace = true
 gtv-core = { path = "../gtv-core" }

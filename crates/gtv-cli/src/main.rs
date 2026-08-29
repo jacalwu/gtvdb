@@ -4,14 +4,16 @@
 //! Phase 2 layers a SQL REPL (DataFusion) on top: any input that is not a
 //! built-in command is executed as SQL.
 
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{anyhow, Result};
 use arrow::array::{
-    ArrayRef, BooleanArray, Float64Array, Int64Array, RecordBatch, TimestampNanosecondArray,
-    UInt64Array,
+    ArrayRef, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray,
+    TimestampNanosecondArray, UInt64Array,
 };
-use arrow::compute::{cast, filter_record_batch};
+use arrow::compute::{cast, concat_batches, filter_record_batch};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::util::pretty::print_batches;
 use rustyline::DefaultEditor;
@@ -19,6 +21,7 @@ use rustyline::DefaultEditor;
 use gtv_array::{asof, window};
 use gtv_core::{EdgeTable, NodeTable, TemporalGraph, VectorIndex};
 use gtv_delta::{DeltaEdge, LsmStore};
+use gtv_engine::hft_exec::KernelPlan;
 use gtv_engine::GtvContext;
 use gtv_index::HnswIndex;
 use gtv_pattern::Pattern;
@@ -39,6 +42,21 @@ const MARKUP_WAT: &str = r#"
 enum Action {
     Continue,
     Quit,
+}
+
+/// SQL execution mode selected via `ALTER SESSION SET sqlmode = hft|full`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SqlMode {
+    /// Thin wrapper: limited operator subset + abbreviated names, latency-first.
+    Hft,
+    /// Full DataFusion SQL: joins / group by / window / CTE / subqueries.
+    Full,
+}
+
+impl Default for SqlMode {
+    fn default() -> Self {
+        SqlMode::Hft
+    }
 }
 
 struct Demo {
@@ -64,7 +82,10 @@ async fn main() -> Result<()> {
     register_tables(&ctx, &demo)?;
 
     let mut rl = DefaultEditor::new()?;
-    println!("gtv — temporal graph/array shell (SQL enabled). Type `help` for commands.");
+    let mut mode = SqlMode::default();
+    let mut timing = false;
+    let mut cache: HashMap<String, KernelPlan> = HashMap::new();
+    println!("gtv — temporal graph/array shell. sqlmode=hft (default). Type `help` for commands.");
     loop {
         match rl.readline("gtv> ") {
             Ok(line) => {
@@ -73,7 +94,8 @@ async fn main() -> Result<()> {
                     continue;
                 }
                 let _ = rl.add_history_entry(&line);
-                match run(&demo, &ctx, &line).await {
+                let result = run(&demo, &ctx, &line, &mut mode, &mut timing, &mut cache).await;
+                match result {
                     Ok(Action::Continue) => {}
                     Ok(Action::Quit) => break,
                     Err(e) => eprintln!("error: {e:#}"),
@@ -193,9 +215,147 @@ fn register_tables(ctx: &GtvContext, demo: &Demo) -> Result<()> {
 
     ctx.register_neighbors(demo.graph.csr());
     ctx.register_asof_join(demo.times.clone(), demo.prices.clone());
+    register_hft_demo(ctx, demo)?;
     register_knn_collections(ctx)?;
     Ok(())
 }
+
+/// Register the HFT demo tables (ticks/orders/book) and the table functions
+/// that back TC1 (as-of multi), TC3 (wash trade), TC5 (point-in-time).
+fn register_hft_demo(ctx: &GtvContext, demo: &Demo) -> Result<()> {
+    // TC2: order-flow ticks (t, bid, ask, bid_sz, ask_sz).
+    let t: Vec<i64> = (0..6).map(|i| i * 10).collect();
+    let bid = vec![100.0, 100.1, 100.3, 100.2, 100.4, 100.5];
+    let ask = vec![100.2, 100.3, 100.5, 100.4, 100.6, 100.7];
+    let bid_sz = vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0];
+    let ask_sz = vec![5.0, 15.0, 25.0, 35.0, 45.0, 55.0];
+    let ticks_schema = Arc::new(Schema::new(vec![
+        Field::new("t", DataType::Int64, false),
+        Field::new("bid", DataType::Float64, false),
+        Field::new("ask", DataType::Float64, false),
+        Field::new("bid_sz", DataType::Float64, false),
+        Field::new("ask_sz", DataType::Float64, false),
+    ]));
+    ctx.register_batches(
+        "ticks",
+        ticks_schema.clone(),
+        vec![RecordBatch::try_new(
+            ticks_schema,
+            vec![
+                Arc::new(Int64Array::from(t)) as ArrayRef,
+                Arc::new(Float64Array::from(bid)) as ArrayRef,
+                Arc::new(Float64Array::from(ask)) as ArrayRef,
+                Arc::new(Float64Array::from(bid_sz)) as ArrayRef,
+                Arc::new(Float64Array::from(ask_sz)) as ArrayRef,
+            ],
+        )?],
+    )?;
+
+    // TC6: risk orders (id, price, qty, mid, smp).
+    let orders_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("price", DataType::Float64, false),
+        Field::new("qty", DataType::Float64, false),
+        Field::new("mid", DataType::Float64, false),
+        Field::new("smp", DataType::Float64, false),
+    ]));
+    let orders_batch = RecordBatch::try_new(
+        orders_schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![0i64, 1, 2, 3, 4, 5])) as ArrayRef,
+            Arc::new(Float64Array::from(vec![150.0, 151.0, 149.5, 152.0, 148.0, 150.5])) as ArrayRef,
+            Arc::new(Float64Array::from(vec![100.0, 20_000.0, 500.0, 5_000.0, 300.0, 1_000.0])) as ArrayRef,
+            Arc::new(Float64Array::from(vec![150.0; 6])) as ArrayRef,
+            Arc::new(Float64Array::from(vec![0.0, 0.0, 1.0, 0.0, 0.0, 1.0])) as ArrayRef,
+        ],
+    )?;
+    ctx.register_batches("orders", orders_schema, vec![orders_batch])?;
+
+    // TC8: L2 book (sym, level, bid_px, ask_px, bid_sz, ask_sz), 3 symbols x 10 levels.
+    let bases = vec![150.0, 200.0, 100.0];
+    let mut sym = Vec::new();
+    let mut level = Vec::new();
+    let mut bid_px = Vec::new();
+    let mut ask_px = Vec::new();
+    let mut bsz = Vec::new();
+    let mut asz = Vec::new();
+    for (s, &base) in bases.iter().enumerate() {
+        for l in 0..10i64 {
+            sym.push(s as i64);
+            level.push(l);
+            bid_px.push(base - (l as f64 + 1.0) * 0.01);
+            ask_px.push(base + (l as f64 + 1.0) * 0.01);
+            bsz.push((l as f64 + 1.0) * 10.0);
+            asz.push((l as f64 + 1.0) * 8.0);
+        }
+    }
+    let book_schema = Arc::new(Schema::new(vec![
+        Field::new("sym", DataType::Int64, false),
+        Field::new("level", DataType::Int64, false),
+        Field::new("bid_px", DataType::Float64, false),
+        Field::new("ask_px", DataType::Float64, false),
+        Field::new("bid_sz", DataType::Float64, false),
+        Field::new("ask_sz", DataType::Float64, false),
+    ]));
+    let book_batch = RecordBatch::try_new(
+        book_schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(sym)) as ArrayRef,
+            Arc::new(Int64Array::from(level)) as ArrayRef,
+            Arc::new(Float64Array::from(bid_px)) as ArrayRef,
+            Arc::new(Float64Array::from(ask_px)) as ArrayRef,
+            Arc::new(Float64Array::from(bsz)) as ArrayRef,
+            Arc::new(Float64Array::from(asz)) as ArrayRef,
+        ],
+    )?;
+    ctx.register_batches("book", book_schema, vec![book_batch])?;
+
+    // TC1: multi-column as-of join (price + spread) with 500us tolerance.
+    let spread: Vec<f64> = demo.prices.iter().map(|p| 0.02 + p * 0.0001).collect();
+    ctx.register_asof_join_multi(demo.times.clone(), demo.prices.clone(), spread, 500_000);
+
+    // TC5: point-in-time over a temporally-sorted series (vf ascending, vt = vf + 100).
+    let vf: Vec<i64> = (0..1000).collect();
+    let vt: Vec<i64> = vf.iter().map(|f| f + 100).collect();
+    ctx.register_point_in_time(vf, vt);
+
+    // TC3: wash-trade ring(3) over the transfer graph.
+    ctx.register_wash_trade(demo.transfers.csr());
+
+    // TC11–TC15: trade/quote micro-structure demo (aligned via as-of join).
+    let time: Vec<i64> = vec![100, 200, 300, 400, 500, 600];
+    let price = vec![180.50, 180.55, 180.55, 180.45, 180.45, 180.50];
+    let bid = vec![180.40, 180.50, 180.50, 180.40, 180.40, 180.45];
+    let ask = vec![180.60, 180.60, 180.55, 180.50, 180.50, 180.55];
+    let bid_size = vec![100.0, 200.0, 150.0, 300.0, 200.0, 250.0];
+    let ask_size = vec![200.0, 150.0, 100.0, 100.0, 150.0, 100.0];
+    let native_flag = vec!["BUY", "BUY", "SELL", "SELL", "BUY", "BUY"];
+    let t_schema = Arc::new(Schema::new(vec![
+        Field::new("time", DataType::Int64, false),
+        Field::new("price", DataType::Float64, false),
+        Field::new("bid", DataType::Float64, false),
+        Field::new("ask", DataType::Float64, false),
+        Field::new("bid_size", DataType::Float64, false),
+        Field::new("ask_size", DataType::Float64, false),
+        Field::new("native_flag", DataType::Utf8, false),
+    ]));
+    let t_batch = RecordBatch::try_new(
+        t_schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(time)) as ArrayRef,
+            Arc::new(Float64Array::from(price)) as ArrayRef,
+            Arc::new(Float64Array::from(bid)) as ArrayRef,
+            Arc::new(Float64Array::from(ask)) as ArrayRef,
+            Arc::new(Float64Array::from(bid_size)) as ArrayRef,
+            Arc::new(Float64Array::from(ask_size)) as ArrayRef,
+            Arc::new(StringArray::from(native_flag)) as ArrayRef,
+        ],
+    )?;
+    ctx.register_batches("t", t_schema, vec![t_batch])?;
+
+    Ok(())
+}
+
 
 /// Register the canonical vector collections (songs + tss_series) used by the
 /// KDB.AI parity tests TC-07 / TC-11, mirroring `testcase/data/gen_data.py`.
@@ -289,16 +449,6 @@ fn edges_active_at(edges: &EdgeTable, t: i64) -> RecordBatch {
     filter_record_batch(edges.batch(), &mask).expect("filter preserves schema")
 }
 
-/// Fetch a demo table by name (for `save`).
-fn demo_batch(demo: &Demo, name: &str) -> Result<RecordBatch> {
-    match name {
-        "nodes" => Ok(demo.graph.nodes().batch().clone()),
-        "edges" => Ok(edges_int64_batch(demo.graph.edges())?.1),
-        "prices" => Ok(prices_batch(&demo.times, &demo.prices)?.1),
-        _ => Err(anyhow!("unknown table `{name}` (try nodes|edges|prices)")),
-    }
-}
-
 /// Parse an optional `--mask a,b,c` flag into allowed node ids, if present.
 fn parse_mask(tokens: &[&str]) -> Result<Option<Vec<u64>>> {
     let Some(pos) = tokens.iter().position(|&t| t == "--mask") else {
@@ -317,12 +467,51 @@ fn parse_mask(tokens: &[&str]) -> Result<Option<Vec<u64>>> {
         .map(Some)
 }
 
-async fn run(demo: &Demo, ctx: &GtvContext, line: &str) -> Result<Action> {
+async fn run(
+    demo: &Demo,
+    ctx: &GtvContext,
+    line: &str,
+    mode: &mut SqlMode,
+    timing: &mut bool,
+    cache: &mut HashMap<String, KernelPlan>,
+) -> Result<Action> {
     let tokens: Vec<&str> = line.split_whitespace().collect();
     let Some(cmd) = tokens.first().copied() else {
         return Ok(Action::Continue);
     };
     match cmd {
+        "set" | "SET" => {
+            // SET DURATION = ON | OFF
+            let joined = tokens[1..].join(" ");
+            let lower = joined.trim_end_matches(';').trim().to_lowercase();
+            if lower == "duration = on" || lower == "duration=on" {
+                *timing = true;
+                println!("duration = on");
+            } else if lower == "duration = off" || lower == "duration=off" {
+                *timing = false;
+                println!("duration = off");
+            } else {
+                return Err(anyhow!(
+                    "usage: SET DURATION = ON | OFF (got `{joined}`)"
+                ));
+            }
+        }
+        "alter" | "ALTER" => {
+            // ALTER SESSION SET sqlmode = hft | full
+            let joined = tokens[1..].join(" ");
+            let lower = joined.trim_end_matches(';').trim().to_lowercase();
+            if lower == "session set sqlmode = hft" {
+                *mode = SqlMode::Hft;
+                println!("sqlmode = hft");
+            } else if lower == "session set sqlmode = full" {
+                *mode = SqlMode::Full;
+                println!("sqlmode = full");
+            } else {
+                return Err(anyhow!(
+                    "usage: ALTER SESSION SET sqlmode = hft | full (got `{joined}`)"
+                ));
+            }
+        }
         "help" | "?" => print_help(),
         "tables" => show_tables(demo),
         "neighbors" => {
@@ -383,9 +572,13 @@ async fn run(demo: &Demo, ctx: &GtvContext, line: &str) -> Result<Action> {
         "save" => {
             let table = require_arg(&tokens, 1, "save <table> <path>")?;
             let path = require_arg(&tokens, 2, "save <table> <path>")?;
-            let batch = demo_batch(demo, table)?;
-            parquet::write_batch(path, &batch)?;
-            println!("wrote `{table}` ({} rows) -> {path}", batch.num_rows());
+            let batches = ctx.sql(&format!("SELECT * FROM {table}")).await?;
+            let Some(first) = batches.first() else {
+                return Err(anyhow!("table `{table}` is empty"));
+            };
+            let all = concat_batches(&first.schema(), &batches)?;
+            parquet::write_batch(path, &all)?;
+            println!("wrote `{table}` ({} rows) -> {path}", all.num_rows());
         }
         "load" => {
             let table = require_arg(&tokens, 1, "load <table> <path>")?;
@@ -396,6 +589,37 @@ async fn run(demo: &Demo, ctx: &GtvContext, line: &str) -> Result<Action> {
             };
             ctx.register_batches(table, first.schema(), batches)?;
             println!("loaded `{table}` from {path}");
+        }
+        "loadcsv" => {
+            // Method 1/2: load CSV from disk and assign it to a session table.
+            let table = require_arg(&tokens, 1, "loadcsv <table> <path>")?;
+            let path = require_arg(&tokens, 2, "loadcsv <table> <path>")?;
+            ctx.register_csv(path, table)?;
+            println!("loaded `{table}` from {path}");
+        }
+        "bgload" => {
+            // Method 3: a background thread re-imports the data file (CSV or
+            // Parquet, auto-detected by extension) on an interval, refreshing
+            // the registered table the session can keep reading.
+            let table = require_arg(&tokens, 1, "bgload <table> <path> [interval_ms]")?.to_string();
+            let path = require_arg(&tokens, 2, "bgload <table> <path> [interval_ms]")?.to_string();
+            let interval_ms = optional_arg(&tokens, 3)
+                .map_or(Ok(1000u64), |s| s.parse::<u64>())?;
+            register_datafile(ctx, &path, &table)?;
+            println!("bgload: `{table}` <- {path} every {interval_ms}ms");
+            let ctx2 = ctx.clone();
+            std::thread::spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_millis(interval_ms));
+                match read_datafile(&path) {
+                    Ok(batches) => {
+                        if let Some(first) = batches.first() {
+                            ctx2.deregister_table(&table);
+                            let _ = ctx2.register_batches(&table, first.schema(), batches);
+                        }
+                    }
+                    Err(e) => eprintln!("bgload `{table}`: {e}"),
+                }
+            });
         }
         "tt" => {
             let table = require_arg(&tokens, 1, "tt <table> <T>")?;
@@ -473,22 +697,120 @@ async fn run(demo: &Demo, ctx: &GtvContext, line: &str) -> Result<Action> {
         "quit" | "exit" => return Ok(Action::Quit),
         "sql" => {
             let q = line.get(3..).unwrap_or("").trim();
-            run_sql(ctx, q).await?;
+            run_sql(ctx, q, timing).await?;
         }
         _ => {
             // Any other input is executed as SQL.
-            run_sql(ctx, line).await?;
+            if *mode == SqlMode::Hft {
+                // M2: precompiled KernelPlan fast path (compiled once, cached),
+                // covering bare table names, pit/wash/aj table functions and OFI.
+                if let Some(plan) = cache.get(line) {
+                    let t0 = Instant::now();
+                    let batch = plan.execute()?;
+                    let us = t0.elapsed().as_secs_f64() * 1e6;
+                    let _ = print_batches(std::slice::from_ref(&batch));
+                    if *timing {
+                        println!("duration: {us:.3} µs (kernel, cache hit)");
+                    }
+                    return Ok(Action::Continue);
+                }
+                if let Some(plan) = ctx.compile_hft(line) {
+                    let t0 = Instant::now();
+                    let batch = plan.execute()?;
+                    let us = t0.elapsed().as_secs_f64() * 1e6;
+                    let _ = print_batches(std::slice::from_ref(&batch));
+                    if *timing {
+                        println!("duration: {us:.3} µs (kernel, compiled)");
+                    }
+                    // Table plans re-read the registry on each compile (keeps
+                    // bgload-refreshed tables fresh); operator plans are cached.
+                    if !matches!(plan, KernelPlan::Table(_)) {
+                        cache.insert(line.to_string(), plan);
+                    }
+                    return Ok(Action::Continue);
+                }
+                // DataFusion-only table functions (file loaders / index search):
+                // wrap a bare `fn(args)` as `SELECT * FROM fn(args)`.
+                if tokens.len() == 1 && cmd.ends_with(')') {
+                    let fn_name = cmd.split('(').next().unwrap_or(cmd);
+                    if DF_TABLE_FNS.contains(&fn_name) {
+                        run_sql(ctx, &format!("SELECT * FROM {cmd}"), timing).await?;
+                        return Ok(Action::Continue);
+                    }
+                }
+                check_hft_subset(line)?;
+            }
+            run_sql(ctx, line, timing).await?;
         }
     }
     Ok(Action::Continue)
 }
 
-async fn run_sql(ctx: &GtvContext, query: &str) -> Result<()> {
+/// DataFusion table functions that have no KernelPlan fast path, callable as
+/// bare `fn(args)` shorthands in HFT mode.
+const DF_TABLE_FNS: &[&str] = &[
+    "read_csv",
+    "read_parquet",
+    "knn",
+    "vector_search",
+    "neighbors",
+];
+
+/// Read a data file, auto-detecting CSV vs Parquet by extension.
+fn read_datafile(path: &str) -> gtv_storage::Result<Vec<RecordBatch>> {
+    if path.ends_with(".parquet") || path.ends_with(".pq") {
+        gtv_storage::read_batches(path)
+    } else {
+        gtv_storage::read_csv(path)
+    }
+}
+
+/// Register a data file (CSV or Parquet) as a session table.
+fn register_datafile(ctx: &GtvContext, path: &str, name: &str) -> Result<()> {
+    if path.ends_with(".parquet") || path.ends_with(".pq") {
+        ctx.register_parquet(path, name)?;
+    } else {
+        ctx.register_csv(path, name)?;
+    }
+    Ok(())
+}
+
+/// HFT mode accepts only the latency-first subset: SELECT over tables/operators
+/// with simple WHERE/ORDER BY/LIMIT — no JOIN/GROUP BY/HAVING/CTE/subquery/UNION.
+fn check_hft_subset(sql: &str) -> Result<()> {
+    let upper = sql.to_uppercase();
+    let forbidden = [
+        "JOIN", "GROUP", "HAVING", "WITH", "UNION", "DISTINCT", "EXCEPT",
+        "INTERSECT", "CROSS", "LATERAL",
+    ];
+    for f in forbidden {
+        if upper.contains(f) {
+            return Err(anyhow!(
+                "hft mode does not support `{f}`; switch with: ALTER SESSION SET sqlmode = full"
+            ));
+        }
+    }
+    // Reject subqueries (`FROM (SELECT …)`, `IN (SELECT …)`), but keep the
+    // function-call parentheses that operators use (e.g. `ofi(a,b,c)`).
+    if upper.contains("(SELECT") || upper.contains("FROM (") {
+        return Err(anyhow!(
+            "hft mode does not support subqueries; switch with: ALTER SESSION SET sqlmode = full"
+        ));
+    }
+    Ok(())
+}
+
+async fn run_sql(ctx: &GtvContext, query: &str, timing: &bool) -> Result<()> {
     if query.trim().is_empty() {
         eprintln!("usage: `sql <query>`, or type a query directly (e.g. `SELECT * FROM prices`)");
         return Ok(());
     }
+    let t0 = Instant::now();
     let batches = ctx.sql(query).await?;
+    let us = t0.elapsed().as_secs_f64() * 1e6;
+    if *timing {
+        println!("duration: {us:.3} µs (sql)");
+    }
     if !batches.is_empty() {
         let _ = print_batches(&batches);
     }
@@ -537,6 +859,9 @@ fn print_help() {
          \x20 knn <node> [k] [--mask a,b,c]  HNSW K-NN over node embeddings\n\
          \x20 save <table> <path>   write a table to a Parquet file\n\
          \x20 load <table> <path>   load a Parquet file as a table\n\
+         \x20 loadcsv <table> <path>  load CSV from disk into a session table\n\
+         \x20 load <table> <path>   load Parquet from disk into a session table\n\
+         \x20 bgload <table> <path> [ms]  background re-import (CSV or Parquet)\n\
          \x20 tt <table> <T>        time-travel: table snapshot as-of T\n\
          \x20 pattern [T]           temporal pattern matching (ring/path/diamond)\n\
          \x20 delta                 LSM delta buffer insert + compaction demo\n\
@@ -544,13 +869,27 @@ fn print_help() {
          \x20 remote <host:port> <sql>  execute SQL on a remote gtv-server\n\
          \x20 quit | exit\n\
          \n\
-         SQL: any other input is executed as SQL over the `nodes`, `edges` and\n\
-         `prices` tables. Temporal columns are Int64 nanoseconds.\n\
-         \x20 SELECT src, dst FROM edges WHERE valid_from <= 150 AND 150 < valid_to;\n\
+         session:\n\
+         \x20 ALTER SESSION SET sqlmode = hft | full   (default: hft)\n\
+         \x20 SET DURATION = ON | OFF                  time each action (us)\n\
+         \n\
+         SQL (hft mode: thin subset + abbreviated ops + kdb shorthand):\n\
+         \x20 ticks / orders / book                   bare table name dumps rows\n\
+         \x20 pit(500) / wash(500)                    bare table fn == SELECT * FROM it\n\
+         \x20 SELECT t, ofi(bid,ask,bid_sz,ask_sz,100) OVER (ORDER BY t) FROM ticks;\n\
+         \x20 SELECT * FROM pit(500);\n\
+         \x20 SELECT * FROM wash(500);\n\
+         \x20 SELECT count(*) FROM orders WHERE risk(price,qty,mid,smp);\n\
+         \x20 SELECT sym, mp(bid_px,ask_px,bid_sz,ask_sz) FROM book WHERE level = 0;\n\
+         \n\
+         SQL (full mode: complete DataFusion SQL, full names):\n\
+         \x20 SELECT sym, order_book_imbalance(bid_sz,ask_sz) FROM book GROUP BY sym;\n\
+         \x20 SELECT id FROM vector_search('songs', '0.1,0.1', 3);\n\
+         \x20 SELECT * FROM asof_join(0, 5, 15, 25, 35, 45, 55, 60);\n\
          \x20 SELECT t, mavg(price, 3) OVER (ORDER BY t) FROM prices;\n\
-         \x20 SELECT t, msum(price, 2) OVER (ORDER BY t), deltas(price) OVER (ORDER BY t) FROM prices;\n\
-         \x20 SELECT * FROM neighbors(0, 100);\n\
-         \x20 SELECT * FROM asof_join(0, 5, 15, 25, 35, 45, 55, 60);"
+         \x20 SELECT * FROM read_csv('path/to/ticks.csv');\n\
+         \x20 SELECT * FROM read_parquet('path/to/ticks.parquet');\n\
+         \x20 CREATE TABLE t AS SELECT * FROM read_csv('path/to/ticks.csv');"
     );
 }
 

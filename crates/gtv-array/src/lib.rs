@@ -5,4 +5,5 @@
 //! Phase 2.
 
 pub mod asof;
+pub mod micro;
 pub mod window;

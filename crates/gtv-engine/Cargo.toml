@@ -9,4 +9,6 @@ datafusion.workspace = true
 arrow.workspace = true
 gtv-core = { path = "../gtv-core" }
 gtv-array = { path = "../gtv-array" }
+gtv-pattern = { path = "../gtv-pattern" }
+gtv-storage = { path = "../gtv-storage" }
 thiserror.workspace = true

@@ -40,6 +40,11 @@ pub struct TemporalCSR {
     valid_from: Vec<i64>,
     valid_to: Vec<i64>,
     edge_type: Vec<u16>,
+    /// Global temporal bounding box: `max_valid_from` is the largest `valid_from`
+    /// over all edges, `min_valid_to` the smallest `valid_to`. Together they let a
+    /// caller skip per-edge activity checks when every edge is active at a time.
+    max_valid_from: i64,
+    min_valid_to: i64,
 }
 
 impl TemporalCSR {
@@ -97,11 +102,15 @@ impl TemporalCSR {
         let mut vf_vec = Vec::with_capacity(n);
         let mut vt_vec = Vec::with_capacity(n);
         let mut et_vec = Vec::with_capacity(n);
+        let mut max_valid_from = i64::MIN;
+        let mut min_valid_to = i64::MAX;
         for r in &rows {
             dst_vec.push(r.dst);
             vf_vec.push(r.valid_from);
             vt_vec.push(r.valid_to);
             et_vec.push(r.edge_type);
+            max_valid_from = max_valid_from.max(r.valid_from);
+            min_valid_to = min_valid_to.min(r.valid_to);
         }
 
         Ok(Self {
@@ -111,6 +120,8 @@ impl TemporalCSR {
             valid_from: vf_vec,
             valid_to: vt_vec,
             edge_type: et_vec,
+            max_valid_from,
+            min_valid_to,
         })
     }
 
@@ -122,6 +133,16 @@ impl TemporalCSR {
         self.dst.len()
     }
 
+    /// True when *every* edge is active at `t` (`valid_from <= t < valid_to`).
+    ///
+    /// Uses the global temporal bounding box, so this is O(1) and lets hot loops
+    /// skip the per-edge activity test — which reads two columns and compares
+    /// twice per edge — when the answer is known up front.
+    #[inline]
+    pub fn all_active_at(&self, t: i64) -> bool {
+        t >= self.max_valid_from && t < self.min_valid_to
+    }
+
     #[inline]
     fn edge_range(&self, src: u64) -> Result<(usize, usize)> {
         if src >= self.node_count as u64 {
@@ -129,6 +150,25 @@ impl TemporalCSR {
         }
         let s = src as usize;
         Ok((self.offsets[s] as usize, self.offsets[s + 1] as usize))
+    }
+
+    /// Parallel raw edge slices for `src`: `(dst, valid_from, valid_to, edge_type)`
+    /// covering only that source's contiguous run.
+    ///
+    /// Pattern matching reads these directly to skip the per-edge [`Neighbor`]
+    /// struct and iterator closures of [`neighbors`], which dominate a
+    /// multi-million-node scan. The slices are sorted by `(valid_from, valid_to,
+    /// dst)` (the build sort key), so callers may also binary-search the active
+    /// range.
+    #[inline]
+    pub fn edge_slices(&self, src: u64) -> Result<(&[u64], &[i64], &[i64], &[u16])> {
+        let (start, end) = self.edge_range(src)?;
+        Ok((
+            &self.dst[start..end],
+            &self.valid_from[start..end],
+            &self.valid_to[start..end],
+            &self.edge_type[start..end],
+        ))
     }
 
     /// Neighbors of `src` active at `valid_at`.
