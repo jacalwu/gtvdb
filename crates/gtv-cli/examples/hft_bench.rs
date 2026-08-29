@@ -181,6 +181,9 @@ unsafe fn assume_init_f64(v: Vec<MaybeUninit<f64>>) -> Vec<f64> {
 ///   3. O(1) time-bucket radix index replacing the per-chunk `partition_point`
 ///      (kills the O(log M) random cache misses).
 ///   4. Bounded thread count (see `init_thread_pool`) to match memory channels.
+///   5. Branchless hot loop: slice iteration (no `start + i` re-add / bounds
+///      checks), `get_unchecked` on the sweep, no redundant `r_idx < len` branch,
+///      a bitmask select (no data-dependent branch) and `_mm_prefetch` ahead.
 ///
 /// `bucket_ms` is the coarse bucket width in ns (e.g. 1 ms). `left_ts` must be
 /// ascending. Correctness is asserted against [`asof_join_multi_ref`] in `main`.
@@ -249,23 +252,48 @@ fn asof_join_multi_l2_bucket(
                 r_idx -= 1;
             }
 
-            for i in 0..n {
-                let l_ts = left_ts[start + i];
-                while r_idx + 1 < right_ts.len() && right_ts[r_idx + 1] <= l_ts {
+            let l_slice = &left_ts[start..start + n];
+            let right_len = right_ts.len();
+
+            for (i, &l_ts) in l_slice.iter().enumerate() {
+                // SAFETY: the guard keeps r_idx + 1 < right_len, so the unchecked
+                // read of right_ts[r_idx + 1] is in-bounds.
+                while r_idx + 1 < right_len
+                    && unsafe { *right_ts.get_unchecked(r_idx + 1) } <= l_ts
+                {
                     r_idx += 1;
                 }
-                if r_idx < right_ts.len() {
-                    let diff = l_ts - right_ts[r_idx];
-                    if diff >= 0 && diff <= tolerance_ns {
-                        // SAFETY: r_idx < right_ts.len(); the three right-table
-                        // arrays share the same length by construction.
-                        p[i].write(unsafe { *right_price.get_unchecked(r_idx) });
-                        s[i].write(unsafe { *right_spread.get_unchecked(r_idx) });
-                        continue;
+
+                // SAFETY: r_idx < right_len always holds here (it starts <= len-1
+                // and the while only advances while r_idx + 1 < right_len), and the
+                // three right-table arrays share the same length by construction.
+                let diff = l_ts - unsafe { *right_ts.get_unchecked(r_idx) };
+                let is_valid = (diff >= 0) & (diff <= tolerance_ns);
+
+                // Prefetch the right-table value ~one cache line ahead so the next
+                // few iterations hit L1 instead of stalling on DRAM.
+                #[cfg(target_arch = "x86_64")]
+                if r_idx + 8 < right_len {
+                    unsafe {
+                        std::arch::x86_64::_mm_prefetch(
+                            right_price.as_ptr().add(r_idx + 8) as *const _,
+                            std::arch::x86_64::_MM_HINT_T0,
+                        );
+                        std::arch::x86_64::_mm_prefetch(
+                            right_spread.as_ptr().add(r_idx + 8) as *const _,
+                            std::arch::x86_64::_MM_HINT_T0,
+                        );
                     }
                 }
-                p[i].write(f64::NAN);
-                s[i].write(f64::NAN);
+
+                // Branchless select: valid keeps the raw bits, invalid yields NaN
+                // (0x7ff8_0000_0000_0000). No data-dependent branch / pipeline flush.
+                let mask = (is_valid as u64).wrapping_neg(); // 0 or u64::MAX
+                let nan = f64::NAN.to_bits();
+                let raw_p = unsafe { *right_price.get_unchecked(r_idx) }.to_bits();
+                let raw_s = unsafe { *right_spread.get_unchecked(r_idx) }.to_bits();
+                p[i].write(f64::from_bits((raw_p & mask) | (nan & !mask)));
+                s[i].write(f64::from_bits((raw_s & mask) | (nan & !mask)));
             }
         });
 
@@ -795,7 +823,7 @@ fn main() {
             query_us: q,
             bytes: (n * 32) as f64,
             threshold_us: if n == 1_000_000 { Some(5_000.0) } else { None },
-            note: "as-of join v2 (time-bucket + 8k chunk + bounded threads), 500µs lag".into(),
+            note: "as-of join v3 (bucket + 8k chunk + 8t + branchless/prefetch), 500µs lag".into(),
         });
     }
 
