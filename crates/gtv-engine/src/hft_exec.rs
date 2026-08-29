@@ -30,7 +30,7 @@ use gtv_pattern::{find, Pattern};
 // ---------------------------------------------------------------------------
 
 /// Named resources the KernelPlan binds to.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct HftRegistry {
     pub pit: HashMap<String, Arc<PitResource>>,
     pub asof: HashMap<String, Arc<AsofResource>>,
@@ -39,11 +39,13 @@ pub struct HftRegistry {
     pub tables: HashMap<String, Arc<Vec<RecordBatch>>>,
 }
 
+#[derive(Debug)]
 pub struct PitResource {
     pub valid_from: Arc<Vec<i64>>,
     pub valid_to: Arc<Vec<i64>>,
 }
 
+#[derive(Debug)]
 pub struct AsofResource {
     pub times: Arc<Vec<i64>>,
     pub price: Arc<Vec<f64>>,

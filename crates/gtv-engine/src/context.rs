@@ -47,10 +47,22 @@ impl GtvContext {
         ctx.register_udtf("vector_search", Arc::new(KnnTableFunction::new(knn_collections.clone())));
         ctx.register_udtf("read_csv", Arc::new(crate::csv::ReadCsvTableFunction::new()));
         ctx.register_udtf("read_parquet", Arc::new(crate::csv::ReadParquetTableFunction::new()));
+        let hft_reg = Arc::new(RwLock::new(HftRegistry::default()));
+        {
+            let tt = Arc::new(crate::hft_tf::TickToTradeTableFunction::new(hft_reg.clone()));
+            ctx.register_udtf("tick_to_trade", tt.clone());
+            ctx.register_udtf("ttrade", tt);
+            let mo = Arc::new(crate::hft_tf::MatchOrdersTableFunction::new(hft_reg.clone()));
+            ctx.register_udtf("match_orders", mo.clone());
+            ctx.register_udtf("match", mo);
+            let cv = Arc::new(crate::hft_tf::CovarianceTableFunction::new(hft_reg.clone()));
+            ctx.register_udtf("covariance_matrix", cv.clone());
+            ctx.register_udtf("cov", cv);
+        }
         Self {
             ctx,
             knn_collections,
-            hft_reg: Arc::new(RwLock::new(HftRegistry::default())),
+            hft_reg,
         }
     }
 

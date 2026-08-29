@@ -5,5 +5,6 @@
 //! Phase 2.
 
 pub mod asof;
+pub mod hft_ops;
 pub mod micro;
 pub mod window;

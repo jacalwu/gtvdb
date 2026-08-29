@@ -148,7 +148,13 @@ SELECT count(*) FROM orders WHERE risk_ok(price, qty, mid, smp); -- full
 
 ### TC7 — Tick-to-trade end-to-end (decode → strategy → encode)
 
-*Planned (M3) — not yet exposed as a SQL operator.*
+```sql
+SELECT * FROM tick_to_trade('mco', 100);   -- short: ttrade('mco', 100)
+-- returns (side, price, qty); side: 0 = buy, 1 = sell, 2 = none
+```
+
+Mean-reversion crossover signal over the trailing `mavg[window]`; e.g. over the
+2.5M-row `stocks_MCO_tick.parquet` it emits ~2.5M rows in one compiled pass.
 
 ### TC8 — L2 order-book imbalance + micro-price
 
@@ -158,13 +164,25 @@ SELECT sym, obi(bid_sz, ask_sz) FROM book GROUP BY sym;              -- order_bo
 SELECT sym, mp(bid_px, ask_px, bid_sz, ask_sz) FROM book WHERE level = 0;  -- micro_price
 ```
 
-### TC9 — Streaming 500×500 covariance matrix
+### TC9 — Streaming covariance matrix
 
-*Planned (M3) — not yet exposed as a SQL operator.*
+```sql
+SELECT * FROM covariance_matrix('returns', 3);  -- short: cov('returns', 3)
+-- returns the m×m sample covariance as (i, j, cov)
+```
+
+Takes a registered returns table with columns `ret_0 .. ret_{m-1}` and returns the
+`m × m` sample covariance.
 
 ### TC10 — Local matching engine (price-time priority)
 
-*Planned (M3) — not yet exposed as a SQL operator.*
+```sql
+SELECT * FROM match_orders('orderstream');     -- short: match('orderstream')
+-- returns (side, price, qty) fill events
+```
+
+Level-aggregate price-time matching over a registered order table with columns
+`side`, `is_mkt`, `price`, `qty`.
 
 ### TC11 — Lee-Ready algorithm (quote rule + tick-rule fallback)
 
@@ -221,8 +239,11 @@ FROM t;
 | TC4 | `knn` | `vector_search` | table fn |
 | TC5 | `pit` | `point_in_time` | table fn |
 | TC6 | `risk` | `risk_ok` | scalar |
+| TC7 | `ttrade` | `tick_to_trade` | table fn |
 | TC8 | `obi` | `order_book_imbalance` | aggregate |
 | TC8 | `mp` | `micro_price` | scalar |
+| TC9 | `cov` | `covariance_matrix` | table fn |
+| TC10 | `match` | `match_orders` | table fn |
 | TC11 | `lr` | `lee_ready` | window |
 | TC12 | `tick` | `tick_rule` | window |
 | TC13 | `emo` | `emo` | window |
@@ -263,8 +284,11 @@ udf [x ...]                remote <host:port> <sql>
 
 ## 8. Notes
 
-- TC7 (tick-to-trade), TC9 (streaming covariance) and TC10 (matching engine) are
-  stateful operators planned for the M3 milestone; currently benchmarked in
-  `hft_bench_tc6_tc10` as compiled kernels but not yet exposed as SQL operators.
 - The `full` mode is the complete DataFusion SQL surface; the `hft` mode is the
   latency-first subset (no JOIN / GROUP BY / CTE / subquery).
+- Real tick samples (`stocks_{MCO,NVDA,TSLA}_tick.parquet`, ~2.5M rows each, from
+  London Strategic Edge) live under `testcase/hft/data/`:
+  ```text
+  gtv> load mco testcase/hft/data/stocks_MCO_tick.parquet
+  gtv> SELECT count(*) FROM tick_to_trade('mco', 100);
+  ```

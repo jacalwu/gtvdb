@@ -147,7 +147,13 @@ SELECT count(*) FROM orders WHERE risk_ok(price, qty, mid, smp); -- 全名
 
 ### TC7 — Tick-to-Trade 端到端（解碼 → 策略 → 編碼）
 
-*規劃中（M3）—— 尚未開放為 SQL 算子。*
+```sql
+SELECT * FROM tick_to_trade('mco', 100);   -- 簡稱：ttrade('mco', 100)
+-- 回傳 (side, price, qty)；side：0=買、1=賣、2=無
+```
+
+均值回歸交叉訊號（價格穿越尾部 `mavg[window]`）；例如對 250 萬列的
+`stocks_MCO_tick.parquet` 一次編譯掃描產出 ~250 萬列。
 
 ### TC8 — L2 訂單簿不平衡 + 微觀價格
 
@@ -157,13 +163,23 @@ SELECT sym, obi(bid_sz, ask_sz) FROM book GROUP BY sym;              -- order_bo
 SELECT sym, mp(bid_px, ask_px, bid_sz, ask_sz) FROM book WHERE level = 0;  -- micro_price
 ```
 
-### TC9 — 流式 500×500 協方差矩陣
+### TC9 — 流式協方差矩陣
 
-*規劃中（M3）—— 尚未開放為 SQL 算子。*
+```sql
+SELECT * FROM covariance_matrix('returns', 3);  -- 簡稱：cov('returns', 3)
+-- 回傳 m×m 樣本協方差，格式 (i, j, cov)
+```
+
+讀取已註冊的 returns 表（欄位 `ret_0 .. ret_{m-1}`），回傳 `m × m` 樣本協方差。
 
 ### TC10 — 本地撮合引擎（價格-時間優先）
 
-*規劃中（M3）—— 尚未開放為 SQL 算子。*
+```sql
+SELECT * FROM match_orders('orderstream');     -- 簡稱：match('orderstream')
+-- 回傳 (side, price, qty) 成交事件
+```
+
+對已註冊訂單表（欄位 `side`、`is_mkt`、`price`、`qty`）做價格-時間優先撮合。
 
 ### TC11 — Lee-Ready 演算法（報價規則 + 跳價規則備用）
 
@@ -220,8 +236,11 @@ FROM t;
 | TC4 | `knn` | `vector_search` | 表函數 |
 | TC5 | `pit` | `point_in_time` | 表函數 |
 | TC6 | `risk` | `risk_ok` | 純量 |
+| TC7 | `ttrade` | `tick_to_trade` | 表函數 |
 | TC8 | `obi` | `order_book_imbalance` | 聚合 |
 | TC8 | `mp` | `micro_price` | 純量 |
+| TC9 | `cov` | `covariance_matrix` | 表函數 |
+| TC10 | `match` | `match_orders` | 表函數 |
 | TC11 | `lr` | `lee_ready` | 視窗 |
 | TC12 | `tick` | `tick_rule` | 視窗 |
 | TC13 | `emo` | `emo` | 視窗 |
@@ -261,8 +280,11 @@ udf [x ...]                remote <host:port> <sql>
 
 ## 8. 備註
 
-- TC7（tick-to-trade）、TC9（流式協方差）、TC10（撮合引擎）屬狀態式算子，規劃於
-  M3 里程碑；目前在 `hft_bench_tc6_tc10` 中以 compiled kernel 做基準測試，尚未開放
-  為 SQL 算子。
 - `full` 模式是完整 DataFusion SQL；`hft` 模式是低延遲子集（不支援 JOIN / GROUP BY
   / CTE / 子查詢）。
+- 真實 tick 樣本（`stocks_{MCO,NVDA,TSLA}_tick.parquet`，各約 250 萬列，取自
+  London Strategic Edge）位於 `testcase/hft/data/`：
+  ```text
+  gtv> load mco testcase/hft/data/stocks_MCO_tick.parquet
+  gtv> SELECT count(*) FROM tick_to_trade('mco', 100);
+  ```

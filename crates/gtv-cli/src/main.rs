@@ -353,6 +353,40 @@ fn register_hft_demo(ctx: &GtvContext, demo: &Demo) -> Result<()> {
     )?;
     ctx.register_batches("t", t_schema, vec![t_batch])?;
 
+    // TC9: aligned returns table (3 series), for covariance_matrix.
+    let returns_schema = Arc::new(Schema::new(vec![
+        Field::new("ret_0", DataType::Float64, false),
+        Field::new("ret_1", DataType::Float64, false),
+        Field::new("ret_2", DataType::Float64, false),
+    ]));
+    let returns_batch = RecordBatch::try_new(
+        returns_schema.clone(),
+        vec![
+            Arc::new(Float64Array::from(vec![0.010, 0.005, -0.020, 0.015, -0.010])) as ArrayRef,
+            Arc::new(Float64Array::from(vec![0.008, 0.004, -0.018, 0.012, -0.008])) as ArrayRef,
+            Arc::new(Float64Array::from(vec![0.012, 0.006, -0.022, 0.018, -0.012])) as ArrayRef,
+        ],
+    )?;
+    ctx.register_batches("returns", returns_schema, vec![returns_batch])?;
+
+    // TC10: order stream (side, is_mkt, price, qty) for the matching engine.
+    let orders_schema = Arc::new(Schema::new(vec![
+        Field::new("side", DataType::Float64, false),
+        Field::new("is_mkt", DataType::Float64, false),
+        Field::new("price", DataType::Float64, false),
+        Field::new("qty", DataType::Float64, false),
+    ]));
+    let orders_batch = RecordBatch::try_new(
+        orders_schema.clone(),
+        vec![
+            Arc::new(Float64Array::from(vec![1.0, 0.0, 1.0, 0.0, 0.0, 1.0])) as ArrayRef,
+            Arc::new(Float64Array::from(vec![0.0, 1.0, 0.0, 1.0, 0.0, 1.0])) as ArrayRef,
+            Arc::new(Float64Array::from(vec![100.0, 100.0, 99.5, 100.0, 100.2, 99.0])) as ArrayRef,
+            Arc::new(Float64Array::from(vec![10.0, 5.0, 8.0, 3.0, 6.0, 4.0])) as ArrayRef,
+        ],
+    )?;
+    ctx.register_batches("orderstream", orders_schema, vec![orders_batch])?;
+
     Ok(())
 }
 
@@ -729,14 +763,12 @@ async fn run(
                     }
                     return Ok(Action::Continue);
                 }
-                // DataFusion-only table functions (file loaders / index search):
-                // wrap a bare `fn(args)` as `SELECT * FROM fn(args)`.
-                if tokens.len() == 1 && cmd.ends_with(')') {
-                    let fn_name = cmd.split('(').next().unwrap_or(cmd);
-                    if DF_TABLE_FNS.contains(&fn_name) {
-                        run_sql(ctx, &format!("SELECT * FROM {cmd}"), timing).await?;
-                        return Ok(Action::Continue);
-                    }
+                // DataFusion-only table functions (file loaders / index search /
+                // stateful ops): wrap a bare `fn(args)` as `SELECT * FROM fn(args)`.
+                let fn_name = cmd.split('(').next().unwrap_or(cmd);
+                if cmd.contains('(') && DF_TABLE_FNS.contains(&fn_name) {
+                    run_sql(ctx, &format!("SELECT * FROM {line}"), timing).await?;
+                    return Ok(Action::Continue);
                 }
                 check_hft_subset(line)?;
             }
@@ -754,6 +786,12 @@ const DF_TABLE_FNS: &[&str] = &[
     "knn",
     "vector_search",
     "neighbors",
+    "tick_to_trade",
+    "ttrade",
+    "match_orders",
+    "match",
+    "covariance_matrix",
+    "cov",
 ];
 
 /// Read a data file, auto-detecting CSV vs Parquet by extension.
@@ -881,6 +919,7 @@ fn print_help() {
          \x20 SELECT * FROM wash(500);\n\
          \x20 SELECT count(*) FROM orders WHERE risk(price,qty,mid,smp);\n\
          \x20 SELECT sym, mp(bid_px,ask_px,bid_sz,ask_sz) FROM book WHERE level = 0;\n\
+         \x20 tick_to_trade('mco', 100) / match_orders('orderstream') / covariance_matrix('returns', 3);\n\
          \n\
          SQL (full mode: complete DataFusion SQL, full names):\n\
          \x20 SELECT sym, order_book_imbalance(bid_sz,ask_sz) FROM book GROUP BY sym;\n\
