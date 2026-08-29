@@ -17,3 +17,4 @@ rustyline = "14"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time"] }
 tonic = "0.14"
 prost = "0.14"
+rayon = "1"

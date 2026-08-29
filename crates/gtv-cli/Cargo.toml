@@ -22,3 +22,4 @@ arrow.workspace = true
 anyhow.workspace = true
 rustyline.workspace = true
 tokio.workspace = true
+rayon.workspace = true
