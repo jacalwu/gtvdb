@@ -1,24 +1,23 @@
 [package]
-name = "gtv-cli"
+name = "gtv-server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "gtv"
+name = "gtv-server"
 path = "src/main.rs"
 
 [dependencies]
 gtv-core = { path = "../gtv-core" }
-gtv-array = { path = "../gtv-array" }
 gtv-engine = { path = "../gtv-engine" }
-gtv-index = { path = "../gtv-index" }
-gtv-storage = { path = "../gtv-storage" }
-gtv-delta = { path = "../gtv-delta" }
-gtv-pattern = { path = "../gtv-pattern" }
-gtv-udf = { path = "../gtv-udf" }
 gtv-proto = { path = "../gtv-proto" }
 arrow.workspace = true
 anyhow.workspace = true
-rustyline.workspace = true
+tokio.workspace = true
+tonic.workspace = true
+
+[dev-dependencies]
+gtv-proto = { path = "../gtv-proto" }
+arrow.workspace = true
 tokio.workspace = true

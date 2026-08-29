@@ -34,10 +34,10 @@ crates/
 ├── gtv-delta/   # LSM Delta Buffer + Compaction
 ├── gtv-pattern/ # 時序圖 Pattern Matching（path/diamond/ring）
 ├── gtv-udf/     # wasmtime 沙盒 UDF
+├── gtv-proto/   # tonic gRPC 服務定義 + Arrow IPC 編解碼
+├── gtv-server/  # gRPC QueryService 端點（bin: gtv-server）
 └── gtv-cli/     # 互動式 SQL REPL（bin: gtv）
 ```
-
-後續（P5）：tonic gRPC + Arrow Flight 分散式。
 
 ---
 
@@ -74,4 +74,19 @@ tt <table> <T>                 time-travel：讀取 T 時間點（或之前）�
 pattern [T]                    時序圖 Pattern Matching（ring / path / diamond）
 delta                          LSM Delta Buffer 插入 + Compaction 示範
 udf [x ...]                    wasmtime 沙盒 UDF（x * 1.1）
+remote <host:port> <sql>       喺遠端 gtv-server 執行 SQL
 ```
+
+### 分散式（P5）
+
+```sh
+# 終端 A：啟動 gRPC 端點（預設 0.0.0.0:50051，可用 GTV_ADDR 覆寫）
+cargo run -p gtv-server --bin gtv-server
+
+# 終端 B：由 REPL 派送 SQL 到遠端節點
+cargo run -p gtv-cli --bin gtv
+gtv> remote 127.0.0.1:50051 SELECT * FROM numbers ORDER BY n
+```
+
+`QueryService.Execute` 收 SQL、回傳以 Arrow IPC stream（Flight wire format）編碼嘅
+結果 batches；client 端 `gtv_proto::query_remote` 解碼後直接印出。

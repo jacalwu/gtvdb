@@ -415,6 +415,17 @@ async fn run(demo: &Demo, ctx: &GtvContext, line: &str) -> Result<Action> {
                 println!("  {x} -> {y}");
             }
         }
+        "remote" => {
+            let addr = require_arg(&tokens, 1, "remote <host:port> <sql>")?;
+            let sql = tokens[2..].join(" ");
+            if sql.is_empty() {
+                return Err(anyhow!("usage: remote <host:port> <sql>"));
+            }
+            let batches = gtv_proto::query_remote(addr, &sql).await?;
+            if !batches.is_empty() {
+                let _ = print_batches(&batches);
+            }
+        }
         "quit" | "exit" => return Ok(Action::Quit),
         "sql" => {
             let q = line.get(3..).unwrap_or("").trim();
@@ -486,6 +497,7 @@ fn print_help() {
          \x20 pattern [T]           temporal pattern matching (ring/path/diamond)\n\
          \x20 delta                 LSM delta buffer insert + compaction demo\n\
          \x20 udf [x ...]           WASM sandbox UDF (x * 1.1) over prices\n\
+         \x20 remote <host:port> <sql>  execute SQL on a remote gtv-server\n\
          \x20 quit | exit\n\
          \n\
          SQL: any other input is executed as SQL over the `nodes`, `edges` and\n\

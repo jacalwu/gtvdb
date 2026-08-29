@@ -1,0 +1,16 @@
+[package]
+name = "gtv-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[build-dependencies]
+tonic-prost-build = "0.14"
+protoc-bin-vendored = "3"
+
+[dependencies]
+anyhow.workspace = true
+arrow.workspace = true
+prost.workspace = true
+tonic.workspace = true
+tonic-prost = "0.14"

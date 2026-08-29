@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package gtvquery;
+
+// A cross-node query dispatch service: a client sends SQL, the server executes
+// it against its local DataFusion context and returns the result batches as an
+// Arrow IPC stream (the Flight wire format).
+service QueryService {
+  rpc Execute (QueryRequest) returns (QueryResponse);
+}
+
+message QueryRequest {
+  string sql = 1;
+}
+
+message QueryResponse {
+  // Arrow IPC stream encoding the result RecordBatches (empty on error).
+  bytes arrow_ipc = 1;
+  // Non-empty when execution or serialization failed.
+  string error = 2;
+}

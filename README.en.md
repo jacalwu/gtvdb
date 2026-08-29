@@ -29,10 +29,10 @@ crates/
 ├── gtv-delta/   # LSM delta buffer + compaction
 ├── gtv-pattern/ # temporal graph pattern matching (path/diamond/ring)
 ├── gtv-udf/     # wasmtime sandbox UDF
+├── gtv-proto/   # tonic gRPC service definition + Arrow IPC codec
+├── gtv-server/  # gRPC QueryService endpoint (bin: gtv-server)
 └── gtv-cli/     # interactive SQL REPL (bin: gtv)
 ```
-
-Planned (P5): distributed query dispatch via tonic gRPC + Arrow Flight.
 
 ---
 
@@ -70,4 +70,20 @@ tt <table> <T>                 time-travel: read the snapshot at or before T
 pattern [T]                    temporal graph pattern matching (ring/path/diamond)
 delta                          LSM delta buffer insert + compaction demo
 udf [x ...]                    wasmtime sandbox UDF (x * 1.1)
+remote <host:port> <sql>       execute SQL on a remote gtv-server
 ```
+
+### Distributed query dispatch (P5)
+
+```sh
+# terminal A: start the gRPC endpoint (default 0.0.0.0:50051, override via GTV_ADDR)
+cargo run -p gtv-server --bin gtv-server
+
+# terminal B: dispatch SQL to the remote node from the REPL
+cargo run -p gtv-cli --bin gtv
+gtv> remote 127.0.0.1:50051 SELECT * FROM numbers ORDER BY n
+```
+
+`QueryService.Execute` takes SQL and returns the result batches encoded as an
+Arrow IPC stream (the Flight wire format); the client-side `gtv_proto::query_remote`
+decodes them for display.
