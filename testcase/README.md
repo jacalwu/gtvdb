@@ -62,14 +62,23 @@ This regenerates the canonical CSV datasets (identical to the demo data shipped
 in `gtv-cli`) and prints the L2 K-NN reference rankings used as oracles for the
 vector test cases (TC-07, TC-11).
 
-## P5 (distributed) hook
+## P5 (distributed) tests — TC-09 / TC-10
 
-The P5 gRPC contract already exists in `crates/gtv-proto/proto/gtvquery.proto`
-(`QueryService.Execute` returning Arrow IPC bytes). TC-09 and TC-10 (and the SQL
-variants of TC-01..04, TC-08) target that service once the server binary exists.
-Point `run_tests.sh` at the P5 client by setting `GTV_P5_CLIENT`; the runner then
-replays the same scripts through the distributed endpoint and diffs against the
-same golden files (see `TEST_PLAN.md` §5).
+The single-node golden tests (TC-01..08, TC-11) run via `./run_tests.sh`. The two
+distributed cases are Rust integration tests that spin up a `gtv-server` on an
+ephemeral port and drive it through `gtv_proto::query_remote`:
 
-`gtv_proto::query_remote(addr, sql)` is a ready-made client helper for replaying
-the SQL test cases over the network.
+```sh
+cargo test -p gtv-server --test p5_distributed
+```
+
+- `tc09_distributed_sql_parity` — replays the SQL variants of TC-01..04 (+ vector
+  K-NN) over gRPC and asserts `RecordBatch` parity with a local `GtvContext`.
+- `tc10_arrow_ipc_transport_integrity` — transports a 1,000,000-row result over
+  the Arrow IPC payload and verifies row count + column checksum survive
+  losslessly.
+
+The gRPC contract lives in `crates/gtv-proto/proto/gtvquery.proto`
+(`QueryService.Execute` returning Arrow IPC bytes); `gtv_proto::query_remote` is
+the client helper. Both client and server lift tonic's default 4 MiB message cap
+so large result sets can be shipped as a single payload.

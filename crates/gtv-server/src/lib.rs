@@ -68,7 +68,11 @@ pub async fn serve(addr: SocketAddr) -> Result<()> {
     let svc = service()?;
     println!("gtv-server listening on {addr}");
     tonic::transport::Server::builder()
-        .add_service(QueryServiceServer::new(svc))
+        .add_service(
+            QueryServiceServer::new(svc)
+                .max_decoding_message_size(usize::MAX)
+                .max_encoding_message_size(usize::MAX),
+        )
         .serve(addr)
         .await?;
     Ok(())

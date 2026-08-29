@@ -61,8 +61,8 @@ Dataset summary:
 | TC-06 | Vector K-NN with bitmask filter          | ✅                  | —           | `expected/tc06_knn.txt`                       |
 | TC-07 | Temporal similarity search (TSS)         | ✅                  | ✅ (SQL)    | `expected/tc07_tss.txt`                       |
 | TC-08 | Parquet persistence + time-travel        | ✅                  | ✅ (SQL)    | `expected/tc08_tt_save_load.txt`              |
-| TC-09 | Distributed SQL dispatch (gRPC) parity   | —                   | ✅          | compare vs TC-01..04, TC-08 golden            |
-| TC-10 | Arrow IPC transport integrity            | —                   | ✅          | row-count / checksum, see §6                  |
+| TC-09 | Distributed SQL dispatch (gRPC) parity   | ✅ (cargo test)     | ✅          | `gtv-server/tests/p5_distributed.rs`          |
+| TC-10 | Arrow IPC transport integrity            | ✅ (cargo test)     | ✅          | `gtv-server/tests/p5_distributed.rs`          |
 | TC-11 | Metadata-filtered K-NN (songs)           | ✅                  | ✅ (SQL)    | `expected/tc11_songs.txt`                     |
 
 > "Runnable now" means the single-node `gtv` REPL already produces the golden
@@ -166,6 +166,9 @@ Dataset summary:
 - **Procedure**: for each SQL statement in `scripts/tc0*.gtv`, send it via
   `QueryService.Execute(QueryRequest{ sql })` (helper: `gtv_proto::query_remote`),
   decode the Arrow IPC response, and diff against the corresponding golden.
+- **Implementation**: `gtv-server/tests/p5_distributed.rs::tc09_distributed_sql_parity`
+  replays the SQL variants of TC-01..04 (+ vector K-NN) over gRPC and asserts
+  `RecordBatch`-level parity with a local `GtvContext`.
 - **Pass**: 100% parity. Un-ordered queries are compared after `ORDER BY` (or as
   multisets); ordered queries must match exactly.
 
@@ -178,6 +181,11 @@ Dataset summary:
   2. Execute it via `Execute` and decode the `arrow_ipc` bytes.
   3. Assert: schema matches; total row count == expected; a column checksum
      (e.g., `SUM(t)` / `SUM(price)`) matches the single-node computation.
+- **Implementation**: `gtv-server/tests/p5_distributed.rs::tc10_arrow_ipc_transport_integrity`
+  transports a 10^6-row `numbers` six-way cross join and checks row count
+  (`1_000_000`) plus a column checksum (`SUM(x) == 5_500_000`). The gRPC client
+  and server both lift tonic's default 4 MiB message cap to allow a single large
+  IPC payload.
 - **Pass**: row count + checksum match; decode succeeds without error.
 - **Note**: if the P5 coordinator later upgrades to true Arrow Flight `DoGet`
   streaming (rather than a single IPC payload), this test is unchanged in intent —

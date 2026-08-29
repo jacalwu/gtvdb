@@ -46,10 +46,15 @@ pub fn decode_batches(data: &[u8]) -> arrow::error::Result<Vec<RecordBatch>> {
 
 /// Execute `sql` on a remote gtv-server at `addr` (e.g. `127.0.0.1:50051`).
 pub async fn query_remote(addr: &str, sql: &str) -> anyhow::Result<Vec<RecordBatch>> {
-    let mut client = gtvquery::query_service_client::QueryServiceClient::connect(format!(
+    let client = gtvquery::query_service_client::QueryServiceClient::connect(format!(
         "http://{addr}"
     ))
     .await?;
+    // Lift tonic's default 4 MiB message cap so large result sets (TC-10) can
+    // be transported as a single Arrow IPC payload.
+    let mut client = client
+        .max_decoding_message_size(usize::MAX)
+        .max_encoding_message_size(usize::MAX);
     let response = client
         .execute(QueryRequest {
             sql: sql.to_string(),
