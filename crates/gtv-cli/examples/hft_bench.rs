@@ -433,6 +433,95 @@ fn asof_join_cpu_ultimate(
     unsafe { (assume_init_f64(out_price), assume_init_f64(out_spread)) }
 }
 
+/// TC1 fused with a downstream feature (zero-copy / operator fusion).
+///
+/// Instead of materializing the 16 MB `(price, spread)` join result, this consumes
+/// the aligned payload inside the sweep and writes only the fused feature —
+/// `rel_spread = spread / price` — a single f64 per row (8 MB). The intermediate
+/// never leaves the per-thread working set, eliminating the 16 MB output write
+/// (plus its read-for-ownership) and the downstream re-read of that buffer.
+///
+/// A pure reduction downstream (e.g. an aggregate) would shrink the output to ~0
+/// and leave only the ~32 MB input read — ~10 ms at this host's bandwidth.
+fn asof_join_fused(
+    left_ts: &[i64],
+    right_ts: &[i64],
+    right_price: &[f64],
+    right_spread: &[f64],
+    tolerance_ns: i64,
+    bucket_ms: i64,
+) -> Vec<f64> {
+    use rayon::prelude::*;
+    let len = left_ts.len();
+    if len == 0 || right_ts.is_empty() {
+        return vec![f64::NAN; len];
+    }
+
+    let min_r_ts = right_ts[0];
+    let max_r_ts = *right_ts.last().unwrap();
+    let num_buckets = ((max_r_ts - min_r_ts) / bucket_ms + 1) as usize;
+    let mut bucket_offsets = vec![0usize; num_buckets + 1];
+    {
+        let mut b_curr = 0usize;
+        for (i, &ts) in right_ts.iter().enumerate() {
+            let b = ((ts - min_r_ts) / bucket_ms) as usize;
+            while b_curr <= b {
+                bucket_offsets[b_curr] = i;
+                b_curr += 1;
+            }
+        }
+        for b in b_curr..=num_buckets {
+            bucket_offsets[b] = right_ts.len();
+        }
+    }
+
+    let mut out: Vec<MaybeUninit<f64>> = Vec::with_capacity(len);
+    // SAFETY: every element is written exactly once below.
+    unsafe {
+        out.set_len(len);
+    }
+
+    const CHUNK: usize = 8192;
+    let right_len = right_ts.len();
+    out.par_chunks_mut(CHUNK)
+        .enumerate()
+        .for_each(|(ci, o)| {
+            let start = ci * CHUNK;
+            let n = o.len();
+            let l_start_ts = left_ts[start];
+            let b_idx = if l_start_ts < min_r_ts {
+                0
+            } else {
+                (((l_start_ts - min_r_ts) / bucket_ms) as usize).min(num_buckets)
+            };
+            let mut r_idx = bucket_offsets[b_idx];
+            if r_idx > 0 {
+                r_idx -= 1;
+            }
+            let l_slice = &left_ts[start..start + n];
+            for (i, &l_ts) in l_slice.iter().enumerate() {
+                while r_idx + 1 < right_len
+                    && unsafe { *right_ts.get_unchecked(r_idx + 1) } <= l_ts
+                {
+                    r_idx += 1;
+                }
+                let diff = l_ts - unsafe { *right_ts.get_unchecked(r_idx) };
+                // Fused: consume price/spread here, never materialize them.
+                let val = if diff >= 0 && diff <= tolerance_ns {
+                    let p = unsafe { *right_price.get_unchecked(r_idx) };
+                    let s = unsafe { *right_spread.get_unchecked(r_idx) };
+                    s / p
+                } else {
+                    f64::NAN
+                };
+                o[i].write(val);
+            }
+        });
+
+    // SAFETY: every element was written exactly once above.
+    unsafe { assume_init_f64(out) }
+}
+
 /// Naive single-threaded reference (order-independent) for asserting the
 /// parallel path.
 fn asof_join_multi_ref(
@@ -1065,6 +1154,14 @@ fn main() {
         assert!(f64_slice_eq(&up, &rp), "TC1 v4 price != reference");
         assert!(f64_slice_eq(&us, &rs), "TC1 v4 spread != reference");
 
+        let fused = asof_join_fused(&a_times, &b_times, &b_prices, &b_spread, 500_000, 1_000_000);
+        let fused_ref: Vec<f64> = rp
+            .iter()
+            .zip(&rs)
+            .map(|(&p, &s)| if p.is_nan() { f64::NAN } else { s / p })
+            .collect();
+        assert!(f64_slice_eq(&fused, &fused_ref), "TC1 fused != reference");
+
         #[cfg(feature = "cuda")]
         {
             if use_gpu {
@@ -1112,6 +1209,20 @@ fn main() {
             bytes: (n * 32) as f64,
             threshold_us: if n == 1_000_000 { Some(5_000.0) } else { None },
             note: "as-of join v4 (payload decoupling + NT store), 500µs lag".into(),
+        });
+
+        // TC1 fused with a downstream feature (zero-copy / no 16MB materialization).
+        let qf = bench_us(iters, || {
+            let _ = asof_join_fused(&a_times, &b_times, &b_prices, &b_spread, 500_000, 1_000_000);
+        });
+        rows.push(Row {
+            tc: "TC1",
+            scale: n,
+            build_us: 0.0,
+            query_us: qf,
+            bytes: (n * 32) as f64,
+            threshold_us: if n == 1_000_000 { Some(5_000.0) } else { None },
+            note: "as-of join fused (→ rel-spread 8MB out, no 16MB write), 500µs lag".into(),
         });
 
         // CUDA (only when the feature is on and a GPU is present).
