@@ -1,0 +1,11 @@
+[package]
+name = "gtv-udf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+# Minimal wasmtime: JIT compilation + core runtime, no component-model/async/GC.
+wasmtime = { version = "48", default-features = false, features = ["anyhow", "cranelift", "runtime", "std"] }
+wat = "1"

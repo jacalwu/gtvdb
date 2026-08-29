@@ -31,10 +31,13 @@ crates/
 ├── gtv-engine/  # DataFusion 整合：GtvContext、WindowUDF、table function
 ├── gtv-index/   # 向量檢索：FlatIndex（精確）+ HnswIndex（近似，bitmask 剪枝）
 ├── gtv-storage/ # Arrow ↔ Parquet + SnapshotStore（time-travel 多版本）
+├── gtv-delta/   # LSM Delta Buffer + Compaction
+├── gtv-pattern/ # 時序圖 Pattern Matching（path/diamond/ring）
+├── gtv-udf/     # wasmtime 沙盒 UDF
 └── gtv-cli/     # 互動式 SQL REPL（bin: gtv）
 ```
 
-後續（P4–P5）：WASM UDF 沙盒、LSM Delta 分層。
+後續（P5）：tonic gRPC + Arrow Flight 分散式。
 
 ---
 
@@ -68,4 +71,7 @@ knn <node> [k] [--mask a,b,c]  HNSW K-NN 向量檢索（可加 bitmask 過濾）
 save <table> <path>            將表寫成 Parquet
 load <table> <path>            載入 Parquet 成為新表
 tt <table> <T>                 time-travel：讀取 T 時間點（或之前）嘅快照
+pattern [T]                    時序圖 Pattern Matching（ring / path / diamond）
+delta                          LSM Delta Buffer 插入 + Compaction 示範
+udf [x ...]                    wasmtime 沙盒 UDF（x * 1.1）
 ```

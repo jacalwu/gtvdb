@@ -26,10 +26,13 @@ crates/
 ├── gtv-engine/  # DataFusion integration: GtvContext, WindowUDFs, table functions
 ├── gtv-index/   # vector search: FlatIndex (exact) + HnswIndex (approx, bitmask pruning)
 ├── gtv-storage/ # Arrow ↔ Parquet + SnapshotStore (multi-version time-travel)
+├── gtv-delta/   # LSM delta buffer + compaction
+├── gtv-pattern/ # temporal graph pattern matching (path/diamond/ring)
+├── gtv-udf/     # wasmtime sandbox UDF
 └── gtv-cli/     # interactive SQL REPL (bin: gtv)
 ```
 
-Planned (P4–P5): WASM UDF sandbox and LSM delta storage tiering.
+Planned (P5): distributed query dispatch via tonic gRPC + Arrow Flight.
 
 ---
 
@@ -64,4 +67,7 @@ knn <node> [k] [--mask a,b,c]  HNSW K-NN vector search (with optional bitmask fi
 save <table> <path>            write a table to Parquet
 load <table> <path>            load a Parquet file as a new table
 tt <table> <T>                 time-travel: read the snapshot at or before T
+pattern [T]                    temporal graph pattern matching (ring/path/diamond)
+delta                          LSM delta buffer insert + compaction demo
+udf [x ...]                    wasmtime sandbox UDF (x * 1.1)
 ```

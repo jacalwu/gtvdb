@@ -14,6 +14,9 @@ gtv-array = { path = "../gtv-array" }
 gtv-engine = { path = "../gtv-engine" }
 gtv-index = { path = "../gtv-index" }
 gtv-storage = { path = "../gtv-storage" }
+gtv-delta = { path = "../gtv-delta" }
+gtv-pattern = { path = "../gtv-pattern" }
+gtv-udf = { path = "../gtv-udf" }
 arrow.workspace = true
 anyhow.workspace = true
 rustyline.workspace = true

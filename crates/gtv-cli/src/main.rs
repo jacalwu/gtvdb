@@ -17,11 +17,23 @@ use rustyline::DefaultEditor;
 
 use gtv_array::{asof, window};
 use gtv_core::{EdgeTable, NodeTable, TemporalGraph, VectorIndex};
+use gtv_delta::{DeltaEdge, LsmStore};
 use gtv_engine::GtvContext;
 use gtv_index::HnswIndex;
+use gtv_pattern::Pattern;
 use gtv_storage::{parquet, SnapshotStore};
+use gtv_udf::WasmUdf;
 
 const DEFAULT_T: i64 = 0;
+
+/// A sandboxed UDF: applies a 10% markup (`x * 1.1`) to a price.
+const MARKUP_WAT: &str = r#"
+(module
+  (func (export "map") (param f64) (result f64)
+    local.get 0
+    f64.const 1.1
+    f64.mul))
+"#;
 
 enum Action {
     Continue,
@@ -38,6 +50,10 @@ struct Demo {
     hnsw: HnswIndex,
     /// Time-travel store seeded with point-in-time edge snapshots.
     store: SnapshotStore,
+    /// LSM delta buffer over the demo graph.
+    lsm: LsmStore,
+    /// A transfer graph with distinct event times for pattern matching.
+    transfers: TemporalGraph,
 }
 
 #[tokio::main]
@@ -118,6 +134,12 @@ fn build_demo() -> Result<Demo> {
         store.insert("edges", t, vec![edges_active_at(&edges, t)])?;
     }
 
+    // LSM delta buffer over the same demo graph.
+    let lsm = LsmStore::new(graph.clone());
+
+    // A transfer graph with distinct event times for pattern matching.
+    let transfers = build_transfers()?;
+
     Ok(Demo {
         graph,
         times: vec![0, 10, 20, 30, 40, 50],
@@ -125,7 +147,33 @@ fn build_demo() -> Result<Demo> {
         embeddings,
         hnsw,
         store,
+        lsm,
+        transfers,
     })
+}
+
+/// A small "money transfer" graph whose edges carry distinct event times,
+/// supporting temporal ring / path / diamond pattern matches.
+fn build_transfers() -> Result<TemporalGraph> {
+    let node_batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt64, false),
+            Field::new("value", DataType::Float64, false),
+        ])),
+        vec![
+            Arc::new(UInt64Array::from(vec![0u64, 1, 2, 3])) as ArrayRef,
+            Arc::new(Float64Array::from(vec![1.0, 2.0, 3.0, 4.0])) as ArrayRef,
+        ],
+    )?;
+    let nodes = NodeTable::new(node_batch)?;
+    let edges = EdgeTable::from_vecs(
+        vec![0, 1, 2, 3, 0, 1],
+        vec![1, 2, 3, 0, 2, 3],
+        vec![1u16, 1, 1, 1, 1, 1],
+        vec![10, 20, 30, 40, 15, 25],
+        vec![1000, 1000, 1000, 1000, 1000, 1000],
+    )?;
+    Ok(TemporalGraph::new(nodes, edges)?)
 }
 
 fn register_tables(ctx: &GtvContext, demo: &Demo) -> Result<()> {
@@ -313,6 +361,60 @@ async fn run(demo: &Demo, ctx: &GtvContext, line: &str) -> Result<Action> {
             println!("{table} as-of T={t} ({rows} rows):");
             let _ = print_batches(&batches);
         }
+        "pattern" => {
+            let csr = demo.transfers.csr();
+            let valid_at = optional_arg(&tokens, 1)
+                .map_or(Ok(500), |s| s.parse::<i64>())?;
+            for (name, pat) in [
+                ("ring(4)", Pattern::ring(4)),
+                ("path(3)", Pattern::temporal_path(3)),
+                ("diamond", Pattern::diamond()),
+            ] {
+                let m = gtv_pattern::find(csr, &pat, valid_at, 10)?;
+                println!("{name}: {} match(es)", m.len());
+                for mm in &m {
+                    println!("  nodes = {:?}", mm.nodes);
+                }
+            }
+        }
+        "delta" => {
+            let before = demo.lsm.merged_edges()?.len();
+            println!("delta: {before} edges (merged snapshot+delta)");
+            demo.lsm.insert(DeltaEdge {
+                src: 3,
+                dst: 1,
+                edge_type: 5,
+                valid_from: 0,
+                valid_to: 500,
+            });
+            println!(
+                "insert 3->1 @[0,500): pending={}, merged={} edges",
+                demo.lsm.pending(),
+                demo.lsm.merged_edges()?.len()
+            );
+            demo.lsm.compact_now()?;
+            println!(
+                "compacted: pending={}, merged={} edges",
+                demo.lsm.pending(),
+                demo.lsm.merged_edges()?.len()
+            );
+        }
+        "udf" => {
+            let input: Vec<f64> = if tokens.len() > 1 {
+                tokens[1..]
+                    .iter()
+                    .map(|s| s.parse::<f64>().map_err(|_| anyhow!("invalid number `{s}`")))
+                    .collect::<Result<Vec<_>>>()?
+            } else {
+                demo.prices.clone()
+            };
+            let mut udf = WasmUdf::from_wat(MARKUP_WAT, "map")?;
+            let out = udf.map(&input)?;
+            println!("WASM UDF (x * 1.1):");
+            for (x, y) in input.iter().zip(&out) {
+                println!("  {x} -> {y}");
+            }
+        }
         "quit" | "exit" => return Ok(Action::Quit),
         "sql" => {
             let q = line.get(3..).unwrap_or("").trim();
@@ -381,6 +483,9 @@ fn print_help() {
          \x20 save <table> <path>   write a table to a Parquet file\n\
          \x20 load <table> <path>   load a Parquet file as a table\n\
          \x20 tt <table> <T>        time-travel: table snapshot as-of T\n\
+         \x20 pattern [T]           temporal pattern matching (ring/path/diamond)\n\
+         \x20 delta                 LSM delta buffer insert + compaction demo\n\
+         \x20 udf [x ...]           WASM sandbox UDF (x * 1.1) over prices\n\
          \x20 quit | exit\n\
          \n\
          SQL: any other input is executed as SQL over the `nodes`, `edges` and\n\

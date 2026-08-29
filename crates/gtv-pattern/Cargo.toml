@@ -1,0 +1,9 @@
+[package]
+name = "gtv-pattern"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+arrow.workspace = true
+gtv-core = { path = "../gtv-core" }
