@@ -18,6 +18,7 @@
 //!   * Memory is the *logical* input footprint (rows × bytes/row), not peak RSS.
 
 use std::collections::HashMap;
+use std::mem::MaybeUninit;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -127,6 +128,7 @@ fn gen_embeddings(n: usize, dim: usize, seed: u64) -> (Vec<u64>, Vec<Vec<f32>>) 
 /// `left_ts` must be ascending (the common kdb `aj` case). Each 64k-row chunk
 /// binary-searches its right-table start (`partition_point`, O(log M)) then does
 /// a lock-free two-pointer sweep; chunks run in parallel via rayon.
+#[allow(dead_code)] // v1 baseline (tuning2.md §1), superseded by asof_join_multi_l2_bucket
 fn asof_join_multi_fast(
     left_ts: &[i64],
     right_ts: &[i64],
@@ -161,6 +163,116 @@ fn asof_join_multi_fast(
     (out_price, out_spread)
 }
 
+/// Consume a `Vec<MaybeUninit<f64>>` whose elements were all written.
+///
+/// # Safety
+/// Caller guarantees every element has been initialized.
+unsafe fn assume_init_f64(v: Vec<MaybeUninit<f64>>) -> Vec<f64> {
+    let mut v = std::mem::ManuallyDrop::new(v);
+    Vec::from_raw_parts(v.as_mut_ptr().cast::<f64>(), v.len(), v.capacity())
+}
+
+/// TC1 v2 (follow-up to tuning2.md §1): break the memory wall with four
+/// orthogonal tweaks —
+///   1. L2-sized chunks (8k rows ≈ 192 KB) instead of 64k, so a thread's working
+///      set stays in its private L2 rather than thrashing L3/DRAM.
+///   2. Zero-init output (`MaybeUninit`, no `f64::NAN` memset) so the parallel
+///      pass writes full cache lines without a prior read-for-ownership.
+///   3. O(1) time-bucket radix index replacing the per-chunk `partition_point`
+///      (kills the O(log M) random cache misses).
+///   4. Bounded thread count (see `init_thread_pool`) to match memory channels.
+///
+/// `bucket_ms` is the coarse bucket width in ns (e.g. 1 ms). `left_ts` must be
+/// ascending. Correctness is asserted against [`asof_join_multi_ref`] in `main`.
+fn asof_join_multi_l2_bucket(
+    left_ts: &[i64],
+    right_ts: &[i64],
+    right_price: &[f64],
+    right_spread: &[f64],
+    tolerance_ns: i64,
+    bucket_ms: i64,
+) -> (Vec<f64>, Vec<f64>) {
+    use rayon::prelude::*;
+    let len = left_ts.len();
+    if len == 0 || right_ts.is_empty() {
+        return (vec![f64::NAN; len], vec![f64::NAN; len]);
+    }
+
+    // O(M) time-bucket index: bucket_offsets[b] = first right row with
+    // timestamp >= (min_r_ts + b * bucket_ms). Sparse buckets forward-fill.
+    let min_r_ts = right_ts[0];
+    let max_r_ts = *right_ts.last().unwrap();
+    let num_buckets = ((max_r_ts - min_r_ts) / bucket_ms + 1) as usize;
+    let mut bucket_offsets = vec![0usize; num_buckets + 1];
+    {
+        let mut b_curr = 0usize;
+        for (i, &ts) in right_ts.iter().enumerate() {
+            let b = ((ts - min_r_ts) / bucket_ms) as usize;
+            while b_curr <= b {
+                bucket_offsets[b_curr] = i;
+                b_curr += 1;
+            }
+        }
+        for b in b_curr..=num_buckets {
+            bucket_offsets[b] = right_ts.len();
+        }
+    }
+
+    // Zero-init output: uninitialized, written exactly once per element below.
+    let mut out_p: Vec<MaybeUninit<f64>> = Vec::with_capacity(len);
+    let mut out_s: Vec<MaybeUninit<f64>> = Vec::with_capacity(len);
+    // SAFETY: `MaybeUninit` may legitimately be uninitialized; every element is
+    // written before `assume_init_f64` consumes the vec.
+    unsafe {
+        out_p.set_len(len);
+        out_s.set_len(len);
+    }
+
+    const CHUNK: usize = 8192;
+    out_p
+        .par_chunks_mut(CHUNK)
+        .zip(out_s.par_chunks_mut(CHUNK))
+        .enumerate()
+        .for_each(|(ci, (p, s))| {
+            let start = ci * CHUNK;
+            let n = p.len();
+
+            // O(1) bucket lookup for this chunk's starting right-table row.
+            let l_start_ts = left_ts[start];
+            let b_idx = if l_start_ts < min_r_ts {
+                0
+            } else {
+                (((l_start_ts - min_r_ts) / bucket_ms) as usize).min(num_buckets)
+            };
+            let mut r_idx = bucket_offsets[b_idx];
+            if r_idx > 0 {
+                r_idx -= 1;
+            }
+
+            for i in 0..n {
+                let l_ts = left_ts[start + i];
+                while r_idx + 1 < right_ts.len() && right_ts[r_idx + 1] <= l_ts {
+                    r_idx += 1;
+                }
+                if r_idx < right_ts.len() {
+                    let diff = l_ts - right_ts[r_idx];
+                    if diff >= 0 && diff <= tolerance_ns {
+                        // SAFETY: r_idx < right_ts.len(); the three right-table
+                        // arrays share the same length by construction.
+                        p[i].write(unsafe { *right_price.get_unchecked(r_idx) });
+                        s[i].write(unsafe { *right_spread.get_unchecked(r_idx) });
+                        continue;
+                    }
+                }
+                p[i].write(f64::NAN);
+                s[i].write(f64::NAN);
+            }
+        });
+
+    // SAFETY: every element of both buffers was written exactly once above.
+    unsafe { (assume_init_f64(out_p), assume_init_f64(out_s)) }
+}
+
 /// Naive single-threaded reference (order-independent) for asserting the
 /// parallel path.
 fn asof_join_multi_ref(
@@ -185,7 +297,7 @@ fn asof_join_multi_ref(
 
 /// TC1: cross-asset lead-lag feature via the single-pass multi-column join.
 fn tc1_compute(a_times: &[i64], b_times: &[i64], b_prices: &[f64], b_spread: &[f64]) {
-    let _ = asof_join_multi_fast(a_times, b_times, b_prices, b_spread, 500_000);
+    let _ = asof_join_multi_l2_bucket(a_times, b_times, b_prices, b_spread, 500_000, 1_000_000);
 }
 
 /// NaN-aware f64 slice equality (for asserting the parallel vs reference paths).
@@ -619,8 +731,28 @@ impl Row {
     }
 }
 
+/// Configure the global rayon pool once. Bounding threads to the number of
+/// memory channels (4–8) beats "all cores" for this memory-bound sweep — too
+/// many threads queue on the memory controller. Overridable via `GTV_HFT_THREADS`.
+fn init_thread_pool() -> usize {
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(8);
+    let threads = std::env::var("GTV_HFT_THREADS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(8)
+        .clamp(1, cpus);
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build_global()
+        .expect("build global rayon pool");
+    threads
+}
+
 fn main() {
     std::fs::create_dir_all(DATA_DIR).expect("create data dir");
+    let threads = init_thread_pool();
 
     // ---- Data loader (CSV round-trip on a representative sample) ----
     let sample = 10_000usize;
@@ -638,10 +770,17 @@ fn main() {
         let (a_times, _) = gen_series(10_000, 0xA1, 1000);
         let (b_times, b_prices) = gen_series(10_000, 0xA2, 1000);
         let b_spread: Vec<f64> = b_prices.iter().map(|p| 0.02 + p * 0.0001).collect();
-        let (fp, fs) = asof_join_multi_fast(&a_times, &b_times, &b_prices, &b_spread, 500_000);
         let (rp, rs) = asof_join_multi_ref(&a_times, &b_times, &b_prices, &b_spread, 500_000);
-        assert!(f64_slice_eq(&fp, &rp), "TC1 parallel price != reference");
-        assert!(f64_slice_eq(&fs, &rs), "TC1 parallel spread != reference");
+        let (fp, fs) = asof_join_multi_l2_bucket(
+            &a_times,
+            &b_times,
+            &b_prices,
+            &b_spread,
+            500_000,
+            1_000_000,
+        );
+        assert!(f64_slice_eq(&fp, &rp), "TC1 v2 price != reference");
+        assert!(f64_slice_eq(&fs, &rs), "TC1 v2 spread != reference");
     }
     for &n in &[100_000usize, 1_000_000, 5_000_000] {
         let (a_times, _) = gen_series(n, 0xA1, 1000);
@@ -656,7 +795,7 @@ fn main() {
             query_us: q,
             bytes: (n * 32) as f64,
             threshold_us: if n == 1_000_000 { Some(5_000.0) } else { None },
-            note: "parallel single-pass multi-col as-of join, 500µs lag".into(),
+            note: "as-of join v2 (time-bucket + 8k chunk + bounded threads), 500µs lag".into(),
         });
     }
 
@@ -747,8 +886,12 @@ fn main() {
         if loader_ok { " ✅ OK" } else { " ❌ MISMATCH" }
     ));
     md.push_str(
-        "- 說明：TC3/TC4 的 build 為一次性索引建構（不計入查詢門檻）；TC4 使用精確 FlatIndex（scalar），512 維大規模 ANN 需另建 HNSW/SIMD。\n\n",
+        "- 說明：TC3/TC4 的 build 為一次性索引建構（不計入查詢門檻）；TC4 使用精確 FlatIndex（scalar），512 維大規模 ANN 需另建 HNSW/SIMD。\n",
     );
+    md.push_str(&format!(
+        "- Rayon 執行緒：{}（可用 `GTV_HFT_THREADS` 環境變數調整，建議 4–8）。\n\n",
+        threads
+    ));
 
     md.push_str("| TC | 描述 | 規模 | Build | 查詢 Latency | Throughput (rows/s) | 記憶體 (MB) | 門檻 | 結果 |\n");
     md.push_str("|----|------|-----:|------:|-------------:|--------------------:|-----------:|------|------|\n");
