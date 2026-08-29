@@ -8,6 +8,10 @@ license.workspace = true
 name = "gtv"
 path = "src/main.rs"
 
+[features]
+default = []
+cuda = ["dep:cudarc"]
+
 [dependencies]
 gtv-core = { path = "../gtv-core" }
 gtv-array = { path = "../gtv-array" }
@@ -23,3 +27,4 @@ anyhow.workspace = true
 rustyline.workspace = true
 tokio.workspace = true
 rayon.workspace = true
+cudarc = { version = "0.19", optional = true, default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading", "cuda-13000"] }

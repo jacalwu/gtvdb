@@ -301,6 +301,138 @@ fn asof_join_multi_l2_bucket(
     unsafe { (assume_init_f64(out_p), assume_init_f64(out_s)) }
 }
 
+/// Non-temporal store of a single `f64` (bypasses cache, skips the
+/// read-for-ownership a normal cold-cache-line store would trigger).
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "sse2")]
+unsafe fn nt_store_f64(p: *mut f64, v: f64) {
+    std::arch::x86_64::_mm_stream_si64(p as *mut i64, v.to_bits() as i64);
+}
+
+/// TC1 v4 ("ultimate" CPU): payload decoupling + non-temporal stores.
+///
+/// Phase 1 sweeps only the two timestamp arrays (8 B each) and writes a 4-byte
+/// matched index — the price/spread payload is never touched during the search.
+/// Phase 2 gathers the payload in a second, fully-sequential pass and writes the
+/// output with non-temporal stores, eliminating the read-for-ownership double-write
+/// that a normal `Vec<f64>` store incurs on cold cache lines.
+///
+/// `bucket_ms` is the coarse bucket width (e.g. 1 ms). `left_ts` must be ascending.
+/// Correctness asserted against [`asof_join_multi_ref`] in `main`.
+fn asof_join_cpu_ultimate(
+    left_ts: &[i64],
+    right_ts: &[i64],
+    right_price: &[f64],
+    right_spread: &[f64],
+    tolerance_ns: i64,
+    bucket_ms: i64,
+) -> (Vec<f64>, Vec<f64>) {
+    use rayon::prelude::*;
+    let len = left_ts.len();
+    if len == 0 || right_ts.is_empty() {
+        return (vec![f64::NAN; len], vec![f64::NAN; len]);
+    }
+
+    // O(M) time-bucket index (shared with v3): bucket_offsets[b] = first right
+    // row with timestamp >= min_r_ts + b * bucket_ms.
+    let min_r_ts = right_ts[0];
+    let max_r_ts = *right_ts.last().unwrap();
+    let num_buckets = ((max_r_ts - min_r_ts) / bucket_ms + 1) as usize;
+    let mut bucket_offsets = vec![0usize; num_buckets + 1];
+    {
+        let mut b_curr = 0usize;
+        for (i, &ts) in right_ts.iter().enumerate() {
+            let b = ((ts - min_r_ts) / bucket_ms) as usize;
+            while b_curr <= b {
+                bucket_offsets[b_curr] = i;
+                b_curr += 1;
+            }
+        }
+        for b in b_curr..=num_buckets {
+            bucket_offsets[b] = right_ts.len();
+        }
+    }
+
+    // Phase 1 — index-only sweep (4-byte match index, payload untouched).
+    let mut matched_idx = vec![-1i32; len];
+    const CHUNK: usize = 8192;
+    let right_len = right_ts.len();
+    matched_idx
+        .par_chunks_mut(CHUNK)
+        .enumerate()
+        .for_each(|(ci, out)| {
+            let start = ci * CHUNK;
+            let n = out.len();
+            let l_start_ts = left_ts[start];
+            let b_idx = if l_start_ts < min_r_ts {
+                0
+            } else {
+                (((l_start_ts - min_r_ts) / bucket_ms) as usize).min(num_buckets)
+            };
+            let mut r_idx = bucket_offsets[b_idx];
+            if r_idx > 0 {
+                r_idx -= 1;
+            }
+            let l_slice = &left_ts[start..start + n];
+            for (i, &l_ts) in l_slice.iter().enumerate() {
+                // SAFETY: the guard keeps r_idx + 1 < right_len, so the unchecked
+                // read of right_ts[r_idx + 1] is in-bounds.
+                while r_idx + 1 < right_len
+                    && unsafe { *right_ts.get_unchecked(r_idx + 1) } <= l_ts
+                {
+                    r_idx += 1;
+                }
+                let diff = l_ts - unsafe { *right_ts.get_unchecked(r_idx) };
+                if diff >= 0 && diff <= tolerance_ns {
+                    out[i] = r_idx as i32;
+                }
+            }
+        });
+
+    // Phase 2 — sequential payload gather + non-temporal store.
+    let mut out_price: Vec<MaybeUninit<f64>> = Vec::with_capacity(len);
+    let mut out_spread: Vec<MaybeUninit<f64>> = Vec::with_capacity(len);
+    // SAFETY: every element is written exactly once in phase 2 below.
+    unsafe {
+        out_price.set_len(len);
+        out_spread.set_len(len);
+    }
+    out_price
+        .par_chunks_mut(CHUNK)
+        .zip(out_spread.par_chunks_mut(CHUNK))
+        .zip(matched_idx.par_chunks(CHUNK))
+        .for_each(|((op, os), mi)| {
+            for i in 0..mi.len() {
+                let r = mi[i];
+                let (pv, sv) = if r >= 0 {
+                    let j = r as usize;
+                    (right_price[j], right_spread[j])
+                } else {
+                    (f64::NAN, f64::NAN)
+                };
+                #[cfg(target_arch = "x86_64")]
+                unsafe {
+                    nt_store_f64(op.as_mut_ptr().add(i).cast::<f64>(), pv);
+                    nt_store_f64(os.as_mut_ptr().add(i).cast::<f64>(), sv);
+                }
+                #[cfg(not(target_arch = "x86_64"))]
+                {
+                    op[i].write(pv);
+                    os[i].write(sv);
+                }
+            }
+        });
+
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_sfence();
+    }
+
+    // SAFETY: every element of both buffers was written exactly once above.
+    unsafe { (assume_init_f64(out_price), assume_init_f64(out_spread)) }
+}
+
 /// Naive single-threaded reference (order-independent) for asserting the
 /// parallel path.
 fn asof_join_multi_ref(
@@ -778,9 +910,121 @@ fn init_thread_pool() -> usize {
     threads
 }
 
+// ---------------------------------------------------------------------------
+// TC1 CUDA acceleration (optional — compile with `--features cuda`)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "cuda")]
+struct Tc1Cuda {
+    ctx: Arc<cudarc::driver::CudaContext>,
+    // NOTE: `func` holds the module's `Arc<CudaModule>` internally, keeping it alive.
+    func: cudarc::driver::CudaFunction,
+    left: Vec<i64>,
+    right: Vec<i64>,
+    price: Vec<f64>,
+    spread: Vec<f64>,
+    tol: i64,
+    build_us: f64,
+}
+
+/// One-time GPU setup: context, NVRTC compile of `asof_join.cu`, module + function
+/// load. Inputs are owned copies so the query can re-upload without borrowing.
+#[cfg(feature = "cuda")]
+fn tc1_cuda_build(
+    left_ts: &[i64],
+    right_ts: &[i64],
+    right_price: &[f64],
+    right_spread: &[f64],
+    tolerance_ns: i64,
+) -> Tc1Cuda {
+    use cudarc::driver::CudaContext;
+    use cudarc::nvrtc::compile_ptx;
+
+    let t0 = Instant::now();
+    let ctx = CudaContext::new(0).expect("init CUDA context");
+    let ptx = compile_ptx(include_str!("asof_join.cu")).expect("NVRTC compile kernel");
+    let module = ctx.load_module(ptx).expect("load PTX module");
+    let func = module
+        .load_function("asof_join_cuda_kernel")
+        .expect("load kernel fn");
+    Tc1Cuda {
+        build_us: t0.elapsed().as_secs_f64() * 1e6,
+        ctx,
+        func,
+        left: left_ts.to_vec(),
+        right: right_ts.to_vec(),
+        price: right_price.to_vec(),
+        spread: right_spread.to_vec(),
+        tol: tolerance_ns,
+    }
+}
+
+/// Full per-query cost: upload all inputs, launch the kernel, download outputs.
+#[cfg(feature = "cuda")]
+fn tc1_cuda_query(b: &Tc1Cuda) -> (Vec<f64>, Vec<f64>) {
+    use cudarc::driver::{LaunchConfig, PushKernelArg};
+
+    let stream = b.ctx.default_stream();
+    let left_len = b.left.len();
+    let right_len = b.right.len();
+    let left_len_i = left_len as i32;
+    let right_len_i = right_len as i32;
+
+    let d_left = stream.clone_htod(&b.left).expect("H2D left");
+    let d_right = stream.clone_htod(&b.right).expect("H2D right");
+    let d_price = stream.clone_htod(&b.price).expect("H2D price");
+    let d_spread = stream.clone_htod(&b.spread).expect("H2D spread");
+    let mut d_op = stream.alloc_zeros::<f64>(left_len).expect("alloc out");
+    let mut d_os = stream.alloc_zeros::<f64>(left_len).expect("alloc out");
+
+    let cfg = LaunchConfig::for_num_elems(left_len as u32);
+    let mut lb = stream.launch_builder(&b.func);
+    lb.arg(&d_left)
+        .arg(&d_right)
+        .arg(&d_price)
+        .arg(&d_spread)
+        .arg(&mut d_op)
+        .arg(&mut d_os)
+        .arg(&left_len_i)
+        .arg(&right_len_i)
+        .arg(&b.tol);
+    unsafe { lb.launch(cfg) }.expect("launch kernel");
+
+    let op = stream.clone_dtoh(&d_op).expect("D2H out");
+    let os = stream.clone_dtoh(&d_os).expect("D2H out");
+    (op, os)
+}
+
+/// Runtime CUDA switch: `USE_CUDA=1` enables the GPU path. If the binary lacks
+/// the `cuda` feature or the GPU can't initialize, fall back to CPU with a warning.
+fn detect_cuda() -> bool {
+    #[cfg(feature = "cuda")]
+    {
+        let mut on = std::env::var("USE_CUDA").map(|v| v == "1").unwrap_or(false);
+        if on {
+            if let Err(e) = cudarc::driver::CudaContext::new(0) {
+                eprintln!("[CUDA] USE_CUDA=1 but GPU init failed: {e:?} — falling back to CPU.");
+                eprintln!("[CUDA]   WSL2 hint: if nvidia-smi shows a GPU but cuInit reports NO_DEVICE,");
+                eprintln!("[CUDA]   run with LD_LIBRARY_PATH=/usr/lib/wsl/lib to use the WSL forwarding stub.");
+                on = false;
+            }
+        }
+        on
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        if std::env::var("USE_CUDA").map(|v| v == "1").unwrap_or(false) {
+            eprintln!("[CUDA] USE_CUDA=1 but binary lacks `--features cuda`; using CPU.");
+        }
+        false
+    }
+}
+
 fn main() {
     std::fs::create_dir_all(DATA_DIR).expect("create data dir");
     let threads = init_thread_pool();
+    let use_cuda = detect_cuda();
+    let use_gpu = cfg!(feature = "cuda") && use_cuda;
 
     // ---- Data loader (CSV round-trip on a representative sample) ----
     let sample = 10_000usize;
@@ -807,24 +1051,88 @@ fn main() {
             500_000,
             1_000_000,
         );
-        assert!(f64_slice_eq(&fp, &rp), "TC1 v2 price != reference");
-        assert!(f64_slice_eq(&fs, &rs), "TC1 v2 spread != reference");
+        assert!(f64_slice_eq(&fp, &rp), "TC1 v3 price != reference");
+        assert!(f64_slice_eq(&fs, &rs), "TC1 v3 spread != reference");
+
+        let (up, us) = asof_join_cpu_ultimate(
+            &a_times,
+            &b_times,
+            &b_prices,
+            &b_spread,
+            500_000,
+            1_000_000,
+        );
+        assert!(f64_slice_eq(&up, &rp), "TC1 v4 price != reference");
+        assert!(f64_slice_eq(&us, &rs), "TC1 v4 spread != reference");
+
+        #[cfg(feature = "cuda")]
+        {
+            if use_gpu {
+                let c = tc1_cuda_build(&a_times, &b_times, &b_prices, &b_spread, 500_000);
+                let (cp, cs) = tc1_cuda_query(&c);
+                assert!(f64_slice_eq(&cp, &rp), "TC1 cuda price != reference");
+                assert!(f64_slice_eq(&cs, &rs), "TC1 cuda spread != reference");
+            }
+        }
     }
     for &n in &[100_000usize, 1_000_000, 5_000_000] {
         let (a_times, _) = gen_series(n, 0xA1, 1000);
         let (b_times, b_prices) = gen_series(n, 0xA2, 1000);
         let b_spread: Vec<f64> = b_prices.iter().map(|p| 0.02 + p * 0.0001).collect();
         let iters = if n >= 5_000_000 { 3 } else if n >= 1_000_000 { 5 } else { 10 };
-        let q = bench_us(iters, || tc1_compute(&a_times, &b_times, &b_prices, &b_spread));
+
+        // CPU v3 baseline (branchless single-pass).
+        let q3 = bench_us(iters, || tc1_compute(&a_times, &b_times, &b_prices, &b_spread));
         rows.push(Row {
             tc: "TC1",
             scale: n,
             build_us: 0.0,
-            query_us: q,
+            query_us: q3,
             bytes: (n * 32) as f64,
             threshold_us: if n == 1_000_000 { Some(5_000.0) } else { None },
             note: "as-of join v3 (bucket + 8k chunk + 8t + branchless/prefetch), 500µs lag".into(),
         });
+
+        // CPU v4 (payload decoupling + non-temporal stores).
+        let q4 = bench_us(iters, || {
+            let _ = asof_join_cpu_ultimate(
+                &a_times,
+                &b_times,
+                &b_prices,
+                &b_spread,
+                500_000,
+                1_000_000,
+            );
+        });
+        rows.push(Row {
+            tc: "TC1",
+            scale: n,
+            build_us: 0.0,
+            query_us: q4,
+            bytes: (n * 32) as f64,
+            threshold_us: if n == 1_000_000 { Some(5_000.0) } else { None },
+            note: "as-of join v4 (payload decoupling + NT store), 500µs lag".into(),
+        });
+
+        // CUDA (only when the feature is on and a GPU is present).
+        #[cfg(feature = "cuda")]
+        {
+            if use_gpu {
+                let c = tc1_cuda_build(&a_times, &b_times, &b_prices, &b_spread, 500_000);
+                let qc = bench_us(iters, || {
+                    let _ = tc1_cuda_query(&c);
+                });
+                rows.push(Row {
+                    tc: "TC1",
+                    scale: n,
+                    build_us: c.build_us,
+                    query_us: qc,
+                    bytes: (n * 32) as f64,
+                    threshold_us: if n == 1_000_000 { Some(5_000.0) } else { None },
+                    note: "as-of join CUDA (RTX 4060, per-thread binary search), 500µs lag".into(),
+                });
+            }
+        }
     }
 
     // ---- TC2: OFI rolling 100 ----
@@ -917,8 +1225,16 @@ fn main() {
         "- 說明：TC3/TC4 的 build 為一次性索引建構（不計入查詢門檻）；TC4 使用精確 FlatIndex（scalar），512 維大規模 ANN 需另建 HNSW/SIMD。\n",
     );
     md.push_str(&format!(
-        "- Rayon 執行緒：{}（可用 `GTV_HFT_THREADS` 環境變數調整，建議 4–8）。\n\n",
+        "- Rayon 執行緒：{}（可用 `GTV_HFT_THREADS` 環境變數調整，建議 4–8）。\n",
         threads
+    ));
+    md.push_str(&format!(
+        "- TC1 引擎：{}\n\n",
+        if use_gpu {
+            "CUDA（`--features cuda`，RTX 4060）"
+        } else {
+            "純 CPU（v3 branchless / v4 payload-decoupling + NT-store）"
+        }
     ));
 
     md.push_str("| TC | 描述 | 規模 | Build | 查詢 Latency | Throughput (rows/s) | 記憶體 (MB) | 門檻 | 結果 |\n");

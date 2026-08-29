@@ -18,6 +18,24 @@ cargo run --release -p gtv-cli --example hft_bench
 `data/` 內 CSV 為可重生的樣本（由 benchmark 產生），已由 `testcase/.gitignore` 排除。
 TC1 的 Rayon 執行緒數可用環境變數調整（預設 8）：`GTV_HFT_THREADS=4 cargo run --release -p gtv-cli --example hft_bench`。
 
+### CUDA 加速開關（選用）
+
+```sh
+# 編譯期開關：cudarc + NVRTC JIT（CUDA_ACCELERATION.md 規格）
+cargo build --release -p gtv-cli --features cuda --example hft_bench
+# 執行期開關：USE_CUDA=1（GPU 偵測失敗自動回退 CPU）
+USE_CUDA=1 cargo run --release -p gtv-cli --features cuda --example hft_bench
+```
+
+WSL2 注意：`nvidia-smi` 看得到 GPU，但 `cuInit` 可能回 `CUDA_ERROR_NO_DEVICE`——因為
+`/lib/x86_64-linux-gnu/libcuda.so.1`（真實 driver，96MB）遮蔽了 WSL 轉送 stub。解法是讓
+動態載入優先選 `/usr/lib/wsl/lib/libcuda.so.1`：
+
+```sh
+LD_LIBRARY_PATH=/usr/lib/wsl/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH} USE_CUDA=1 \
+  cargo run --release -p gtv-cli --features cuda --example hft_bench
+```
+
 ## 方法論
 
 - **資料**：採用確定性合成資料（SplitMix64 種子 PRNG），schema 完全符合規格。
@@ -38,7 +56,7 @@ TC1 的 Rayon 執行緒數可用環境變數調整（預設 8）：`GTV_HFT_THRE
 
 | TC | 門檻 | 結果 | 判定 |
 |----|------|------:|------|
-| TC1 跨資產 As-Of Join | < 5 ms @ 1M | ~11–22 ms（噪聲，見下） | ❌ |
+| TC1 跨資產 As-Of Join | < 5 ms @ 1M | ~16–26 ms（v3/v4，記憶體牆） | ❌ |
 | TC2 OFI 滾動 100 | < 2 ms @ 1M | ~20–43 ms（未改動） | ❌ |
 | TC3 洗艙循環檢測 | < 10 ms @ 500k | ~140–380 ms（未改動） | ❌ |
 | TC4 512 維 KNN + 時序過濾 | < 8 ms | ~130 ms @ 100k（未改動） | ❌ |
@@ -52,6 +70,8 @@ TC1 的 Rayon 執行緒數可用環境變數調整（預設 8）：`GTV_HFT_THRE
 | v1（tuning2 §1） | 單趟多欄 + `Vec<f64>` NAN 輸出 + Rayon 並行 | 25.63 ms |
 | v2（記憶體牆） | 8k L2 chunk + `MaybeUninit` 零初始化 + O(1) 時間桶 + 8 threads | 15.20 ms |
 | v3（branchless） | 零邊界檢查 + 消冗餘分支 + 位元遮罩 + `_mm_prefetch` | ~11–22 ms（噪聲） |
+| v4（payload 解耦） | 搜尋/寫出分離 + `_mm_stream_si64` NT Store | ~16–26 ms（與 v3 同噪聲） |
+| CUDA（binary search） | cudarc 雙開關 + `asof_join.cu` 每 thread 二分 | ~48 ms（慢於 CPU，見下） |
 
 ### v1（tuning2.md §1）：單趟多欄 + Rayon 並行
 一次雙指針掃描同時鎖定 price 與 spread（取代兩次 join）、輸出 `Vec<f64>`（無效值填 `NAN`）、
@@ -76,6 +96,25 @@ TC1 的 Rayon 執行緒數可用環境變數調整（預設 8）：`GTV_HFT_THRE
 **結果：1M 在 11–22 ms 間跳動（與 v2 無可靠差異）。** 關鍵證據：最後一輪只改了 doc 註解與
 note 字串（熱迴圈 byte-identical），1M 卻從 15.23 → 11.46 ms——證明變動純屬主機噪聲。
 
+### v4：Payload 解耦 + Non-Temporal Store（純 CPU 極限）
+依「極限 CPU」方向重構：階段一僅掃描時間戳並寫 4-byte 命中索引（不碰 price/spread）；階段二以
+`_mm_stream_si64`（非暫時性儲存，旁路快取、消除 RFO 雙重寫入）順序寫出。修正了原提案以
+`_mm_stream_pd` 寫單一 f64 會覆寫相鄰元素／越界的 bug。
+
+**結果：1M 仍在 ~16–26 ms（與 v3 無可靠差異）。** 3–4 ms 的預估在硬體上不可達，原因有二：
+1. 「解耦可減少 60% 流量」前提不成立——v3 的 sweep 本來就只在命中列讀 price/spread，
+   解耦反而多出 matched_idx 的 4-byte 寫+讀往返（1M 多 ~12 MB 流量）。
+2. NT Store 僅省下輸出寫入的 RFO（1M 約 16 MB，佔總流量 ~25%），抵不過多出的往返。
+理論下限仍是 DRAM 頻寬：1M ≈ 48 MB 流量 @ ~3.2 GB/s（本機有效）≈ 15 ms；< 5 ms 需 ~10 GB/s。
+
+### CUDA 開關（`--features cuda`）
+依 `CUDA_ACCELERATION.md` 實作雙開關，`asof_join.cu` 每 thread 對右表二分搜尋（規格忠實實作），
+NVRTC 執行期 JIT 編譯，GPU 初始化失敗自動回退 CPU。**功能正確**（與 `asof_join_multi_ref` 驗證），
+但 **1M = ~48 ms，比 CPU 慢**：
+1. 每 thread 二分搜尋是 O(M log M)（1M × ~20 次相依全域讀取），CPU 雙指針是 O(M)——GPU 做了 ~20× 工作量。
+2. 每查詢 H2D/D2H 傳 48 MB，經 WSL2 半虛擬化 GPU 通道，傳輸主導。
+GPU 要真正贏需換演算法（分 block 雙指針 merge、資料常駐 device 端），非 spec 的 per-thread binary search。
+
 ### 結論：TC1 是純記憶體頻寬受限
 v3 把 CPU 端的邊界檢查、分支、branch prediction 全數消除，1M 卻無實質改善——因為 CPU 原本就在
 **等待 DRAM（~3.2 GB/s 有效頻寬）**，減少 CPU 指令只讓它 stall 得更久。prefetch 對 5M（資料 >> L3）
@@ -85,8 +124,9 @@ WSL2 主機供不到。**除非改用更緊湊的資料型別（如 f32 減半 p
 
 ## 瓶頸診斷與後續方向
 
-- **TC1（As-Of Join，記憶體牆）**：v1→v3 已走完通用手段，瓶頸為 DRAM 頻寬非 CPU。
-  僅剩換 f32 / 降流量、或換硬體。屬硬性上限。
+- **TC1（As-Of Join，記憶體牆）**：v1→v4 已走完通用手段，瓶頸為 DRAM 頻寬非 CPU。
+  僅剩換 f32 / 降流量、或換硬體（bare-metal）。屬硬性上限。CUDA 需改用 GPU merge 演算法
+  且資料常駐 device 端才有機會，per-thread binary search 反而更慢。
 - **TC2（OFI，~10–20× 超標）**：`msum` 已是 O(n) 滑動窗口，瓶頸在逐元素 OFI 純量迴圈。
   方向：用 Arrow 比較/算術 kernel 做 `ΔBidPrice`/`ΔAskPrice` 的 SIMD 差量，再向量乘加。
 - **TC3（洗艙循環，~15–38× 超標）**：`find` 對 50 萬個起點逐一 `find_from`，每個起點都分配
@@ -101,5 +141,6 @@ WSL2 主機供不到。**除非改用更緊湊的資料型別（如 f32 減半 p
 
 - `RESULTS.md` — 由 benchmark 自動產生的完整數據表與門檻摘要。
 - `data/ticks.csv`、`data/account_transfers.csv` — 10,000 列 schema 樣本（可重生）。
-- `crates/gtv-cli/examples/hft_bench.rs` — 資料產生器、Data Loader 與 TC1–TC5 實作（含 TC1 v1/v2/v3）。
-- `Cargo.toml` / `crates/gtv-cli/Cargo.toml` — 新增 `rayon` workspace 依賴。
+- `crates/gtv-cli/examples/hft_bench.rs` — 資料產生器、Data Loader 與 TC1–TC5 實作（含 TC1 v1/v2/v3/v4 與 CUDA 路徑）。
+- `crates/gtv-cli/examples/asof_join.cu` — CUDA kernel（每 thread 二分搜尋，NVRTC JIT 編譯）。
+- `Cargo.toml` / `crates/gtv-cli/Cargo.toml` — 新增 `rayon` workspace 依賴與 `cuda`（`dep:cudarc`）feature。
