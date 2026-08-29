@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
 #
-# Build and start the gtv-server gRPC endpoint in the background.
+# Start the gtv-server gRPC endpoint in the background.
+#
+# By default the already-compiled binary is reused (no recompilation); it is
+# only built if missing. Pass --build (or --rebuild) to force a recompile.
 #
 # Usage:
-#   ./start.sh                          # build (release) and start on 0.0.0.0:50051
+#   ./start.sh                          # reuse target/release/gtv-server and start
+#   ./start.sh --build                  # recompile first, then start
 #   GTV_ADDR=0.0.0.0:50052 ./start.sh   # bind a different address
-#   GTV_PROFILE=debug ./start.sh        # use a debug build (faster to compile)
+#   GTV_PROFILE=debug ./start.sh        # use the debug build
 #
 # Runtime artifacts (PID file + log) are written under target/ (gitignored).
 set -euo pipefail
@@ -19,6 +23,16 @@ BIN="target/$PROFILE/gtv-server"
 PIDFILE="target/gtv-server.pid"
 LOGFILE="target/gtv-server.log"
 
+BUILD=0
+case "${1:-}" in
+  "") ;;
+  --build|--rebuild) BUILD=1 ;;
+  -h|--help)
+    sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
+    exit 0 ;;
+  *) echo "unknown argument '$1' (try --help)" >&2; exit 2 ;;
+esac
+
 case "$PROFILE" in
   release|debug) ;;
   *) echo "GTV_PROFILE must be 'release' or 'debug' (got '$PROFILE')" >&2; exit 2 ;;
@@ -30,11 +44,15 @@ if [[ -f "$PIDFILE" ]] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
 fi
 rm -f "$PIDFILE"
 
-echo "building gtv-server ($PROFILE)…"
-if [[ "$PROFILE" == "release" ]]; then
-  cargo build --release -p gtv-server --bin gtv-server
+if [[ "$BUILD" == 1 || ! -x "$BIN" ]]; then
+  echo "building gtv-server ($PROFILE)…"
+  if [[ "$PROFILE" == "release" ]]; then
+    cargo build --release -p gtv-server --bin gtv-server
+  else
+    cargo build -p gtv-server --bin gtv-server
+  fi
 else
-  cargo build -p gtv-server --bin gtv-server
+  echo "using prebuilt gtv-server ($BIN)"
 fi
 
 echo "starting gtv-server on $ADDR (log: $LOGFILE)"
