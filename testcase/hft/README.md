@@ -56,7 +56,7 @@ LD_LIBRARY_PATH=/usr/lib/wsl/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH} USE_CUDA=1
 
 | TC | 門檻 | 結果 | 判定 |
 |----|------|------:|------|
-| TC1 跨資產 As-Of Join | < 5 ms @ 1M | ~2.5 ms（fused）/ ~4.6 ms（v3 單獨） | ✅ |
+| TC1 跨資產 As-Of Join | < 5 ms @ 1M | ~3.5 ms（CUDA merge）/ ~2.5–6.7 ms（CPU fused） | ✅ |
 | TC2 OFI 滾動 100 | < 2 ms @ 1M | ~20–43 ms（未改動） | ❌ |
 | TC3 洗艙循環檢測 | < 10 ms @ 500k | ~140–380 ms（未改動） | ❌ |
 | TC4 512 維 KNN + 時序過濾 | < 8 ms | ~130 ms @ 100k（未改動） | ❌ |
@@ -73,6 +73,7 @@ LD_LIBRARY_PATH=/usr/lib/wsl/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH} USE_CUDA=1
 | v4（payload 解耦） | 搜尋/寫出分離 + `_mm_stream_si64` NT Store | ~16–26 ms（與 v3 同噪聲） |
 | CUDA（binary search） | cudarc 雙開關 + `asof_join.cu` 每 thread 二分 | ~48 ms（慢於 CPU，見下） |
 | v5（fused 零複製） | 下游特徵熔接，輸出 8MB 非 16MB | ~2.5 ms ✅ |
+| CUDA merge（雙指針） | 資料常駐 + chunk 雙指針 + 熔接，O(L) 非 O(L log R) | ~3.5 ms ✅（最穩定） |
 
 ### v1（tuning2.md §1）：單趟多欄 + Rayon 並行
 一次雙指針掃描同時鎖定 price 與 spread（取代兩次 join）、輸出 `Vec<f64>`（無效值填 `NAN`）、
@@ -114,7 +115,19 @@ NVRTC 執行期 JIT 編譯，GPU 初始化失敗自動回退 CPU。**功能正�
 但 **1M = ~48 ms，比 CPU 慢**：
 1. 每 thread 二分搜尋是 O(M log M)（1M × ~20 次相依全域讀取），CPU 雙指針是 O(M)——GPU 做了 ~20× 工作量。
 2. 每查詢 H2D/D2H 傳 48 MB，經 WSL2 半虛擬化 GPU 通道，傳輸主導。
-GPU 要真正贏需換演算法（分 block 雙指針 merge、資料常駐 device 端），非 spec 的 per-thread binary search。
+
+### CUDA merge-join（資料常駐 + 雙指針 + 熔接）——反超 CPU
+
+依上述結論重寫：`asof_merge_fused_kernel` 把 CPU v5 的 chunk 雙指針 sweep 直接映射到
+GPU——每 thread 掃一段連續左列、以 O(1) 時間桶索引取得起點、右指針單調前進（O(L) 而非
+O(L log R)），並熔接 `rel_spread` 只寫 8 MB。**全部輸入（右表 + bucket + 左表）build 時
+一次上傳常駐 device**，query 只 launch + D2H 8 MB（無輸入 H2D）。
+
+**結果：1M = ~3.5 ms ✅（從 48 ms 加速 ~13×），反超 CPU fused（今日 6.68 ms，輕載 ~2.5 ms）
+約 1.9×。** 這是唯一「主機重載下仍穩定 < 5 ms」的路徑——GPU 把工作移出受擾動的 CPU/DRAM，
+對共享 WSL2 主機負載不敏感。5M 時（49.8 ms）略慢於 CPU fused（42.2 ms），因 40 MB D2H
+輸出經 WSL2 轉送通道主導。若要再快：輸出也可改用 f32（降 D2H 一半），或將下游 TC2 也搬進
+kernel 徹底免 D2H。
 
 ### v5：Zero-Copy 熔接（Fusion）——突破記憶體牆
 依「案 B」方向：不把 16 MB 的 `(price, spread)` join 結果寫回 DRAM，改在 sweep 內直接熔接下游特徵
@@ -132,16 +145,19 @@ GPU 要真正贏需換演算法（分 block 雙指針 merge、資料常駐 devic
 v1→v4 已證明 CPU 端的指令優化（邊界檢查、分支、branchless、prefetch、NT store）無效——瓶頸在
 DRAM 頻寬（共享 WSL2 主機有效 ~3–7 GB/s，隨負載漂移）。**熔接（v5）是第一個真正有效的突破**：把
 輸出從 16 MB 減到 8 MB，流量削 1/3，1M 由 ~4.6 ms 降至 ~2.5 ms，首破 < 5 ms。關鍵領悟：**突破
-記憶體牆只能靠削減「移動的位元組」，而非「執行的指令」。**
+記憶體牆只能靠削減「移動的位元組」，而非「執行的指令」。** CUDA merge-join（資料常駐 +
+雙指針 + 熔接）把同一原則搬到 GPU：搬移的位元組降到只剩 8 MB D2H，1M ~3.5 ms 反超 CPU 且對
+主機負載最不敏感。
 
 剩餘下限：單獨 join 必須讀 ~32 MB 輸入（left/right ts + price/spread），~7 GB/s 下 ≈ 4.6 ms，
 重載時 ≈ 10 ms。要再往下仍需 f32 降位元組或 bare-metal 高頻寬。（v3/v5 正確性以 `asof_join_multi_ref` 驗證。）
 
 ## 瓶頸診斷與後續方向
 
-- **TC1（As-Of Join，記憶體牆）**：**熔接（v5）已破 < 5 ms**（輸出 16→8 MB）。剩餘為輸入
-  32 MB 讀取下限。要再快：f32 降位元組、或換硬體（bare-metal）。CUDA 需改 GPU merge 演算法
-  且資料常駐 device 端才有機會，per-thread binary search 反而更慢。
+- **TC1（As-Of Join，記憶體牆）**：**熔接（v5）已破 < 5 ms**（輸出 16→8 MB），且
+  **CUDA merge-join（資料常駐 + 雙指針 + 熔接）1M = ~3.5 ms 反超 CPU、負載最穩**。剩餘為
+  輸入 32 MB 讀取下限（CPU）或 8 MB D2H 下限（GPU）。要再快：輸出降 f32、下游 TC2 搬進
+  kernel 免 D2H。
 - **TC2（OFI，~10–20× 超標）**：`msum` 已是 O(n) 滑動窗口，瓶頸在逐元素 OFI 純量迴圈。
   方向：用 Arrow 比較/算術 kernel 做 `ΔBidPrice`/`ΔAskPrice` 的 SIMD 差量，再向量乘加。
 - **TC3（洗艙循環，~15–38× 超標）**：`find` 對 50 萬個起點逐一 `find_from`，每個起點都分配

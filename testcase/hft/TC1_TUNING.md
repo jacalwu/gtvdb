@@ -21,6 +21,7 @@
 | v4（payload 解耦） | 搜尋/寫出分離 + `_mm_stream_si64` NT Store | ~16–26 ms | ❌（同噪聲） |
 | CUDA | cudarc 雙開關 + 每 thread 二分 | ~48 ms | ❌（慢於 CPU） |
 | **v5（fused 零複製）** | 下游特徵熔接，輸出 8MB 非 16MB | **~2.5 ms** | ✅ **PASS** |
+| **CUDA merge** | 資料常駐 + chunk 雙指針 + 熔接，O(L) | **~3.5 ms** | ✅ **PASS（最穩）** |
 
 ---
 
@@ -254,6 +255,59 @@ LD_LIBRARY_PATH=/usr/lib/wsl/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH} USE_CUDA=1
 
 GPU 要真正贏需換演算法（分 block 雙指針 merge、資料常駐 device 端），非 spec 的 per-thread binary search。
 
+### 6.1 CUDA merge-join（資料常駐 + chunk 雙指針 + 熔接）——反超 CPU
+
+依上述結論重寫：`asof_merge_fused_kernel` 把 CPU v5 的 chunk 雙指針 sweep 直接映射到 GPU——
+
+```cuda
+extern "C" __global__ void asof_merge_fused_kernel(
+    const long long* __restrict__ left_ts,
+    const long long* __restrict__ right_ts,
+    const double* __restrict__ right_price,
+    const double* __restrict__ right_spread,
+    const int* __restrict__ bucket_offsets,
+    double* __restrict__ out_feature,
+    int left_len, int right_len, int num_buckets,
+    long long min_r_ts, long long bucket_ms, long long tolerance_ns, int chunk)
+{
+    long long tid = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long start = tid * chunk;
+    if (start >= left_len) return;
+
+    // O(1) bucket 起點（同 CPU v3/v5）
+    long long l_start = left_ts[start];
+    int b = 0;
+    if (l_start >= min_r_ts) {
+        long long bll = (l_start - min_r_ts) / bucket_ms;
+        b = (int)(bll < (long long)num_buckets ? bll : (long long)num_buckets);
+    }
+    int r_idx = bucket_offsets[b];
+    if (r_idx > 0) r_idx -= 1;
+
+    long long end = start + chunk;
+    if (end > left_len) end = left_len;
+    const double nan = __longlong_as_double(0x7ff8000000000000ULL);
+    for (long long i = start; i < end; ++i) {
+        long long l = left_ts[i];
+        // 雙指針：右指針單調前進（O(L)，非 binary search 的 O(L·log R)）
+        while (r_idx + 1 < right_len && right_ts[r_idx + 1] <= l) r_idx += 1;
+        double val = nan;
+        long long diff = l - right_ts[r_idx];
+        if (diff >= 0 && diff <= tolerance_ns)
+            val = right_spread[r_idx] / right_price[r_idx];  // 熔接特徵，永不實體化
+        out_feature[i] = val;
+    }
+}
+```
+
+Rust 端 `tc1_cuda_build` 於 build 時一次上傳全部輸入（右表 + bucket + 左表）常駐 device，
+`tc1_cuda_query` 只 launch + `clone_dtoh` 8 MB（無輸入 H2D）。grid = ceil(L/chunk)，chunk=32。
+
+**結果：1M = ~3.5 ms ✅（從 48 ms 加速 ~13×），反超 CPU fused（今日 6.68 ms，輕載 ~2.5 ms）
+約 1.9×。** 也是唯一「主機重載下仍穩定 < 5 ms」的路徑——GPU 把工作移出受擾動的 CPU/DRAM，
+對共享 WSL2 主機負載不敏感。5M 時（49.8 ms）略慢於 CPU fused（42.2 ms），因 40 MB D2H 輸出
+經 WSL2 轉送通道主導。若要再快：輸出降 f32（D2H 減半），或把下游 TC2 也搬進 kernel 徹底免 D2H。
+
 ---
 
 ## 7. v5 Zero-Copy 熔接（Fusion）——唯一突破（2.5 ms ✅）
@@ -306,6 +360,8 @@ fn asof_join_fused(
 - **v1→v4 的指令優化全部無效**（邊界檢查、分支、branchless、prefetch、NT store）——
   瓶頸在 DRAM 頻寬（共享 WSL2 主機有效 ~3–7 GB/s，隨負載漂移）。
 - **熔接（v5）是第一個真正有效的突破**：把輸出 16 MB 減到 8 MB，流量削 1/3。
+- **CUDA merge-join 把同一原則搬到 GPU**：資料常駐 + O(L) 雙指針 + 熔接，搬移位元組降到
+  只剩 8 MB D2H，1M ~3.5 ms 反超 CPU 且對主機負載最不敏感。
 - **核心領悟：突破記憶體牆只能靠削減「移動的位元組」，而非「執行的指令」。**
 
 **⚠️ 前提**：此加速來自「下游特徵會縮小輸出」。若下游真的需要完整 16 MB 的

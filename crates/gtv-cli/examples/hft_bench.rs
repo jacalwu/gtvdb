@@ -1008,16 +1008,26 @@ struct Tc1Cuda {
     ctx: Arc<cudarc::driver::CudaContext>,
     // NOTE: `func` holds the module's `Arc<CudaModule>` internally, keeping it alive.
     func: cudarc::driver::CudaFunction,
-    left: Vec<i64>,
-    right: Vec<i64>,
-    price: Vec<f64>,
-    spread: Vec<f64>,
+    // Resident device buffers — uploaded once at build, reused across queries.
+    d_left: cudarc::driver::CudaSlice<i64>,
+    d_right: cudarc::driver::CudaSlice<i64>,
+    d_price: cudarc::driver::CudaSlice<f64>,
+    d_spread: cudarc::driver::CudaSlice<f64>,
+    d_bucket: cudarc::driver::CudaSlice<i32>,
+    d_out: cudarc::driver::CudaSlice<f64>,
+    left_len: i32,
+    right_len: i32,
+    num_buckets: i32,
+    min_r_ts: i64,
+    bucket_ms: i64,
     tol: i64,
+    chunk: i32,
     build_us: f64,
 }
 
 /// One-time GPU setup: context, NVRTC compile of `asof_join.cu`, module + function
-/// load. Inputs are owned copies so the query can re-upload without borrowing.
+/// load, then upload every input (right table + O(1) time-bucket index + left) so
+/// the merge-join query only launches the kernel and downloads the 8 MB output.
 #[cfg(feature = "cuda")]
 fn tc1_cuda_build(
     left_ts: &[i64],
@@ -1025,6 +1035,7 @@ fn tc1_cuda_build(
     right_price: &[f64],
     right_spread: &[f64],
     tolerance_ns: i64,
+    bucket_ms: i64,
 ) -> Tc1Cuda {
     use cudarc::driver::CudaContext;
     use cudarc::nvrtc::compile_ptx;
@@ -1034,54 +1045,91 @@ fn tc1_cuda_build(
     let ptx = compile_ptx(include_str!("asof_join.cu")).expect("NVRTC compile kernel");
     let module = ctx.load_module(ptx).expect("load PTX module");
     let func = module
-        .load_function("asof_join_cuda_kernel")
+        .load_function("asof_merge_fused_kernel")
         .expect("load kernel fn");
+    let stream = ctx.default_stream();
+
+    // Host-side O(M) time-bucket index (identical to the CPU v3/v5 path), built
+    // once and uploaded; it is tiny (≈ (span/bucket_ms) + 1 ints).
+    let min_r_ts = right_ts[0];
+    let max_r_ts = *right_ts.last().unwrap();
+    let num_buckets = ((max_r_ts - min_r_ts) / bucket_ms + 1) as i32;
+    let mut bucket_offsets = vec![0i32; (num_buckets + 1) as usize];
+    {
+        let mut b_curr = 0i32;
+        for (i, &ts) in right_ts.iter().enumerate() {
+            let b = ((ts - min_r_ts) / bucket_ms) as i32;
+            while b_curr <= b {
+                bucket_offsets[b_curr as usize] = i as i32;
+                b_curr += 1;
+            }
+        }
+        for b in b_curr..=num_buckets {
+            bucket_offsets[b as usize] = right_ts.len() as i32;
+        }
+    }
+
+    // Resident uploads — never re-transferred per query.
+    let d_left = stream.clone_htod(left_ts).expect("H2D left");
+    let d_right = stream.clone_htod(right_ts).expect("H2D right");
+    let d_price = stream.clone_htod(right_price).expect("H2D price");
+    let d_spread = stream.clone_htod(right_spread).expect("H2D spread");
+    let d_bucket = stream.clone_htod(&bucket_offsets).expect("H2D bucket");
+    let d_out = stream.alloc_zeros::<f64>(left_ts.len()).expect("alloc out");
+
     Tc1Cuda {
         build_us: t0.elapsed().as_secs_f64() * 1e6,
         ctx,
         func,
-        left: left_ts.to_vec(),
-        right: right_ts.to_vec(),
-        price: right_price.to_vec(),
-        spread: right_spread.to_vec(),
+        d_left,
+        d_right,
+        d_price,
+        d_spread,
+        d_bucket,
+        d_out,
+        left_len: left_ts.len() as i32,
+        right_len: right_ts.len() as i32,
+        num_buckets,
+        min_r_ts,
+        bucket_ms,
         tol: tolerance_ns,
+        chunk: 32,
     }
 }
 
-/// Full per-query cost: upload all inputs, launch the kernel, download outputs.
+/// Per-query cost: launch the fused merge kernel (all data resident) and download
+/// the single 8 MB output. No input H2D — the only host traffic is the 8 MB D2H.
 #[cfg(feature = "cuda")]
-fn tc1_cuda_query(b: &Tc1Cuda) -> (Vec<f64>, Vec<f64>) {
+fn tc1_cuda_query(b: &mut Tc1Cuda) -> Vec<f64> {
     use cudarc::driver::{LaunchConfig, PushKernelArg};
 
     let stream = b.ctx.default_stream();
-    let left_len = b.left.len();
-    let right_len = b.right.len();
-    let left_len_i = left_len as i32;
-    let right_len_i = right_len as i32;
+    let threads = 256u32;
+    let total_chunks = (b.left_len as u32 + b.chunk as u32 - 1) / b.chunk as u32;
+    let blocks = (total_chunks + threads - 1) / threads;
+    let cfg = LaunchConfig {
+        grid_dim: (blocks, 1, 1),
+        block_dim: (threads, 1, 1),
+        shared_mem_bytes: 0,
+    };
 
-    let d_left = stream.clone_htod(&b.left).expect("H2D left");
-    let d_right = stream.clone_htod(&b.right).expect("H2D right");
-    let d_price = stream.clone_htod(&b.price).expect("H2D price");
-    let d_spread = stream.clone_htod(&b.spread).expect("H2D spread");
-    let mut d_op = stream.alloc_zeros::<f64>(left_len).expect("alloc out");
-    let mut d_os = stream.alloc_zeros::<f64>(left_len).expect("alloc out");
-
-    let cfg = LaunchConfig::for_num_elems(left_len as u32);
     let mut lb = stream.launch_builder(&b.func);
-    lb.arg(&d_left)
-        .arg(&d_right)
-        .arg(&d_price)
-        .arg(&d_spread)
-        .arg(&mut d_op)
-        .arg(&mut d_os)
-        .arg(&left_len_i)
-        .arg(&right_len_i)
-        .arg(&b.tol);
+    lb.arg(&b.d_left)
+        .arg(&b.d_right)
+        .arg(&b.d_price)
+        .arg(&b.d_spread)
+        .arg(&b.d_bucket)
+        .arg(&mut b.d_out)
+        .arg(&b.left_len)
+        .arg(&b.right_len)
+        .arg(&b.num_buckets)
+        .arg(&b.min_r_ts)
+        .arg(&b.bucket_ms)
+        .arg(&b.tol)
+        .arg(&b.chunk);
     unsafe { lb.launch(cfg) }.expect("launch kernel");
 
-    let op = stream.clone_dtoh(&d_op).expect("D2H out");
-    let os = stream.clone_dtoh(&d_os).expect("D2H out");
-    (op, os)
+    stream.clone_dtoh(&b.d_out).expect("D2H out")
 }
 
 /// Runtime CUDA switch: `USE_CUDA=1` enables the GPU path. If the binary lacks
@@ -1165,10 +1213,11 @@ fn main() {
         #[cfg(feature = "cuda")]
         {
             if use_gpu {
-                let c = tc1_cuda_build(&a_times, &b_times, &b_prices, &b_spread, 500_000);
-                let (cp, cs) = tc1_cuda_query(&c);
-                assert!(f64_slice_eq(&cp, &rp), "TC1 cuda price != reference");
-                assert!(f64_slice_eq(&cs, &rs), "TC1 cuda spread != reference");
+                let mut c = tc1_cuda_build(
+                    &a_times, &b_times, &b_prices, &b_spread, 500_000, 1_000_000,
+                );
+                let cf = tc1_cuda_query(&mut c);
+                assert!(f64_slice_eq(&cf, &fused), "TC1 cuda merge != fused");
             }
         }
     }
@@ -1225,13 +1274,15 @@ fn main() {
             note: "as-of join fused (→ rel-spread 8MB out, no 16MB write), 500µs lag".into(),
         });
 
-        // CUDA (only when the feature is on and a GPU is present).
+        // CUDA merge-join (resident data + fused feature), only with GPU present.
         #[cfg(feature = "cuda")]
         {
             if use_gpu {
-                let c = tc1_cuda_build(&a_times, &b_times, &b_prices, &b_spread, 500_000);
+                let mut c = tc1_cuda_build(
+                    &a_times, &b_times, &b_prices, &b_spread, 500_000, 1_000_000,
+                );
                 let qc = bench_us(iters, || {
-                    let _ = tc1_cuda_query(&c);
+                    let _ = tc1_cuda_query(&mut c);
                 });
                 rows.push(Row {
                     tc: "TC1",
@@ -1240,7 +1291,7 @@ fn main() {
                     query_us: qc,
                     bytes: (n * 32) as f64,
                     threshold_us: if n == 1_000_000 { Some(5_000.0) } else { None },
-                    note: "as-of join CUDA (RTX 4060, per-thread binary search), 500µs lag".into(),
+                    note: "as-of join CUDA merge (resident + fused 8MB out), 500µs lag".into(),
                 });
             }
         }
