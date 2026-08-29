@@ -6,6 +6,7 @@
 pub mod asof;
 pub mod context;
 pub mod graph;
+pub mod knn;
 pub mod udf;
 
 mod expr_util;

@@ -1,0 +1,6 @@
+mavg 3
+msum 3
+deltas
+SELECT t, mavg(price, 3) OVER (ORDER BY t) FROM prices;
+SELECT t, msum(price, 2) OVER (ORDER BY t), deltas(price) OVER (ORDER BY t) FROM prices;
+quit

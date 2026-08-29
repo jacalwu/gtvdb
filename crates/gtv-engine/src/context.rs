@@ -1,6 +1,7 @@
 //! A DataFusion [`SessionContext`] wrapper for the gtv engine.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
@@ -9,10 +10,13 @@ use datafusion::error::Result;
 use datafusion::prelude::SessionContext;
 use gtv_core::TemporalCSR;
 
+use crate::knn::{KnnCollection, KnnTableFunction};
+
 /// A DataFusion `SessionContext` that gtv tables and UDFs are registered into.
 #[derive(Clone)]
 pub struct GtvContext {
     ctx: SessionContext,
+    knn_collections: Arc<RwLock<HashMap<String, KnnCollection>>>,
 }
 
 impl GtvContext {
@@ -21,7 +25,12 @@ impl GtvContext {
         for udwf in crate::udf::window_udfs() {
             ctx.register_udwf(udwf);
         }
-        Self { ctx }
+        let knn_collections = Arc::new(RwLock::new(HashMap::new()));
+        ctx.register_udtf("knn", Arc::new(KnnTableFunction::new(knn_collections.clone())));
+        Self {
+            ctx,
+            knn_collections,
+        }
     }
 
     pub fn session(&self) -> &SessionContext {
@@ -64,6 +73,27 @@ impl GtvContext {
                 right_values,
             )),
         );
+    }
+
+    /// Register a named vector collection for `knn(name, query, k [, label])`.
+    pub fn register_knn(
+        &self,
+        name: &str,
+        ids: Vec<u64>,
+        vectors: Vec<Vec<f32>>,
+        labels: Option<Vec<String>>,
+    ) -> Result<()> {
+        let collection = KnnCollection::new(ids, vectors, labels)
+            .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+        self.knn_collections
+            .write()
+            .map_err(|_| {
+                datafusion::error::DataFusionError::Execution(
+                    "knn collection registry poisoned".into(),
+                )
+            })?
+            .insert(name.to_string(), collection);
+        Ok(())
     }
 }
 

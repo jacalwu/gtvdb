@@ -1,0 +1,2 @@
+tss    knn(q=noisy_uptrend, k=4, no mask) = [0, 2, 1, 3]
+tss    knn(q=noisy_uptrend, k=1, no mask) = [0]

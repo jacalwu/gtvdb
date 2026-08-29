@@ -34,3 +34,18 @@ pub(crate) fn expr_to_u64(expr: &Expr) -> Result<u64> {
         )),
     }
 }
+
+/// Extract a `String` from a literal argument (accepting `Utf8`/`LargeUtf8`).
+pub(crate) fn expr_to_string(expr: &Expr) -> Result<String> {
+    match expr {
+        Expr::Literal(sv, _) => match sv {
+            ScalarValue::Utf8(Some(v)) | ScalarValue::LargeUtf8(Some(v)) => Ok(v.clone()),
+            other => Err(DataFusionError::Execution(format!(
+                "expected a string literal, got {other:?}"
+            ))),
+        },
+        _ => Err(DataFusionError::Execution(
+            "arguments must be literals".into(),
+        )),
+    }
+}

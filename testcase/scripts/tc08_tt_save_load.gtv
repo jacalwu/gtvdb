@@ -1,0 +1,7 @@
+tt edges 0
+tt edges 100
+tt edges 200
+save prices /tmp/gtvdb_testcase/prices.parquet
+load prices2 /tmp/gtvdb_testcase/prices.parquet
+SELECT * FROM prices2;
+quit

@@ -1,0 +1,7 @@
+neighbors 0 0
+neighbors 0 100
+neighbors 3 399
+neighbors 3 400
+khop 0 2 0
+SELECT * FROM neighbors(0, 100);
+quit

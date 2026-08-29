@@ -1,0 +1,3 @@
+knn 0 3
+knn 0 3 --mask 2,3,4,5
+quit

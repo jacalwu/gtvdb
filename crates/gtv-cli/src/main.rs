@@ -192,6 +192,43 @@ fn register_tables(ctx: &GtvContext, demo: &Demo) -> Result<()> {
 
     ctx.register_neighbors(demo.graph.csr());
     ctx.register_asof_join(demo.times.clone(), demo.prices.clone());
+    register_knn_collections(ctx)?;
+    Ok(())
+}
+
+/// Register the canonical vector collections (songs + tss_series) used by the
+/// KDB.AI parity tests TC-07 / TC-11, mirroring `testcase/data/gen_data.py`.
+fn register_knn_collections(ctx: &GtvContext) -> Result<()> {
+    let song_ids: Vec<u64> = (0..10).collect();
+    let song_vectors = vec![
+        vec![0.0, 0.0],
+        vec![0.5, 0.5],
+        vec![5.0, 5.0],
+        vec![5.2, 5.1],
+        vec![1.0, 1.0],
+        vec![1.1, 1.0],
+        vec![9.0, 9.0],
+        vec![9.1, 9.0],
+        vec![0.2, 0.1],
+        vec![4.9, 5.0],
+    ];
+    let genres = ["pop", "pop", "rock", "rock", "jazz", "jazz", "classical", "classical", "pop", "rock"];
+    ctx.register_knn(
+        "songs",
+        song_ids,
+        song_vectors,
+        Some(genres.iter().map(|s| s.to_string()).collect()),
+    )?;
+
+    let tss_ids: Vec<u64> = (0..4).collect();
+    let tss_vectors = vec![
+        vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        vec![5.0, 4.0, 2.0, 2.0, 4.0, 5.0],
+        vec![3.0, 3.0, 3.0, 3.0, 3.0, 3.0],
+        vec![6.0, 5.0, 4.0, 3.0, 2.0, 1.0],
+    ];
+    ctx.register_knn("tss", tss_ids, tss_vectors, None)?;
+
     Ok(())
 }
 
