@@ -9,6 +9,7 @@ pub mod csr;
 pub mod error;
 pub mod graph;
 pub mod table;
+pub mod temporal;
 pub mod traits;
 
 pub use chunk::TemporalEdgeChunk;
