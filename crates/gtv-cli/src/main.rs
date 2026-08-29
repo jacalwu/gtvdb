@@ -8,7 +8,8 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use arrow::array::{
-    ArrayRef, BooleanArray, Float64Array, Int64Array, RecordBatch, UInt64Array,
+    ArrayRef, BooleanArray, Float64Array, Int64Array, RecordBatch, TimestampNanosecondArray,
+    UInt64Array,
 };
 use arrow::compute::{cast, filter_record_batch};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -271,14 +272,20 @@ fn prices_batch(times: &[i64], prices: &[f64]) -> Result<(SchemaRef, RecordBatch
 }
 
 /// The subset of edges active at time `t` (`valid_from <= t < valid_to`).
+///
+/// Built with Arrow's SIMD comparison kernels (`lt_eq` + `gt` fused via `and`)
+/// rather than a per-element scalar loop, so mask generation stays vectorized
+/// for million-edge tables.
 fn edges_active_at(edges: &EdgeTable, t: i64) -> RecordBatch {
-    let mask: BooleanArray = (0..edges.len())
-        .map(|i| {
-            let from = edges.valid_from().value(i);
-            let to = edges.valid_to().value(i);
-            from <= t && t < to
+    let from = edges.valid_from();
+    let to = edges.valid_to();
+    let t_scalar = TimestampNanosecondArray::new_scalar(t);
+    let mask = arrow::compute::kernels::cmp::lt_eq(from, &t_scalar)
+        .and_then(|after| {
+            let before = arrow::compute::kernels::cmp::gt(to, &t_scalar)?;
+            arrow::compute::kernels::boolean::and(&after, &before)
         })
-        .collect();
+        .expect("temporal mask over timestamp columns");
     filter_record_batch(edges.batch(), &mask).expect("filter preserves schema")
 }
 
