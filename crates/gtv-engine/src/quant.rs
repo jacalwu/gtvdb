@@ -956,6 +956,7 @@ impl RelativeStrengthTableFunction {
             Field::new("excess_vs_idx", DataType::Float64, false),
             Field::new("excess_vs_peer", DataType::Float64, false),
             Field::new("signal", DataType::Utf8, false),
+            Field::new("next_day_return", DataType::Float64, true),
         ]))
     }
 }
@@ -1026,12 +1027,23 @@ impl TableFunctionImpl for RelativeStrengthTableFunction {
             }
             mom_map.insert(sym.clone(), m);
         }
+        // Forward-fill: if a benchmark has no bar at the exact ts, use the most
+        // recent prior day's momentum (so index/peer calendars align with the
+        // target's trading days).
+        let mom_ff = |m: &std::collections::HashMap<i64, f64>, ts: i64| -> f64 {
+            if let Some(&v) = m.get(&ts) {
+                return v;
+            }
+            let mut best: Option<(i64, f64)> = None;
+            for (&k, &v) in m {
+                if k <= ts && best.map_or(true, |(bk, _)| k > bk) {
+                    best = Some((k, v));
+                }
+            }
+            best.map(|(_, v)| v).unwrap_or(0.0)
+        };
         let get_mom = |sym: &str, ts: i64| -> f64 {
-            mom_map
-                .get(sym)
-                .and_then(|m| m.get(&ts))
-                .copied()
-                .unwrap_or(0.0)
+            mom_map.get(sym).map(|m| mom_ff(m, ts)).unwrap_or(0.0)
         };
 
         // Cross-sectional z of target within (target + peers) per day.
@@ -1062,8 +1074,10 @@ impl TableFunctionImpl for RelativeStrengthTableFunction {
         let mut exi_out = Vec::new();
         let mut exp_out = Vec::new();
         let mut sig_out = Vec::new();
+        let mut ret_out: Vec<Option<f64>> = Vec::new();
+        let target_closes: Vec<f64> = series[&target].iter().map(|&(_, c)| c).collect();
 
-        for &(ts, close) in &series[&target] {
+        for (i, &(ts, close)) in series[&target].iter().enumerate() {
             let tm = get_mom(&target, ts);
             let idx_mean = if indices.is_empty() {
                 0.0
@@ -1091,7 +1105,13 @@ impl TableFunctionImpl for RelativeStrengthTableFunction {
             pm_out.push(peer_mean);
             exi_out.push(tm - idx_mean);
             exp_out.push(tm - peer_mean);
+            let next_ret = if i + 1 < target_closes.len() && target_closes[i] != 0.0 {
+                Some(target_closes[i + 1] / target_closes[i] - 1.0)
+            } else {
+                None
+            };
             sig_out.push(sig.to_string());
+            ret_out.push(next_ret);
         }
 
         let schema = Self::schema();
@@ -1107,6 +1127,7 @@ impl TableFunctionImpl for RelativeStrengthTableFunction {
                 Arc::new(Float64Array::from(exi_out)) as ArrayRef,
                 Arc::new(Float64Array::from(exp_out)) as ArrayRef,
                 Arc::new(arrow::array::StringArray::from(sig_out)) as ArrayRef,
+                Arc::new(Float64Array::from(ret_out)) as ArrayRef,
             ],
         )?;
         Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
