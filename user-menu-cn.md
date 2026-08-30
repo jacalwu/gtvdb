@@ -295,6 +295,7 @@ FROM t;
 | — | `zscore` / `momentum` | 視窗（截面 / 技術指標） |
 | — | `signal` | 純量（z → buy/sell/hold） |
 | — | `read_yahoo` | 表函數（日線 OHLCV） |
+| — | `cross_sectional_signal` | 表函數（fetch+momentum+zscore+signal+隔日報酬） |
 
 ---
 

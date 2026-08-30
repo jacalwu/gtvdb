@@ -5,7 +5,7 @@
 use std::sync::{Arc, RwLock};
 
 use arrow::array::{as_primitive_array, as_string_array, Array, ArrayRef, Float64Array, Int32Array, Int64Array, UInt64Array, RecordBatch};
-use arrow::datatypes::{DataType, Field, FieldRef, Float64Type, Int64Type, Schema, UInt64Type};
+use arrow::datatypes::{DataType, Field, FieldRef, Float64Type, Int64Type, Schema, SchemaRef, UInt64Type};
 use datafusion::catalog::{TableFunctionArgs, TableFunctionImpl};
 use datafusion::datasource::{MemTable, TableProvider};
 use datafusion::error::{DataFusionError, Result as DfResult};
@@ -778,4 +778,161 @@ impl ScalarUDFImpl for SignalUdf {
 
 pub fn signal_udf() -> ScalarUDF {
     ScalarUDF::from(SignalUdf::new())
+}
+
+// ---------------------------------------------------------------------------
+// cross_sectional_signal(symbols, momentum_n, buy_thr, sell_thr) — one-shot
+// multi-symbol signal pipeline with next-day return for backtest validation
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Default)]
+pub struct CrossSectionalSignalTableFunction;
+
+impl CrossSectionalSignalTableFunction {
+    fn schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("symbol", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+            Field::new("close", DataType::Float64, false),
+            Field::new("momentum", DataType::Float64, false),
+            Field::new("zscore", DataType::Float64, false),
+            Field::new("signal", DataType::Utf8, false),
+            Field::new("next_day_return", DataType::Float64, true),
+        ]))
+    }
+}
+
+impl TableFunctionImpl for CrossSectionalSignalTableFunction {
+    fn call_with_args(&self, args: TableFunctionArgs) -> DfResult<Arc<dyn TableProvider>> {
+        let exprs = args.exprs();
+        let symbols_str = expr_to_string(
+            exprs.first().ok_or_else(|| {
+                DataFusionError::Execution(
+                    "cross_sectional_signal(symbols, n, buy_thr, sell_thr): missing symbols".into(),
+                )
+            })?,
+        )?;
+        let n = expr_to_i64(
+            exprs.get(1).ok_or_else(|| {
+                DataFusionError::Execution(
+                    "cross_sectional_signal(symbols, n, buy_thr, sell_thr): missing n".into(),
+                )
+            })?,
+        )?
+        .max(1) as usize;
+        let buy_thr = expr_to_f64(
+            exprs.get(2).ok_or_else(|| {
+                DataFusionError::Execution(
+                    "cross_sectional_signal(symbols, n, buy_thr, sell_thr): missing buy_thr"
+                        .into(),
+                )
+            })?,
+        )?;
+        let sell_thr = expr_to_f64(
+            exprs.get(3).ok_or_else(|| {
+                DataFusionError::Execution(
+                    "cross_sectional_signal(symbols, n, buy_thr, sell_thr): missing sell_thr"
+                        .into(),
+                )
+            })?,
+        )?;
+
+        let symbols: Vec<String> = symbols_str
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if symbols.is_empty() {
+            return Err(DataFusionError::Execution("no symbols given".into()));
+        }
+
+        // Per-symbol: fetch daily, momentum, next-day return.
+        struct Row {
+            symbol: String,
+            ts: i64,
+            close: f64,
+            mom: f64,
+            next_ret: Option<f64>,
+        }
+        let mut rows: Vec<Row> = Vec::new();
+        for sym in &symbols {
+            let daily = crate::yahoo::fetch_daily(sym, "1y")
+                .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+            if daily.is_empty() {
+                continue;
+            }
+            let close: Vec<f64> = daily.iter().map(|d| d.close).collect();
+            let mom = gtv_array::quant::momentum(&close, n);
+            for i in 0..daily.len() {
+                let next_ret = if i + 1 < close.len() && close[i] != 0.0 {
+                    Some(close[i + 1] / close[i] - 1.0)
+                } else {
+                    None
+                };
+                rows.push(Row {
+                    symbol: sym.clone(),
+                    ts: daily[i].ts,
+                    close: daily[i].close,
+                    mom: mom[i],
+                    next_ret,
+                });
+            }
+        }
+        if rows.is_empty() {
+            return Err(DataFusionError::Execution("no Yahoo data for symbols".into()));
+        }
+
+        // Cross-sectional z-score of momentum per trading day.
+        let mut groups: std::collections::BTreeMap<i64, Vec<usize>> =
+            std::collections::BTreeMap::new();
+        for (i, r) in rows.iter().enumerate() {
+            groups.entry(r.ts).or_default().push(i);
+        }
+        let mut z = vec![0.0f64; rows.len()];
+        for idxs in groups.values() {
+            let m: Vec<f64> = idxs.iter().map(|&i| rows[i].mom).collect();
+            let zs = gtv_array::quant::zscore(&m);
+            for (k, &i) in idxs.iter().enumerate() {
+                z[i] = zs[k];
+            }
+        }
+
+        let mut sym_out = Vec::new();
+        let mut ts_out = Vec::new();
+        let mut close_out = Vec::new();
+        let mut mom_out = Vec::new();
+        let mut z_out = Vec::new();
+        let mut sig_out = Vec::new();
+        let mut ret_out: Vec<Option<f64>> = Vec::new();
+        for (i, r) in rows.iter().enumerate() {
+            sym_out.push(r.symbol.clone());
+            ts_out.push(r.ts);
+            close_out.push(r.close);
+            mom_out.push(r.mom);
+            z_out.push(z[i]);
+            sig_out.push(if z[i] >= buy_thr {
+                "buy".to_string()
+            } else if z[i] <= sell_thr {
+                "sell".to_string()
+            } else {
+                "hold".to_string()
+            });
+            ret_out.push(r.next_ret);
+        }
+
+        let schema = Self::schema();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(arrow::array::StringArray::from(sym_out)) as ArrayRef,
+                Arc::new(Int64Array::from(ts_out)) as ArrayRef,
+                Arc::new(Float64Array::from(close_out)) as ArrayRef,
+                Arc::new(Float64Array::from(mom_out)) as ArrayRef,
+                Arc::new(Float64Array::from(z_out)) as ArrayRef,
+                Arc::new(arrow::array::StringArray::from(sig_out)) as ArrayRef,
+                Arc::new(Float64Array::from(ret_out)) as ArrayRef,
+            ],
+        )?;
+        Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
+    }
 }

@@ -299,6 +299,7 @@ Quant operators (phase 2):
 | — | `zscore` / `momentum` | window (cross-sectional / technical) |
 | — | `signal` | scalar (z → buy/sell/hold) |
 | — | `read_yahoo` | table fn (daily OHLCV) |
+| — | `cross_sectional_signal` | table fn (fetch+momentum+zscore+signal+next-day ret) |
 
 ---
 
