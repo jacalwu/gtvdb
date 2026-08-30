@@ -295,6 +295,9 @@ save <table> <path>        load <table> <path>
 loadcsv <table> <path>     bgload <table> <path> [ms]
 live <table> <symbol...>   串流 LSE 即時 tick（需 LSE_API_KEY）
 fetch <table> <symbol> [limit]  抓取 LSE 歷史 tick（REST API）
+hdb_save <table> <date> [root]  把表持久化到 HDB 分區
+hdb_load <table> <date> <sym> [root]  讀取單個 HDB 分區
+hdb_scan <table> <start> <end> [sym] [root]  掃描 HDB 日期區間
 tt <table> <T>             pattern [T]        delta
 udf [x ...]                remote <host:port> <sql>
 ```

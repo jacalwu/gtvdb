@@ -2044,6 +2044,8 @@ name = "gtv-storage"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "bytes",
+ "memmap2",
  "parquet",
  "thiserror 2.0.20",
 ]
@@ -2625,6 +2627,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ad38eb12aea514a0466ea40a80fd8cc83637065948eb4a426e4aa46261175227"
 dependencies = [
  "rustix",
+]
+
+[[package]]
+name = "memmap2"
+version = "0.9.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d1219ed1b7f229ee7104d281dd01d6802fe28bb6e95d292942c4daacdeb798c0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

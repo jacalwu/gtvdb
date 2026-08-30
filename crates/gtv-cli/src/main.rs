@@ -27,7 +27,7 @@ use gtv_engine::hft_exec::KernelPlan;
 use gtv_engine::GtvContext;
 use gtv_index::HnswIndex;
 use gtv_pattern::Pattern;
-use gtv_storage::{parquet, SnapshotStore};
+use gtv_storage::{parquet, HdbStore, SnapshotStore};
 use gtv_udf::WasmUdf;
 
 const DEFAULT_T: i64 = 0;
@@ -636,6 +636,55 @@ async fn run(
             ctx.register_csv(path, table)?;
             println!("loaded `{table}` from {path}");
         }
+        "hdb_save" => {
+            // hdb_save <table> <date> [root] — persist a table to the HDB layout
+            // (<root>/<date>/<table>/<symbol>.parquet, split by `symbol` if present).
+            let table = require_arg(&tokens, 1, "hdb_save <table> <date> [root]")?;
+            let date = require_arg(&tokens, 2, "hdb_save <table> <date> [root]")?;
+            let root = optional_arg(&tokens, 3).unwrap_or("hdb");
+            let batches = ctx.sql(&format!("SELECT * FROM {table}")).await?;
+            let Some(first) = batches.first() else {
+                return Err(anyhow!("table `{table}` is empty"));
+            };
+            let all = concat_batches(&first.schema(), &batches)?;
+            let hdb = HdbStore::new(root);
+            let n = hdb.write_table(date, table, &all)?;
+            println!(
+                "hdb_save: wrote {n} partition(s) to {}/{date}/{table}/",
+                hdb.root().display()
+            );
+        }
+        "hdb_load" => {
+            // hdb_load <table> <date> <sym> [root] — read one HDB partition.
+            let table = require_arg(&tokens, 1, "hdb_load <table> <date> <sym> [root]")?;
+            let date = require_arg(&tokens, 2, "hdb_load <table> <date> <sym> [root]")?;
+            let sym = require_arg(&tokens, 3, "hdb_load <table> <date> <sym> [root]")?;
+            let root = optional_arg(&tokens, 4).unwrap_or("hdb");
+            let hdb = HdbStore::new(root);
+            let batches = hdb.read_partition(date, table, sym)?;
+            let Some(first) = batches.first() else {
+                return Err(anyhow!("no data in {date}/{table}/{sym}"));
+            };
+            ctx.register_batches(table, first.schema(), batches)?;
+            println!("hdb_load: loaded `{table}` from {date}/{sym}");
+        }
+        "hdb_scan" => {
+            // hdb_scan <table> <start> <end> [sym] [root] — prune + scan a date range.
+            let table = require_arg(&tokens, 1, "hdb_scan <table> <start> <end> [sym] [root]")?;
+            let start = require_arg(&tokens, 2, "hdb_scan <table> <start> <end> [sym] [root]")?;
+            let end = require_arg(&tokens, 3, "hdb_scan <table> <start> <end> [sym] [root]")?;
+            let sym = optional_arg(&tokens, 4);
+            let root = optional_arg(&tokens, 5).unwrap_or("hdb");
+            let syms: Vec<String> = sym.map(|s| vec![s.to_string()]).unwrap_or_default();
+            let hdb = HdbStore::new(root);
+            let batches = hdb.scan(table, start, end, &syms)?;
+            let Some(first) = batches.first() else {
+                return Err(anyhow!("no data in {start}..{end} for `{table}`"));
+            };
+            let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            ctx.register_batches(table, first.schema(), batches)?;
+            println!("hdb_scan: loaded `{table}` {start}..{end} ({rows} rows)");
+        }
         "fetch" => {
             // fetch <table> <symbol> [limit] — pull historical ticks from the
             // London Strategic Edge REST API into a session table.
@@ -964,6 +1013,9 @@ fn print_help() {
          \x20 bgload <table> <path> [ms]  background re-import (CSV or Parquet)\n\
          \x20 live <table> <symbol...>  stream LSE live ticks (needs LSE_API_KEY)\n\
          \x20 fetch <table> <symbol> [limit]  pull LSE historical ticks (REST API)\n\
+         \x20 hdb_save <table> <date> [root]  persist table to HDB partitions\n\
+         \x20 hdb_load <table> <date> <sym> [root]  read one HDB partition\n\
+         \x20 hdb_scan <table> <start> <end> [sym] [root]  scan HDB date range\n\
          \x20 tt <table> <T>        time-travel: table snapshot as-of T\n\
          \x20 pattern [T]           temporal pattern matching (ring/path/diamond)\n\
          \x20 delta                 LSM delta buffer insert + compaction demo\n\
