@@ -293,6 +293,8 @@ FROM t;
 | — | `xbar` | 純量（時間分桶） |
 | — | `ohlc` | 表函數（tick → OHLCV K 線） |
 | — | `zscore` / `momentum` | 視窗（截面 / 技術指標） |
+| — | `signal` | 純量（z → buy/sell/hold） |
+| — | `read_yahoo` | 表函數（日線 OHLCV） |
 
 ---
 

@@ -8,7 +8,12 @@ use std::sync::Arc;
 use anyhow::{anyhow, Result};
 use arrow::array::{ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use datafusion::catalog::{TableFunctionArgs, TableFunctionImpl};
+use datafusion::datasource::{MemTable, TableProvider};
+use datafusion::error::{DataFusionError, Result as DfResult};
 use serde_json::Value;
+
+use crate::expr_util::expr_to_string;
 
 /// One daily OHLCV bar.
 #[derive(Debug, Clone)]
@@ -67,6 +72,41 @@ fn arr_of(v: &Value) -> Vec<Value> {
 
 fn f64_at(v: &[Value], i: usize) -> Option<f64> {
     v.get(i).and_then(|x| x.as_f64())
+}
+
+/// `read_yahoo(symbol, range)` table function — daily OHLCV via SQL.
+#[derive(Debug, Default)]
+pub struct ReadYahooTableFunction;
+
+impl ReadYahooTableFunction {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl TableFunctionImpl for ReadYahooTableFunction {
+    fn call_with_args(&self, args: TableFunctionArgs) -> DfResult<Arc<dyn TableProvider>> {
+        let exprs = args.exprs();
+        let symbol = expr_to_string(
+            exprs.first().ok_or_else(|| {
+                DataFusionError::Execution("read_yahoo(symbol [, range]): missing symbol".into())
+            })?,
+        )?;
+        let range = exprs
+            .get(1)
+            .map(expr_to_string)
+            .transpose()?
+            .unwrap_or_else(|| "1y".to_string());
+        let rows = fetch_daily(&symbol, &range)
+            .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+        if rows.is_empty() {
+            return Err(DataFusionError::Execution(format!(
+                "no Yahoo data for `{symbol}` (range={range})"
+            )));
+        }
+        let batch = yahoo_to_batch(&rows);
+        Ok(Arc::new(MemTable::try_new(yahoo_schema(), vec![vec![batch]])?))
+    }
 }
 
 /// Fetch daily OHLCV for a symbol over a Yahoo `range` ("1mo".."max").

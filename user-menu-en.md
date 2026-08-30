@@ -297,6 +297,8 @@ Quant operators (phase 2):
 | — | `xbar` | scalar (time bucket) |
 | — | `ohlc` | table fn (tick → OHLCV bars) |
 | — | `zscore` / `momentum` | window (cross-sectional / technical) |
+| — | `signal` | scalar (z → buy/sell/hold) |
+| — | `read_yahoo` | table fn (daily OHLCV) |
 
 ---
 

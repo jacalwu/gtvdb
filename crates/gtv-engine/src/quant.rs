@@ -720,3 +720,62 @@ pub fn quant_window_udfs() -> Vec<WindowUDF> {
         WindowUDF::from(QuantWindowUdf::new("momentum", WindowOp::Momentum)),
     ]
 }
+
+// ---------------------------------------------------------------------------
+// signal(z, buy_thr, sell_thr) — scalar UDF: cross-sectional buy/sell/hold
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SignalUdf {
+    signature: Signature,
+}
+
+impl SignalUdf {
+    fn new() -> Self {
+        Self {
+            signature: Signature::exact(
+                vec![DataType::Float64, DataType::Float64, DataType::Float64],
+                Volatility::Immutable,
+            ),
+        }
+    }
+}
+
+impl ScalarUDFImpl for SignalUdf {
+    fn name(&self) -> &str {
+        "signal"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _arg_types: &[DataType]) -> DfResult<DataType> {
+        Ok(DataType::Utf8)
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DfResult<ColumnarValue> {
+        let arrays = ColumnarValue::values_to_arrays(&args.args)?;
+        let z = f64_values(&arrays[0]);
+        let buy = f64_values(&arrays[1]);
+        let sell = f64_values(&arrays[2]);
+        let out: Vec<String> = (0..z.len())
+            .map(|i| {
+                let b = buy.get(i).copied().unwrap_or(0.5);
+                let s = sell.get(i).copied().unwrap_or(-0.5);
+                if z[i] >= b {
+                    "buy".to_string()
+                } else if z[i] <= s {
+                    "sell".to_string()
+                } else {
+                    "hold".to_string()
+                }
+            })
+            .collect();
+        Ok(ColumnarValue::Array(Arc::new(arrow::array::StringArray::from(out))))
+    }
+}
+
+pub fn signal_udf() -> ScalarUDF {
+    ScalarUDF::from(SignalUdf::new())
+}

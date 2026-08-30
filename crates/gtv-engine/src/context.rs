@@ -40,6 +40,7 @@ impl GtvContext {
             ctx.register_udf(udf);
         }
         ctx.register_udf(crate::quant::xbar_udf());
+        ctx.register_udf(crate::quant::signal_udf());
         for udwf in crate::micro::micro_window_udfs() {
             ctx.register_udwf(udwf);
         }
@@ -54,6 +55,7 @@ impl GtvContext {
         ctx.register_udtf("vector_search", Arc::new(KnnTableFunction::new(knn_collections.clone())));
         ctx.register_udtf("read_csv", Arc::new(crate::csv::ReadCsvTableFunction::new()));
         ctx.register_udtf("read_parquet", Arc::new(crate::csv::ReadParquetTableFunction::new()));
+        ctx.register_udtf("read_yahoo", Arc::new(crate::yahoo::ReadYahooTableFunction::new()));
         ctx.register_udtf("read_tickdata", Arc::new(crate::tickdata::ReadTickdataTableFunction));
         let hft_reg = Arc::new(RwLock::new(HftRegistry::default()));
         {
