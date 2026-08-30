@@ -298,6 +298,7 @@ fetch <table> <symbol> [limit]  抓取 LSE 歷史 tick（REST API）
 hdb_save <table> <date> [root]  把表持久化到 HDB 分區
 hdb_load <table> <date> <sym> [root]  讀取單個 HDB 分區
 hdb_scan <table> <start> <end> [sym] [root]  掃描 HDB 日期區間
+hdb_flush <table> [root] [secs]  背景 HDB 落盤（symbol 枚舉）
 tt <table> <T>             pattern [T]        delta
 udf [x ...]                remote <host:port> <sql>
 ```

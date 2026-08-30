@@ -685,6 +685,47 @@ async fn run(
             ctx.register_batches(table, first.schema(), batches)?;
             println!("hdb_scan: loaded `{table}` {start}..{end} ({rows} rows)");
         }
+        "hdb_flush" => {
+            // hdb_flush <table> [root] [interval_secs] — background task that
+            // flushes the memory table to HDB (symbol-enumerated) on an interval.
+            let table = require_arg(&tokens, 1, "hdb_flush <table> [root] [interval_secs]")?.to_string();
+            let root = optional_arg(&tokens, 2).unwrap_or("hdb").to_string();
+            let interval = optional_arg(&tokens, 3)
+                .map_or(Ok(86400u64), |s| s.parse::<u64>())?;
+            let ctx2 = ctx.clone();
+            let table2 = table.clone();
+            let root2 = root.clone();
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval));
+                // first tick fires immediately; skip it and flush at the first interval.
+                ticker.tick().await;
+                loop {
+                    ticker.tick().await;
+                    let date = chrono::Local::now().format("%Y.%m.%d").to_string();
+                    match ctx2.sql(&format!("SELECT * FROM {table2}")).await {
+                        Ok(batches) => {
+                            let Some(first) = batches.first() else { continue };
+                            let all = match concat_batches(&first.schema(), &batches) {
+                                Ok(b) => b,
+                                Err(e) => {
+                                    eprintln!("hdb_flush `{table2}`: {e}");
+                                    continue;
+                                }
+                            };
+                            let hdb = HdbStore::new(&root2);
+                            match hdb.write_table(&date, &table2, &all) {
+                                Ok(n) => eprintln!(
+                                    "hdb_flush: wrote {n} partition(s) to {date}/{table2}/"
+                                ),
+                                Err(e) => eprintln!("hdb_flush `{table2}`: {e}"),
+                            }
+                        }
+                        Err(e) => eprintln!("hdb_flush `{table2}`: {e}"),
+                    }
+                }
+            });
+            println!("hdb_flush: `{table}` -> {root}/<date>/<table>/ every {interval}s");
+        }
         "fetch" => {
             // fetch <table> <symbol> [limit] — pull historical ticks from the
             // London Strategic Edge REST API into a session table.
@@ -1016,6 +1057,7 @@ fn print_help() {
          \x20 hdb_save <table> <date> [root]  persist table to HDB partitions\n\
          \x20 hdb_load <table> <date> <sym> [root]  read one HDB partition\n\
          \x20 hdb_scan <table> <start> <end> [sym] [root]  scan HDB date range\n\
+         \x20 hdb_flush <table> [root] [secs]  background HDB flush (sym-enumerated)\n\
          \x20 tt <table> <T>        time-travel: table snapshot as-of T\n\
          \x20 pattern [T]           temporal pattern matching (ring/path/diamond)\n\
          \x20 delta                 LSM delta buffer insert + compaction demo\n\

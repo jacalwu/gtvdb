@@ -302,6 +302,7 @@ fetch <table> <symbol> [limit]  pull LSE historical ticks (REST API)
 hdb_save <table> <date> [root]  persist table to HDB partitions
 hdb_load <table> <date> <sym> [root]  read one HDB partition
 hdb_scan <table> <start> <end> [sym] [root]  scan HDB date range
+hdb_flush <table> [root] [secs]  background HDB flush (sym-enumerated)
 tt <table> <T>             pattern [T]        delta
 udf [x ...]                remote <host:port> <sql>
 ```
