@@ -286,6 +286,15 @@ FROM t;
 Plus built-ins: `mavg` / `msum` / `deltas` (window), `neighbors` (table fn),
 `read_csv` / `read_parquet` (table fn).
 
+Quant operators (phase 2):
+
+| short | full | type |
+|-------|------|------|
+| — | `bs_price` / `bs_delta` / `bs_gamma` / `bs_vega` / `bs_theta` | scalar |
+| `var` | `var_historical` | table fn |
+| — | `pca` | table fn |
+| `l2` | `reconstruct_l2` | table fn |
+
 ---
 
 ## 6. Shell Commands

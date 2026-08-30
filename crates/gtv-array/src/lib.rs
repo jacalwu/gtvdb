@@ -7,4 +7,5 @@
 pub mod asof;
 pub mod hft_ops;
 pub mod micro;
+pub mod quant;
 pub mod window;

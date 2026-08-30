@@ -282,6 +282,15 @@ FROM t;
 另有內建：`mavg` / `msum` / `deltas`（視窗）、`neighbors`（表函數）、
 `read_csv` / `read_parquet`（表函數）。
 
+量化算子（Phase 2）：
+
+| 簡稱 | 全名 | 型態 |
+|------|------|------|
+| — | `bs_price` / `bs_delta` / `bs_gamma` / `bs_vega` / `bs_theta` | 純量 |
+| `var` | `var_historical` | 表函數 |
+| — | `pca` | 表函數 |
+| `l2` | `reconstruct_l2` | 表函數 |
+
 ---
 
 ## 6. Shell 命令

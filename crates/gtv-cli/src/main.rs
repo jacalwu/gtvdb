@@ -392,6 +392,61 @@ fn register_hft_demo(ctx: &GtvContext, demo: &Demo) -> Result<()> {
     )?;
     ctx.register_batches("orderstream", orders_schema, vec![orders_batch])?;
 
+    // Phase 2 quant demos: options (Black-Scholes), MBO stream (L2 rebuild),
+    // and a single-column returns table (historical VaR).
+    let options_schema = Arc::new(Schema::new(vec![
+        Field::new("option_type", DataType::Utf8, false),
+        Field::new("s", DataType::Float64, false),
+        Field::new("k", DataType::Float64, false),
+        Field::new("t", DataType::Float64, false),
+        Field::new("r", DataType::Float64, false),
+        Field::new("sigma", DataType::Float64, false),
+    ]));
+    let options_batch = RecordBatch::try_new(
+        options_schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["call", "put", "call", "put"])) as ArrayRef,
+            Arc::new(Float64Array::from(vec![100.0, 100.0, 120.0, 110.0])) as ArrayRef,
+            Arc::new(Float64Array::from(vec![100.0, 100.0, 110.0, 110.0])) as ArrayRef,
+            Arc::new(Float64Array::from(vec![1.0, 1.0, 0.5, 0.5])) as ArrayRef,
+            Arc::new(Float64Array::from(vec![0.05, 0.05, 0.03, 0.03])) as ArrayRef,
+            Arc::new(Float64Array::from(vec![0.2, 0.2, 0.25, 0.25])) as ArrayRef,
+        ],
+    )?;
+    ctx.register_batches("options", options_schema, vec![options_batch])?;
+
+    let mbo_schema = Arc::new(Schema::new(vec![
+        Field::new("order_id", DataType::UInt64, false),
+        Field::new("side", DataType::Float64, false),
+        Field::new("price", DataType::Float64, false),
+        Field::new("qty", DataType::Float64, false),
+        Field::new("action", DataType::Float64, false),
+    ]));
+    let mbo_batch = RecordBatch::try_new(
+        mbo_schema.clone(),
+        vec![
+            Arc::new(UInt64Array::from(vec![1u64, 2, 3, 1, 4, 3])) as ArrayRef,
+            Arc::new(Float64Array::from(vec![1.0, 1.0, 0.0, 1.0, 1.0, 0.0])) as ArrayRef,
+            Arc::new(Float64Array::from(vec![100.0, 100.0, 99.0, 100.0, 100.5, 99.0])) as ArrayRef,
+            Arc::new(Float64Array::from(vec![10.0, 5.0, 7.0, 0.0, 8.0, 2.0])) as ArrayRef,
+            Arc::new(Float64Array::from(vec![0.0, 0.0, 0.0, 1.0, 0.0, 2.0])) as ArrayRef,
+        ],
+    )?;
+    ctx.register_batches("mbo", mbo_schema, vec![mbo_batch])?;
+
+    let rets_schema = Arc::new(Schema::new(vec![Field::new(
+        "returns",
+        DataType::Float64,
+        false,
+    )]));
+    let rets_batch = RecordBatch::try_new(
+        rets_schema.clone(),
+        vec![Arc::new(Float64Array::from(vec![
+            -0.02, -0.01, 0.0, 0.01, 0.02, -0.03, 0.005, 0.015,
+        ])) as ArrayRef],
+    )?;
+    ctx.register_batches("rets", rets_schema, vec![rets_batch])?;
+
     Ok(())
 }
 

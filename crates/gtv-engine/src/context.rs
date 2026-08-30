@@ -36,6 +36,9 @@ impl GtvContext {
         for udaf in crate::hft::hft_aggregate_udfs() {
             ctx.register_udaf(udaf);
         }
+        for udf in crate::quant::bs_udfs() {
+            ctx.register_udf(udf);
+        }
         for udwf in crate::micro::micro_window_udfs() {
             ctx.register_udwf(udwf);
         }
@@ -59,6 +62,14 @@ impl GtvContext {
             let cv = Arc::new(crate::hft_tf::CovarianceTableFunction::new(hft_reg.clone()));
             ctx.register_udtf("covariance_matrix", cv.clone());
             ctx.register_udtf("cov", cv);
+            let var = Arc::new(crate::quant::VarHistoricalTableFunction::new(hft_reg.clone()));
+            ctx.register_udtf("var_historical", var.clone());
+            ctx.register_udtf("var", var);
+            let pca = Arc::new(crate::quant::PcaTableFunction::new(hft_reg.clone()));
+            ctx.register_udtf("pca", pca);
+            let l2 = Arc::new(crate::quant::ReconstructL2TableFunction::new(hft_reg.clone()));
+            ctx.register_udtf("reconstruct_l2", l2.clone());
+            ctx.register_udtf("l2", l2);
         }
         Self {
             ctx,
