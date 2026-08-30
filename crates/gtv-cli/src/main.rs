@@ -812,6 +812,40 @@ async fn run(
             ctx.register_batches(&table, gtv_engine::tickdata::hist_schema(), vec![batch])?;
             println!("fetched `{table}` <- {} ({} rows)", symbols.join(","), all.len());
         }
+        "yahoo" => {
+            // yahoo <table> <symbol...> [--range 1y] — daily OHLCV from Yahoo.
+            let table = require_arg(&tokens, 1, "yahoo <table> <symbol...> [--range 1y]")?.to_string();
+            let mut symbols: Vec<String> = Vec::new();
+            let mut range = "1y".to_string();
+            let mut i = 2;
+            while i < tokens.len() {
+                if tokens[i] == "--range" {
+                    range = tokens
+                        .get(i + 1)
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| "1y".to_string());
+                    i += 2;
+                } else {
+                    symbols.push(tokens[i].to_string());
+                    i += 1;
+                }
+            }
+            if symbols.is_empty() {
+                return Err(anyhow!("usage: yahoo <table> <symbol...> [--range 1y]"));
+            }
+            let mut all = Vec::new();
+            for sym in &symbols {
+                let rows = gtv_engine::yahoo::fetch_daily(sym, &range)?;
+                all.extend(rows);
+            }
+            let batch = gtv_engine::yahoo::yahoo_to_batch(&all);
+            ctx.register_batches(&table, gtv_engine::yahoo::yahoo_schema(), vec![batch])?;
+            println!(
+                "yahoo: fetched `{table}` <- {} ({} rows, range={range})",
+                symbols.join(","),
+                all.len()
+            );
+        }
         "live" => {
             // live <table> <symbol...> — stream LSE ticks into a session table.
             let table = require_arg(&tokens, 1, "live <table> <symbol...>")?.to_string();
@@ -1127,6 +1161,7 @@ fn print_help() {
          \x20 bgload <table> <path> [ms]  background re-import (CSV or Parquet)\n\
          \x20 live <table> <symbol...>  stream LSE live ticks (needs LSE_API_KEY)\n\
          \x20 fetch <table> <symbol> [limit]  pull LSE historical ticks (REST API)\n\
+         \x20 yahoo <table> <symbol...> [--range 1y]  pull daily OHLCV from Yahoo\n\
          \x20 hdb_save <table> <date> [root]  persist table to HDB partitions\n\
          \x20 hdb_load <table> <date> <sym> [root]  read one HDB partition\n\
          \x20 hdb_scan <table> <start> <end> [sym] [root]  scan HDB date range\n\

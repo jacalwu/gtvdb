@@ -15,6 +15,7 @@ pub mod micro;
 pub mod quant;
 pub mod tickdata;
 pub mod udf;
+pub mod yahoo;
 
 mod expr_util;
 

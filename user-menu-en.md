@@ -311,6 +311,7 @@ save <table> <path>        load <table> <path>
 loadcsv <table> <path>     bgload <table> <path> [ms]
 live <table> <symbol...>   stream LSE live ticks (needs LSE_API_KEY)
 fetch <table> <symbol> [limit]  pull LSE historical ticks (REST API)
+yahoo <table> <symbol...> [--range 1y]  pull daily OHLCV from Yahoo
 hdb_save <table> <date> [root]  persist table to HDB partitions
 hdb_load <table> <date> <sym> [root]  read one HDB partition
 hdb_scan <table> <start> <end> [sym] [root]  scan HDB date range
