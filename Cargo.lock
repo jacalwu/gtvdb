@@ -1987,6 +1987,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arrow",
+ "chrono",
  "datafusion",
  "gtv-array",
  "gtv-core",

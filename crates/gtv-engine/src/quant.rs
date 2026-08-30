@@ -5,11 +5,12 @@
 use std::sync::{Arc, RwLock};
 
 use arrow::array::{as_primitive_array, as_string_array, Array, ArrayRef, Float64Array, Int32Array, Int64Array, UInt64Array, RecordBatch};
-use arrow::datatypes::{DataType, Field, Float64Type, Int64Type, Schema, UInt64Type};
+use arrow::datatypes::{DataType, Field, FieldRef, Float64Type, Int64Type, Schema, UInt64Type};
 use datafusion::catalog::{TableFunctionArgs, TableFunctionImpl};
 use datafusion::datasource::{MemTable, TableProvider};
 use datafusion::error::{DataFusionError, Result as DfResult};
-use datafusion::logical_expr::{ColumnarValue, Expr, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility};
+use datafusion::logical_expr::function::{PartitionEvaluatorArgs, WindowUDFFieldArgs};
+use datafusion::logical_expr::{ColumnarValue, Expr, PartitionEvaluator, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility, WindowUDF, WindowUDFImpl};
 use datafusion::scalar::ScalarValue;
 
 use crate::expr_util::{expr_to_i64, expr_to_string};
@@ -482,6 +483,11 @@ fn extract_i64_col(batches: &[RecordBatch], col: &str) -> DfResult<Vec<i64>> {
         let arr = b.column_by_name(col).ok_or_else(|| {
             DataFusionError::Execution(format!("missing `{col}` column"))
         })?;
+        if !matches!(arr.data_type(), DataType::Int64) {
+            return Err(DataFusionError::Execution(format!(
+                "column `{col}` is not Int64"
+            )));
+        }
         out.extend_from_slice(as_primitive_array::<Int64Type>(arr.as_ref()).values());
     }
     Ok(out)
@@ -519,11 +525,12 @@ impl TableFunctionImpl for OhlcTableFunction {
             DataFusionError::Execution(format!("unknown table `{name}`"))
         })?;
 
-        let ts = extract_i64_col(batches, "ts")
+        let ts = extract_i64_col(batches, "ts_us")
             .or_else(|_| extract_i64_col(batches, "t"))
             .or_else(|_| extract_i64_col(batches, "time"))
+            .or_else(|_| extract_i64_col(batches, "ts"))
             .map_err(|_| {
-                DataFusionError::Execution(format!("table `{name}` has no Int64 `ts` column"))
+                DataFusionError::Execution(format!("table `{name}` has no Int64 ts column"))
             })?;
         let price = {
             let mut v = Vec::new();
@@ -626,4 +633,90 @@ impl TableFunctionImpl for OhlcTableFunction {
         let batch = RecordBatch::try_new(schema.clone(), cols)?;
         Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
     }
+}
+
+// ---------------------------------------------------------------------------
+// zscore / momentum — cross-sectional & technical window UDFs
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum WindowOp {
+    Zscore,
+    Momentum,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct QuantWindowUdf {
+    name: &'static str,
+    signature: Signature,
+    op: WindowOp,
+}
+
+impl QuantWindowUdf {
+    fn new(name: &'static str, op: WindowOp) -> Self {
+        let args = match op {
+            WindowOp::Zscore => vec![DataType::Float64],
+            WindowOp::Momentum => vec![DataType::Float64, DataType::Int64],
+        };
+        Self {
+            name,
+            signature: Signature::exact(args, Volatility::Immutable),
+            op,
+        }
+    }
+}
+
+impl WindowUDFImpl for QuantWindowUdf {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn partition_evaluator(&self, _args: PartitionEvaluatorArgs) -> DfResult<Box<dyn PartitionEvaluator>> {
+        Ok(Box::new(QuantWindowEvaluator { op: self.op }))
+    }
+
+    fn field(&self, field_args: WindowUDFFieldArgs) -> DfResult<FieldRef> {
+        Ok(Field::new(field_args.name(), DataType::Float64, true).into())
+    }
+}
+
+#[derive(Debug)]
+struct QuantWindowEvaluator {
+    op: WindowOp,
+}
+
+impl PartitionEvaluator for QuantWindowEvaluator {
+    fn evaluate_all(&mut self, values: &[ArrayRef], _num_rows: usize) -> DfResult<ArrayRef> {
+        if values.is_empty() {
+            return Ok(Arc::new(Float64Array::from(Vec::<f64>::new())));
+        }
+        let x = f64_values(&values[0]);
+        let out: Vec<f64> = match self.op {
+            WindowOp::Zscore => gtv_array::quant::zscore(x),
+            WindowOp::Momentum => {
+                let n = values
+                    .get(1)
+                    .and_then(|a| ScalarValue::try_from_array(a, 0).ok())
+                    .and_then(|s| s.cast_to(&DataType::Int64).ok())
+                    .and_then(|s| match s {
+                        ScalarValue::Int64(Some(n)) => Some(n.max(1) as usize),
+                        _ => None,
+                    })
+                    .unwrap_or(1);
+                gtv_array::quant::momentum(x, n)
+            }
+        };
+        Ok(Arc::new(Float64Array::from(out)))
+    }
+}
+
+pub fn quant_window_udfs() -> Vec<WindowUDF> {
+    vec![
+        WindowUDF::from(QuantWindowUdf::new("zscore", WindowOp::Zscore)),
+        WindowUDF::from(QuantWindowUdf::new("momentum", WindowOp::Momentum)),
+    ]
 }

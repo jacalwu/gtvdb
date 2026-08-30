@@ -782,17 +782,35 @@ async fn run(
             println!("hdb_flush: `{table}` -> {root}/<date>/<table>/ every {interval}s");
         }
         "fetch" => {
-            // fetch <table> <symbol> [limit] — pull historical ticks from the
-            // London Strategic Edge REST API into a session table.
-            let table = require_arg(&tokens, 1, "fetch <table> <symbol> [limit]")?.to_string();
-            let symbol = require_arg(&tokens, 2, "fetch <table> <symbol> [limit]")?;
-            let limit = optional_arg(&tokens, 3)
-                .map_or(Ok(100_000usize), |s| s.parse::<usize>())?;
+            // fetch <table> <symbol...> [--limit N] — pull historical ticks for
+            // one or more symbols into a single session table (symbol column).
+            let table = require_arg(&tokens, 1, "fetch <table> <symbol...> [--limit N]")?.to_string();
+            let mut symbols: Vec<String> = Vec::new();
+            let mut limit = 100_000usize;
+            let mut i = 2;
+            while i < tokens.len() {
+                if tokens[i] == "--limit" {
+                    limit = tokens
+                        .get(i + 1)
+                        .and_then(|s| s.parse::<usize>().ok())
+                        .unwrap_or(limit);
+                    i += 2;
+                } else {
+                    symbols.push(tokens[i].to_string());
+                    i += 1;
+                }
+            }
+            if symbols.is_empty() {
+                return Err(anyhow!("usage: fetch <table> <symbol...> [--limit N]"));
+            }
             let key = gtv_engine::tickdata::api_key();
-            let ticks = gtv_engine::tickdata::fetch_history(symbol, limit, &key)?;
-            let batch = gtv_engine::tickdata::hist_to_batch(&ticks);
+            let mut all = Vec::new();
+            for sym in &symbols {
+                all.extend(gtv_engine::tickdata::fetch_history(sym, limit, &key)?);
+            }
+            let batch = gtv_engine::tickdata::hist_to_batch(&all);
             ctx.register_batches(&table, gtv_engine::tickdata::hist_schema(), vec![batch])?;
-            println!("fetched `{table}` <- {symbol} ({} rows)", ticks.len());
+            println!("fetched `{table}` <- {} ({} rows)", symbols.join(","), all.len());
         }
         "live" => {
             // live <table> <symbol...> — stream LSE ticks into a session table.

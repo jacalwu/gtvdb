@@ -296,6 +296,7 @@ Quant operators (phase 2):
 | `l2` | `reconstruct_l2` | table fn |
 | — | `xbar` | scalar (time bucket) |
 | — | `ohlc` | table fn (tick → OHLCV bars) |
+| — | `zscore` / `momentum` | window (cross-sectional / technical) |
 
 ---
 

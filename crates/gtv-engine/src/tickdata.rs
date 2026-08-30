@@ -63,10 +63,18 @@ pub fn normalize_symbol(s: &str) -> String {
 pub struct HistTick {
     pub symbol: String,
     pub ts: String,
+    pub ts_us: i64,
     pub price: f64,
     pub bid: f64,
     pub ask: f64,
     pub volume: f64,
+}
+
+/// Parse an ISO-8601 timestamp string to epoch microseconds.
+fn iso_to_us(s: &str) -> i64 {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .map(|dt| dt.with_timezone(&chrono::Utc).timestamp_micros())
+        .unwrap_or(0)
 }
 
 /// Historical tick-table schema.
@@ -74,6 +82,7 @@ pub fn hist_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("symbol", DataType::Utf8, false),
         Field::new("ts", DataType::Utf8, false),
+        Field::new("ts_us", DataType::Int64, false),
         Field::new("price", DataType::Float64, false),
         Field::new("bid", DataType::Float64, false),
         Field::new("ask", DataType::Float64, false),
@@ -85,6 +94,7 @@ pub fn hist_schema() -> SchemaRef {
 pub fn hist_to_batch(ticks: &[HistTick]) -> RecordBatch {
     let sym: Vec<String> = ticks.iter().map(|t| t.symbol.clone()).collect();
     let ts: Vec<String> = ticks.iter().map(|t| t.ts.clone()).collect();
+    let ts_us: Vec<i64> = ticks.iter().map(|t| t.ts_us).collect();
     let price: Vec<f64> = ticks.iter().map(|t| t.price).collect();
     let bid: Vec<f64> = ticks.iter().map(|t| t.bid).collect();
     let ask: Vec<f64> = ticks.iter().map(|t| t.ask).collect();
@@ -94,6 +104,7 @@ pub fn hist_to_batch(ticks: &[HistTick]) -> RecordBatch {
         vec![
             Arc::new(StringArray::from(sym)) as ArrayRef,
             Arc::new(StringArray::from(ts)) as ArrayRef,
+            Arc::new(arrow::array::Int64Array::from(ts_us)) as ArrayRef,
             Arc::new(Float64Array::from(price)) as ArrayRef,
             Arc::new(Float64Array::from(bid)) as ArrayRef,
             Arc::new(Float64Array::from(ask)) as ArrayRef,
@@ -150,9 +161,12 @@ pub fn fetch_history(symbol: &str, limit: usize, key: &str) -> Result<Vec<HistTi
             .and_then(|x| x.as_str())
             .map(str::to_string);
         for v in arr {
+            let ts = v.get("ts").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let ts_us = iso_to_us(&ts);
             ticks.push(HistTick {
                 symbol: v.get("symbol").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-                ts: v.get("ts").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                ts,
+                ts_us,
                 price: v.get("price").and_then(|x| x.as_f64()).unwrap_or(0.0),
                 bid: v.get("bid").and_then(|x| x.as_f64()).unwrap_or(0.0),
                 ask: v.get("ask").and_then(|x| x.as_f64()).unwrap_or(0.0),

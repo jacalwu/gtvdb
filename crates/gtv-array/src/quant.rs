@@ -267,6 +267,36 @@ pub fn ohlc_single(
     (bar, open, high, low, close, vol)
 }
 
+/// Cross-sectional z-score within a partition: `(x - mean) / stddev`
+/// (population stddev; zero when the partition is constant).
+pub fn zscore(x: &[f64]) -> Vec<f64> {
+    let n = x.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let mean = x.iter().sum::<f64>() / n as f64;
+    let var = x.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / n as f64;
+    let std = var.sqrt();
+    if std == 0.0 {
+        return vec![0.0; n];
+    }
+    x.iter().map(|v| (v - mean) / std).collect()
+}
+
+/// n-period return: `x[i] / x[i-n] - 1` (0 for the first `n` rows).
+pub fn momentum(x: &[f64], n: usize) -> Vec<f64> {
+    let n = n.max(1);
+    (0..x.len())
+        .map(|i| {
+            if i < n || x[i - n] == 0.0 {
+                0.0
+            } else {
+                x[i] / x[i - n] - 1.0
+            }
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Jacobi eigendecomposition (symmetric matrix) for PCA
 // ---------------------------------------------------------------------------
@@ -393,6 +423,23 @@ mod tests {
         let (vals, _) = jacobi_eigen(&cov, 2, 50);
         assert!((vals[0] - 1.0).abs() < 1e-9);
         assert!((vals[1] - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn zscore_standardizes() {
+        let x = [1.0, 2.0, 3.0];
+        let z = zscore(&x);
+        // mean=2, std=sqrt(2/3) -> z = [-1.2247, 0, 1.2247]
+        assert!((z[1]).abs() < 1e-9);
+        assert!((z[2] - z[2]).abs() < 1e-9);
+        assert!((z[0] + z[2]).abs() < 1e-9);
+    }
+
+    #[test]
+    fn momentum_is_n_period_return() {
+        let x = [100.0, 101.0, 102.0, 104.0];
+        let m = momentum(&x, 2);
+        assert_eq!(m, vec![0.0, 0.0, 102.0 / 100.0 - 1.0, 104.0 / 101.0 - 1.0]);
     }
 
     #[test]

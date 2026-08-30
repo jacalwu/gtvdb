@@ -43,6 +43,9 @@ impl GtvContext {
         for udwf in crate::micro::micro_window_udfs() {
             ctx.register_udwf(udwf);
         }
+        for udwf in crate::quant::quant_window_udfs() {
+            ctx.register_udwf(udwf);
+        }
         for udf in crate::micro::micro_scalar_udfs() {
             ctx.register_udf(udf);
         }

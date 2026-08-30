@@ -119,7 +119,7 @@ pub fn calculate_black_scholes_delta_simd(
 ### 2.5.3 開發任務清單
 1. **[IND-1]** `xbar` + `ohlc`（批次版，核心與 Phase 5 流式版共用）—— ✅ 已實作
 2. **[IND-2]** `ema` / `atr` / `rsi` / `macd` / `bollinger` 窗口 UDF
-3. **[IND-3]** `align`（多標的 resample 對齊）+ `rank` / `zscore` / `momentum` 截面因子
+3. **[IND-3]** 截面因子：`rank`（DataFusion 內建 `rank`/`percent_rank`）✅、`zscore`（視窗 UDF）✅、`momentum`（視窗 UDF）✅、`align`（多標的 resample 對齊）待做
 
 ---
 

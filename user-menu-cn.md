@@ -292,6 +292,7 @@ FROM t;
 | `l2` | `reconstruct_l2` | 表函數 |
 | — | `xbar` | 純量（時間分桶） |
 | — | `ohlc` | 表函數（tick → OHLCV K 線） |
+| — | `zscore` / `momentum` | 視窗（截面 / 技術指標） |
 
 ---
 
