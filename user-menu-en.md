@@ -116,6 +116,14 @@ gtv> SELECT count(*) FROM mco;
 Backed by `GET https://api.londonstrategicedge.com/tickdata?symbol=eq.<sym>`.
 Uses the `LSE_API_KEY` env var when set, otherwise the site's public key. Note the
 `lse_live_*` key is WebSocket-only and returns `Unauthorized` on the REST API.
+Pagination is automatic: the API caps each request at 10,000 rows, so `fetch`/
+`read_tickdata` page with a `ts` keyset cursor up to `limit`.
+
+```sql
+-- full mode: same fetch as a SQL table function
+SELECT * FROM read_tickdata('TSLA', 25000);
+CREATE TABLE tsla AS SELECT * FROM read_tickdata('TSLA', 100000);
+```
 
 ---
 

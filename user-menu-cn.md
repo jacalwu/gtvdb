@@ -114,7 +114,14 @@ gtv> SELECT count(*) FROM mco;
 
 底層 `GET https://api.londonstrategicedge.com/tickdata?symbol=eq.<sym>`。優先使用
 `LSE_API_KEY` 環境變數，未設定時用站方公開 key。注意 `lse_live_*` key 僅限 WebSocket，
-在 REST API 會回 `Unauthorized`。
+在 REST API 會回 `Unauthorized`。自動分頁：API 單次上限 10000 列，`fetch`/`read_tickdata`
+會用 `ts` keyset 游標翻頁直到 `limit`。
+
+```sql
+-- full 模式：同樣的抓取做成 SQL 表函數
+SELECT * FROM read_tickdata('TSLA', 25000);
+CREATE TABLE tsla AS SELECT * FROM read_tickdata('TSLA', 100000);
+```
 
 ---
 

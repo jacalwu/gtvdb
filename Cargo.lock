@@ -1982,13 +1982,16 @@ dependencies = [
 name = "gtv-engine"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "arrow",
  "datafusion",
  "gtv-array",
  "gtv-core",
  "gtv-pattern",
  "gtv-storage",
+ "serde_json",
  "thiserror 2.0.20",
+ "ureq",
 ]
 
 [[package]]

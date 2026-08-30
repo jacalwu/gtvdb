@@ -643,10 +643,10 @@ async fn run(
             let symbol = require_arg(&tokens, 2, "fetch <table> <symbol> [limit]")?;
             let limit = optional_arg(&tokens, 3)
                 .map_or(Ok(100_000usize), |s| s.parse::<usize>())?;
-            let key = lse::api_key();
-            let ticks = lse::fetch_history(symbol, limit, &key)?;
-            let batch = lse::hist_to_batch(&ticks);
-            ctx.register_batches(&table, lse::hist_schema(), vec![batch])?;
+            let key = gtv_engine::tickdata::api_key();
+            let ticks = gtv_engine::tickdata::fetch_history(symbol, limit, &key)?;
+            let batch = gtv_engine::tickdata::hist_to_batch(&ticks);
+            ctx.register_batches(&table, gtv_engine::tickdata::hist_schema(), vec![batch])?;
             println!("fetched `{table}` <- {symbol} ({} rows)", ticks.len());
         }
         "live" => {

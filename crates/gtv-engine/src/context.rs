@@ -47,6 +47,7 @@ impl GtvContext {
         ctx.register_udtf("vector_search", Arc::new(KnnTableFunction::new(knn_collections.clone())));
         ctx.register_udtf("read_csv", Arc::new(crate::csv::ReadCsvTableFunction::new()));
         ctx.register_udtf("read_parquet", Arc::new(crate::csv::ReadParquetTableFunction::new()));
+        ctx.register_udtf("read_tickdata", Arc::new(crate::tickdata::ReadTickdataTableFunction));
         let hft_reg = Arc::new(RwLock::new(HftRegistry::default()));
         {
             let tt = Arc::new(crate::hft_tf::TickToTradeTableFunction::new(hft_reg.clone()));

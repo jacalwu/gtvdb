@@ -12,3 +12,6 @@ gtv-array = { path = "../gtv-array" }
 gtv-pattern = { path = "../gtv-pattern" }
 gtv-storage = { path = "../gtv-storage" }
 thiserror.workspace = true
+ureq = "2"
+serde_json = "1"
+anyhow.workspace = true

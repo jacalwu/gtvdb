@@ -9,17 +9,22 @@
 //!             {"type":"subscribed","symbol":...,"count":N}
 //!             {"type":"tick","symbol","price","bid","ask","ts"}
 //!             {"type":"error","code","message"}
+//!
+//! Historical REST data lives in `gtv_engine::tickdata` (`read_tickdata` /
+//! `fetch_history`).
 
 use std::sync::{Arc, Mutex};
 
 use arrow::array::{ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::connect_async;
 
-/// One quote tick: symbol, last price, best bid, best ask, event time.
+use gtv_engine::tickdata::normalize_symbol;
+
+/// One live quote tick: symbol, last price, best bid, best ask, event time.
 #[derive(Debug, Clone)]
 pub struct Tick {
     pub symbol: String,
@@ -30,118 +35,6 @@ pub struct Tick {
 }
 
 pub const WSS_URL: &str = "wss://ws.londonstrategicedge.com";
-/// Public (anonymous) key embedded in the LSE web front-end — works for the
-/// historical REST data. Override with the `LSE_API_KEY` env var.
-pub const ANON_KEY: &str = "71f880e1d2ef471664f3b6c04c6dc1e618f94e51f68c87522bc6dcbc0ca173a5";
-
-pub fn api_key() -> String {
-    std::env::var("LSE_API_KEY").unwrap_or_else(|_| ANON_KEY.to_string())
-}
-
-/// One historical tick row (`tickdata` endpoint).
-#[derive(Debug, Clone)]
-pub struct HistTick {
-    pub symbol: String,
-    pub ts: String,
-    pub price: f64,
-    pub bid: f64,
-    pub ask: f64,
-    pub volume: f64,
-}
-
-/// Historical tick-table schema.
-pub fn hist_schema() -> SchemaRef {
-    Arc::new(Schema::new(vec![
-        Field::new("symbol", DataType::Utf8, false),
-        Field::new("ts", DataType::Utf8, false),
-        Field::new("price", DataType::Float64, false),
-        Field::new("bid", DataType::Float64, false),
-        Field::new("ask", DataType::Float64, false),
-        Field::new("volume", DataType::Float64, false),
-    ]))
-}
-
-/// Convert historical ticks to a single [`RecordBatch`].
-pub fn hist_to_batch(ticks: &[HistTick]) -> RecordBatch {
-    let sym: Vec<String> = ticks.iter().map(|t| t.symbol.clone()).collect();
-    let ts: Vec<String> = ticks.iter().map(|t| t.ts.clone()).collect();
-    let price: Vec<f64> = ticks.iter().map(|t| t.price).collect();
-    let bid: Vec<f64> = ticks.iter().map(|t| t.bid).collect();
-    let ask: Vec<f64> = ticks.iter().map(|t| t.ask).collect();
-    let volume: Vec<f64> = ticks.iter().map(|t| t.volume).collect();
-    RecordBatch::try_new(
-        hist_schema(),
-        vec![
-            Arc::new(StringArray::from(sym)) as ArrayRef,
-            Arc::new(StringArray::from(ts)) as ArrayRef,
-            Arc::new(Float64Array::from(price)) as ArrayRef,
-            Arc::new(Float64Array::from(bid)) as ArrayRef,
-            Arc::new(Float64Array::from(ask)) as ArrayRef,
-            Arc::new(Float64Array::from(volume)) as ArrayRef,
-        ],
-    )
-    .expect("build hist batch")
-}
-
-/// Fetch historical stock ticks from the LSE REST API
-/// (`GET https://api.londonstrategicedge.com/tickdata?symbol=eq.<sym>`).
-pub fn fetch_history(symbol: &str, limit: usize, key: &str) -> Result<Vec<HistTick>> {
-    let sym = normalize_symbol(symbol);
-    let url = format!(
-        "https://api.londonstrategicedge.com/tickdata?symbol=eq.{sym}&order=ts.asc&limit={limit}&select=symbol,ts,price,bid,ask,volume"
-    );
-    let body = ureq::get(&url)
-        .set("x-api-key", key)
-        .call()
-        .map_err(|e| anyhow!("lse fetch {sym}: {e}"))?
-        .into_string()?;
-    let arr: Vec<serde_json::Value> = serde_json::from_str(&body)?;
-    Ok(arr
-        .iter()
-        .map(|v| HistTick {
-            symbol: v.get("symbol").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-            ts: v.get("ts").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-            price: v.get("price").and_then(|x| x.as_f64()).unwrap_or(0.0),
-            bid: v.get("bid").and_then(|x| x.as_f64()).unwrap_or(0.0),
-            ask: v.get("ask").and_then(|x| x.as_f64()).unwrap_or(0.0),
-            volume: v.get("volume").and_then(|x| x.as_f64()).unwrap_or(0.0),
-        })
-        .collect())
-}
-
-/// Normalize a symbol to LSE's wire format (mirrors the site's `mn` fn):
-/// metals `XAUUSD` -> `XAU/USD`, crypto `BTCUSD` -> `BTC/USD`, forex
-/// `EURUSD` -> `EUR/USD`, everything else (stocks/indices) uppercased as-is.
-pub fn normalize_symbol(s: &str) -> String {
-    let t = s.trim().replace('/', "").to_uppercase();
-    const METALS: &[&str] = &["XAU", "XAG", "XPT", "XPD"];
-    const FOREX: &[&str] = &["EUR", "USD", "GBP", "JPY", "AUD", "NZD", "CAD", "CHF"];
-    const CRYPTO: &[&str] = &[
-        "BTC", "ETH", "LTC", "XRP", "SOL", "DOGE", "ADA", "DOT", "AVAX", "MATIC",
-        "LINK", "UNI", "ATOM", "XLM", "ALGO", "FIL", "NEAR", "AAVE", "MKR", "COMP",
-        "SNX", "YFI", "SUSHI", "CRV", "BAL", "INJ", "SUI", "SEI", "APT", "ARB", "OP",
-    ];
-    for m in METALS {
-        if t.starts_with(m) && t.len() > m.len() {
-            return format!("{m}/{}", &t[m.len()..]);
-        }
-    }
-    for c in CRYPTO {
-        if t.starts_with(c) && t.len() > c.len() {
-            let rest = &t[c.len()..];
-            if rest == "USD" || rest == "USDT" || rest == "BUSD" {
-                return format!("{c}/{rest}");
-            }
-        }
-    }
-    if t.len() == 6 {
-        let (a, b) = (&t[..3], &t[3..]);
-        if FOREX.contains(&a) && FOREX.contains(&b) {
-            return format!("{a}/{b}");
-        }
-    }
-    t
-}
 
 /// Live-tick table schema.
 pub fn live_schema() -> SchemaRef {
