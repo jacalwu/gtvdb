@@ -101,6 +101,28 @@ pub fn calculate_black_scholes_delta_simd(
 
 ---
 
+## 2.5 階段二點五：技術指標與截面因子 (Technical Indicators & Cross-sectional Factors)
+
+> **與 Phase 5 共用**：本階段的 bar 算子（`xbar`/`ohlc`）先做「批次版」，
+> Phase 5 的 `RealtimeWindowAggregator`（實時 OHLCV K 線）複用同一核心，避免兩套邏輯。
+
+### 2.5.1 核心目標
+補齊「tick → 訊號」管線缺的一環：把原始 tick 重採樣為 OHLCV K 線，並提供常用
+技術指標與多標的截面因子，供日內/日線訊號與回測使用。
+
+### 2.5.2 算子規格
+1. **時間分桶** `xbar(ts, bucket) -> i64`
+2. **OHLCV 重採樣** `ohlc(table, bucket) -> (bar, open, high, low, close, volume)`
+3. **技術指標窗口 UDF**：`ema` / `atr` / `rsi` / `macd` / `bollinger`
+4. **截面因子**：`align`（多標的 resample 對齊）+ `rank` / `zscore` / `momentum`
+
+### 2.5.3 開發任務清單
+1. **[IND-1]** `xbar` + `ohlc`（批次版，核心與 Phase 5 流式版共用）—— ✅ 已實作
+2. **[IND-2]** `ema` / `atr` / `rsi` / `macd` / `bollinger` 窗口 UDF
+3. **[IND-3]** `align`（多標的 resample 對齊）+ `rank` / `zscore` / `momentum` 截面因子
+
+---
+
 ## 3. 階段三：時序圖 (Temporal-CSR) 金融風控應用 (Financial Risk Graph)
 
 ### 3.1 核心目標

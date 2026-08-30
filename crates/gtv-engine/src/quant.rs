@@ -4,7 +4,7 @@
 
 use std::sync::{Arc, RwLock};
 
-use arrow::array::{as_primitive_array, as_string_array, Array, ArrayRef, Float64Array, Int32Array, UInt64Array, RecordBatch};
+use arrow::array::{as_primitive_array, as_string_array, Array, ArrayRef, Float64Array, Int32Array, Int64Array, UInt64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Float64Type, Int64Type, Schema, UInt64Type};
 use datafusion::catalog::{TableFunctionArgs, TableFunctionImpl};
 use datafusion::datasource::{MemTable, TableProvider};
@@ -123,6 +123,57 @@ pub fn bs_udfs() -> Vec<ScalarUDF> {
         ScalarUDF::from(BsUdf::new("bs_vega", Greek::Vega)),
         ScalarUDF::from(BsUdf::new("bs_theta", Greek::Theta)),
     ]
+}
+
+// ---------------------------------------------------------------------------
+// xbar(ts, bucket) — scalar UDF (timestamp bucketing)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct XbarUdf {
+    signature: Signature,
+}
+
+impl XbarUdf {
+    fn new() -> Self {
+        Self {
+            signature: Signature::exact(
+                vec![DataType::Int64, DataType::Int64],
+                Volatility::Immutable,
+            ),
+        }
+    }
+}
+
+impl ScalarUDFImpl for XbarUdf {
+    fn name(&self) -> &str {
+        "xbar"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _arg_types: &[DataType]) -> DfResult<DataType> {
+        Ok(DataType::Int64)
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DfResult<ColumnarValue> {
+        let arrays = ColumnarValue::values_to_arrays(&args.args)?;
+        let ts = as_primitive_array::<Int64Type>(&arrays[0]).values();
+        let bucket = as_primitive_array::<Int64Type>(&arrays[1]).values();
+        let out: Int64Array = (0..ts.len())
+            .map(|i| {
+                let b = bucket.get(i).copied().unwrap_or(1).max(1);
+                (ts[i] / b) * b
+            })
+            .collect();
+        Ok(ColumnarValue::Array(Arc::new(out)))
+    }
+}
+
+pub fn xbar_udf() -> ScalarUDF {
+    ScalarUDF::from(XbarUdf::new())
 }
 
 // ---------------------------------------------------------------------------
@@ -406,6 +457,173 @@ impl TableFunctionImpl for ReconstructL2TableFunction {
                 Arc::new(UInt64Array::from(qty_out)) as ArrayRef,
             ],
         )?;
+        Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ohlc(name, bucket) — table function: tick -> OHLCV bars
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+pub struct OhlcTableFunction {
+    registry: Arc<RwLock<HftRegistry>>,
+}
+
+impl OhlcTableFunction {
+    pub fn new(registry: Arc<RwLock<HftRegistry>>) -> Self {
+        Self { registry }
+    }
+}
+
+fn extract_i64_col(batches: &[RecordBatch], col: &str) -> DfResult<Vec<i64>> {
+    let mut out = Vec::new();
+    for b in batches {
+        let arr = b.column_by_name(col).ok_or_else(|| {
+            DataFusionError::Execution(format!("missing `{col}` column"))
+        })?;
+        out.extend_from_slice(as_primitive_array::<Int64Type>(arr.as_ref()).values());
+    }
+    Ok(out)
+}
+
+fn extract_string_col(batches: &[RecordBatch], col: &str) -> DfResult<Vec<String>> {
+    let mut out = Vec::new();
+    for b in batches {
+        let arr = b.column_by_name(col).ok_or_else(|| {
+            DataFusionError::Execution(format!("missing `{col}` column"))
+        })?;
+        let s = as_string_array(arr);
+        out.extend((0..s.len()).map(|i| s.value(i).to_string()));
+    }
+    Ok(out)
+}
+
+impl TableFunctionImpl for OhlcTableFunction {
+    fn call_with_args(&self, args: TableFunctionArgs) -> DfResult<Arc<dyn TableProvider>> {
+        let exprs = args.exprs();
+        let name = expr_to_string(
+            exprs.first()
+                .ok_or_else(|| DataFusionError::Execution("ohlc(name, bucket): missing name".into()))?,
+        )?;
+        let bucket = expr_to_i64(
+            exprs.get(1)
+                .ok_or_else(|| DataFusionError::Execution("ohlc(name, bucket): missing bucket".into()))?,
+        )?
+        .max(1);
+
+        let reg = self.registry.read().map_err(|_| {
+            DataFusionError::Execution("hft registry poisoned".into())
+        })?;
+        let batches = reg.tables.get(&name).ok_or_else(|| {
+            DataFusionError::Execution(format!("unknown table `{name}`"))
+        })?;
+
+        let ts = extract_i64_col(batches, "ts")
+            .or_else(|_| extract_i64_col(batches, "t"))
+            .or_else(|_| extract_i64_col(batches, "time"))
+            .map_err(|_| {
+                DataFusionError::Execution(format!("table `{name}` has no Int64 `ts` column"))
+            })?;
+        let price = {
+            let mut v = Vec::new();
+            for b in batches.as_ref() {
+                let arr = b.column_by_name("price").ok_or_else(|| {
+                    DataFusionError::Execution(format!("table `{name}` has no `price` column"))
+                })?;
+                v.extend_from_slice(f64_values(arr));
+            }
+            v
+        };
+        let volume = batches
+            .first()
+            .and_then(|b| b.column_by_name("volume").map(|_| ()))
+            .map(|_| {
+                let mut v = Vec::new();
+                for b in batches.as_ref() {
+                    v.extend_from_slice(f64_values(b.column_by_name("volume").unwrap()));
+                }
+                v
+            })
+            .unwrap_or_else(|| vec![1.0; price.len()]);
+
+        let has_sym = batches
+            .first()
+            .and_then(|b| b.column_by_name("symbol").map(|c| matches!(c.data_type(), DataType::Utf8)))
+            .unwrap_or(false);
+
+        let mut symbol_out: Vec<String> = Vec::new();
+        let mut bar_out: Vec<i64> = Vec::new();
+        let mut o_out: Vec<f64> = Vec::new();
+        let mut h_out: Vec<f64> = Vec::new();
+        let mut l_out: Vec<f64> = Vec::new();
+        let mut c_out: Vec<f64> = Vec::new();
+        let mut v_out: Vec<f64> = Vec::new();
+
+        if has_sym {
+            let syms = extract_string_col(batches, "symbol")?;
+            let mut groups: std::collections::BTreeMap<String, Vec<usize>> =
+                std::collections::BTreeMap::new();
+            for i in 0..ts.len() {
+                groups.entry(syms[i].clone()).or_default().push(i);
+            }
+            for (sym, idxs) in groups {
+                let (sub_ts, sub_px, sub_vol): (Vec<i64>, Vec<f64>, Vec<f64>) = idxs
+                    .iter()
+                    .map(|&i| (ts[i], price[i], volume[i]))
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .fold((vec![], vec![], vec![]), |(mut a, mut b, mut c), (t, p, v)| {
+                        a.push(t);
+                        b.push(p);
+                        c.push(v);
+                        (a, b, c)
+                    });
+                let (bar, o, h, l, c, v) = gtv_array::quant::ohlc_single(&sub_ts, &sub_px, &sub_vol, bucket);
+                for k in 0..bar.len() {
+                    symbol_out.push(sym.clone());
+                    bar_out.push(bar[k]);
+                    o_out.push(o[k]);
+                    h_out.push(h[k]);
+                    l_out.push(l[k]);
+                    c_out.push(c[k]);
+                    v_out.push(v[k]);
+                }
+            }
+        } else {
+            let (bar, o, h, l, c, v) = gtv_array::quant::ohlc_single(&ts, &price, &volume, bucket);
+            for k in 0..bar.len() {
+                bar_out.push(bar[k]);
+                o_out.push(o[k]);
+                h_out.push(h[k]);
+                l_out.push(l[k]);
+                c_out.push(c[k]);
+                v_out.push(v[k]);
+            }
+        }
+
+        let mut fields = vec![
+            Field::new("bar", DataType::Int64, false),
+            Field::new("open", DataType::Float64, false),
+            Field::new("high", DataType::Float64, false),
+            Field::new("low", DataType::Float64, false),
+            Field::new("close", DataType::Float64, false),
+            Field::new("volume", DataType::Float64, false),
+        ];
+        let mut cols: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from(bar_out)) as ArrayRef,
+            Arc::new(Float64Array::from(o_out)) as ArrayRef,
+            Arc::new(Float64Array::from(h_out)) as ArrayRef,
+            Arc::new(Float64Array::from(l_out)) as ArrayRef,
+            Arc::new(Float64Array::from(c_out)) as ArrayRef,
+            Arc::new(Float64Array::from(v_out)) as ArrayRef,
+        ];
+        if has_sym {
+            fields.insert(0, Field::new("symbol", DataType::Utf8, false));
+            cols.insert(0, Arc::new(arrow::array::StringArray::from(symbol_out)) as ArrayRef);
+        }
+        let schema = Arc::new(Schema::new(fields));
+        let batch = RecordBatch::try_new(schema.clone(), cols)?;
         Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
     }
 }

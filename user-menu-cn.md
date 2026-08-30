@@ -290,6 +290,8 @@ FROM t;
 | `var` | `var_historical` | 表函數 |
 | — | `pca` | 表函數 |
 | `l2` | `reconstruct_l2` | 表函數 |
+| — | `xbar` | 純量（時間分桶） |
+| — | `ohlc` | 表函數（tick → OHLCV K 線） |
 
 ---
 

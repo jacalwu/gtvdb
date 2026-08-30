@@ -39,6 +39,7 @@ impl GtvContext {
         for udf in crate::quant::bs_udfs() {
             ctx.register_udf(udf);
         }
+        ctx.register_udf(crate::quant::xbar_udf());
         for udwf in crate::micro::micro_window_udfs() {
             ctx.register_udwf(udwf);
         }
@@ -70,6 +71,8 @@ impl GtvContext {
             let l2 = Arc::new(crate::quant::ReconstructL2TableFunction::new(hft_reg.clone()));
             ctx.register_udtf("reconstruct_l2", l2.clone());
             ctx.register_udtf("l2", l2);
+            let ohlc = Arc::new(crate::quant::OhlcTableFunction::new(hft_reg.clone()));
+            ctx.register_udtf("ohlc", ohlc);
         }
         Self {
             ctx,

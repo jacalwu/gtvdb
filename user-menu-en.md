@@ -294,6 +294,8 @@ Quant operators (phase 2):
 | `var` | `var_historical` | table fn |
 | — | `pca` | table fn |
 | `l2` | `reconstruct_l2` | table fn |
+| — | `xbar` | scalar (time bucket) |
+| — | `ohlc` | table fn (tick → OHLCV bars) |
 
 ---
 

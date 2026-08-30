@@ -217,6 +217,57 @@ pub fn reconstruct_l2(
 }
 
 // ---------------------------------------------------------------------------
+// Time bucketing + OHLCV bar aggregation (shared with roadmap Phase 5)
+// ---------------------------------------------------------------------------
+
+/// Round each timestamp down to the bucket boundary (`bucket` in the same unit
+/// as `ts`, e.g. ns/µs/ms).
+pub fn xbar(ts: &[i64], bucket: i64) -> Vec<i64> {
+    let bucket = bucket.max(1);
+    ts.iter().map(|&t| (t / bucket) * bucket).collect()
+}
+
+/// Aggregate a single-symbol tick series into OHLCV bars keyed by bucket start.
+/// `ts` must be in chronological order (tick data is). Returns
+/// `(bar_ts, open, high, low, close, volume)`.
+pub fn ohlc_single(
+    ts: &[i64],
+    price: &[f64],
+    volume: &[f64],
+    bucket: i64,
+) -> (Vec<i64>, Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>) {
+    let bucket = bucket.max(1);
+    let mut groups: BTreeMap<i64, Vec<usize>> = BTreeMap::new();
+    for i in 0..ts.len() {
+        groups
+            .entry((ts[i] / bucket) * bucket)
+            .or_default()
+            .push(i);
+    }
+    let mut bar = Vec::with_capacity(groups.len());
+    let mut open = Vec::with_capacity(groups.len());
+    let mut high = Vec::with_capacity(groups.len());
+    let mut low = Vec::with_capacity(groups.len());
+    let mut close = Vec::with_capacity(groups.len());
+    let mut vol = Vec::with_capacity(groups.len());
+    for (b, idxs) in groups {
+        let (mut h, mut l, mut v) = (f64::NEG_INFINITY, f64::INFINITY, 0.0);
+        for &i in &idxs {
+            h = h.max(price[i]);
+            l = l.min(price[i]);
+            v += volume[i];
+        }
+        bar.push(b);
+        open.push(price[idxs[0]]);
+        high.push(h);
+        low.push(l);
+        close.push(price[idxs[idxs.len() - 1]]);
+        vol.push(v);
+    }
+    (bar, open, high, low, close, vol)
+}
+
+// ---------------------------------------------------------------------------
 // Jacobi eigendecomposition (symmetric matrix) for PCA
 // ---------------------------------------------------------------------------
 
@@ -342,5 +393,26 @@ mod tests {
         let (vals, _) = jacobi_eigen(&cov, 2, 50);
         assert!((vals[0] - 1.0).abs() < 1e-9);
         assert!((vals[1] - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn xbar_buckets_down() {
+        let ts = [0, 59, 60, 119, 120];
+        assert_eq!(xbar(&ts, 60), vec![0, 0, 60, 60, 120]);
+    }
+
+    #[test]
+    fn ohlc_aggregates_bars() {
+        // two 1-second bars: [0, 0.5] and [1.0, 1.5]
+        let ts = [0, 500_000_000, 1_000_000_000, 1_500_000_000];
+        let px = [10.0, 11.0, 9.0, 8.0];
+        let vol = [1.0, 2.0, 3.0, 4.0];
+        let (bar, o, h, l, c, v) = ohlc_single(&ts, &px, &vol, 1_000_000_000);
+        assert_eq!(bar, vec![0, 1_000_000_000]);
+        assert_eq!(o, vec![10.0, 9.0]);
+        assert_eq!(h, vec![11.0, 9.0]);
+        assert_eq!(l, vec![10.0, 8.0]);
+        assert_eq!(c, vec![11.0, 8.0]);
+        assert_eq!(v, vec![3.0, 7.0]);
     }
 }
