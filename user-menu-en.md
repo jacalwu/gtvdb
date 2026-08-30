@@ -92,6 +92,19 @@ gtv> bgload ticks /data/ticks.parquet 200    # CSV vs Parquet auto-detected by e
 gtv> SELECT count(*) FROM ticks;              # session keeps reading the latest data
 ```
 
+### 3.4 Live streaming (London Strategic Edge WebSocket)
+
+```sh
+export LSE_API_KEY=lse_live_...              # London Strategic Edge live API key
+gtv> live q BTC/USD ETH/USD SOL/USD          # stream live quote ticks into table `q`
+gtv> SELECT symbol, count(*) FROM q GROUP BY symbol;   # full mode
+```
+
+Streams `(symbol, price, bid, ask, ts)` ticks over `wss://ws.londonstrategicedge.com`
+(auth `{action:"auth",api_key}`, subscribe `{action:"subscribe",symbol}`). The free
+live key covers **crypto** symbols (`BTC/USD`, `ETH/USD`, …); stock/forex symbols may
+require a higher tier or a different symbol format.
+
 ---
 
 ## 4. TC1–TC15 Use Cases
@@ -264,6 +277,7 @@ mavg <n> | msum <n> | deltas
 asof [t ...]               knn <node> [k] [--mask ids]
 save <table> <path>        load <table> <path>
 loadcsv <table> <path>     bgload <table> <path> [ms]
+live <table> <symbol...>   stream LSE live ticks (needs LSE_API_KEY)
 tt <table> <T>             pattern [T]        delta
 udf [x ...]                remote <host:port> <sql>
 ```

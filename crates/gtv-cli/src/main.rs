@@ -5,10 +5,12 @@
 //! built-in command is executed as SQL.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::{anyhow, Result};
+
+mod lse;
 use arrow::array::{
     ArrayRef, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray,
     TimestampNanosecondArray, UInt64Array,
@@ -77,6 +79,9 @@ struct Demo {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Select the rustls `ring` crypto provider (pure-Rust TLS for the LSE feed).
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let demo = build_demo()?;
     let ctx = GtvContext::new();
     register_tables(&ctx, &demo)?;
@@ -631,6 +636,50 @@ async fn run(
             ctx.register_csv(path, table)?;
             println!("loaded `{table}` from {path}");
         }
+        "live" => {
+            // live <table> <symbol...> — stream LSE ticks into a session table.
+            let table = require_arg(&tokens, 1, "live <table> <symbol...>")?.to_string();
+            let symbols: Vec<String> = tokens[2..].iter().map(|s| s.to_string()).collect();
+            if symbols.is_empty() {
+                return Err(anyhow!("usage: live <table> <symbol...> (e.g. live q MCO TSLA)"));
+            }
+            let api_key = std::env::var("LSE_API_KEY").map_err(|_| {
+                anyhow!("set LSE_API_KEY (London Strategic Edge live API key) before `live`")
+            })?;
+            let ticks: Arc<Mutex<Vec<lse::Tick>>> = Arc::new(Mutex::new(Vec::new()));
+            ctx.register_batches(&table, lse::live_schema(), vec![lse::empty_batch()])?;
+            let feed_ticks = ticks.clone();
+            let symbols_feed = symbols.clone();
+            tokio::spawn(async move {
+                if let Err(e) = lse::run_feed(&api_key, &symbols_feed, feed_ticks).await {
+                    eprintln!("lse feed: {e:#}");
+                }
+            });
+            let ctx2 = ctx.clone();
+            let flush_ticks = ticks.clone();
+            let table2 = table.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+                loop {
+                    interval.tick().await;
+                    let mut guard = match flush_ticks.lock() {
+                        Ok(g) => g,
+                        Err(_) => return,
+                    };
+                    if guard.is_empty() {
+                        continue;
+                    }
+                    let batch = lse::ticks_to_batch(&guard);
+                    guard.clear();
+                    let _ = ctx2.register_batches(&table2, lse::live_schema(), vec![batch]);
+                }
+            });
+            println!(
+                "live: streaming `{table}` <- {} ({})",
+                symbols.join(","),
+                lse::WSS_URL
+            );
+        }
         "bgload" => {
             // Method 3: a background thread re-imports the data file (CSV or
             // Parquet, auto-detected by extension) on an interval, refreshing
@@ -900,6 +949,7 @@ fn print_help() {
          \x20 loadcsv <table> <path>  load CSV from disk into a session table\n\
          \x20 load <table> <path>   load Parquet from disk into a session table\n\
          \x20 bgload <table> <path> [ms]  background re-import (CSV or Parquet)\n\
+         \x20 live <table> <symbol...>  stream LSE live ticks (needs LSE_API_KEY)\n\
          \x20 tt <table> <T>        time-travel: table snapshot as-of T\n\
          \x20 pattern [T]           temporal pattern matching (ring/path/diamond)\n\
          \x20 delta                 LSM delta buffer insert + compaction demo\n\

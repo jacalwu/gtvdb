@@ -91,6 +91,19 @@ gtv> bgload ticks /data/ticks.parquet 200    # 依副檔名自動偵測 CSV / Pa
 gtv> SELECT count(*) FROM ticks;              # session 持續讀取最新資料
 ```
 
+### 3.4 即時串流（London Strategic Edge WebSocket）
+
+```sh
+export LSE_API_KEY=lse_live_...              # London Strategic Edge live API key
+gtv> live q BTC/USD ETH/USD SOL/USD          # 把即時報價 tick 串流進表 `q`
+gtv> SELECT symbol, count(*) FROM q GROUP BY symbol;   # full 模式
+```
+
+經 `wss://ws.londonstrategicedge.com` 串流 `(symbol, price, bid, ask, ts)` tick
+（auth `{action:"auth",api_key}`、訂閱 `{action:"subscribe",symbol}`）。免費 live
+key 覆蓋 **加密貨幣**（`BTC/USD`、`ETH/USD`…）；股票/外匯可能需要更高 tier 或不同
+symbol 格式。
+
 ---
 
 ## 4. TC1–TC15 使用案例
@@ -261,6 +274,7 @@ mavg <n> | msum <n> | deltas
 asof [t ...]               knn <node> [k] [--mask ids]
 save <table> <path>        load <table> <path>
 loadcsv <table> <path>     bgload <table> <path> [ms]
+live <table> <symbol...>   串流 LSE 即時 tick（需 LSE_API_KEY）
 tt <table> <T>             pattern [T]        delta
 udf [x ...]                remote <host:port> <sql>
 ```
