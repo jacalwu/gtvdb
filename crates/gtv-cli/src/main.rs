@@ -636,6 +636,19 @@ async fn run(
             ctx.register_csv(path, table)?;
             println!("loaded `{table}` from {path}");
         }
+        "fetch" => {
+            // fetch <table> <symbol> [limit] — pull historical ticks from the
+            // London Strategic Edge REST API into a session table.
+            let table = require_arg(&tokens, 1, "fetch <table> <symbol> [limit]")?.to_string();
+            let symbol = require_arg(&tokens, 2, "fetch <table> <symbol> [limit]")?;
+            let limit = optional_arg(&tokens, 3)
+                .map_or(Ok(100_000usize), |s| s.parse::<usize>())?;
+            let key = lse::api_key();
+            let ticks = lse::fetch_history(symbol, limit, &key)?;
+            let batch = lse::hist_to_batch(&ticks);
+            ctx.register_batches(&table, lse::hist_schema(), vec![batch])?;
+            println!("fetched `{table}` <- {symbol} ({} rows)", ticks.len());
+        }
         "live" => {
             // live <table> <symbol...> — stream LSE ticks into a session table.
             let table = require_arg(&tokens, 1, "live <table> <symbol...>")?.to_string();
@@ -950,6 +963,7 @@ fn print_help() {
          \x20 load <table> <path>   load Parquet from disk into a session table\n\
          \x20 bgload <table> <path> [ms]  background re-import (CSV or Parquet)\n\
          \x20 live <table> <symbol...>  stream LSE live ticks (needs LSE_API_KEY)\n\
+         \x20 fetch <table> <symbol> [limit]  pull LSE historical ticks (REST API)\n\
          \x20 tt <table> <T>        time-travel: table snapshot as-of T\n\
          \x20 pattern [T]           temporal pattern matching (ring/path/diamond)\n\
          \x20 delta                 LSM delta buffer insert + compaction demo\n\

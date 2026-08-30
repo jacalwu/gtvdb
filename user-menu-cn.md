@@ -104,6 +104,18 @@ gtv> SELECT symbol, count(*) FROM q GROUP BY symbol;   # full 模式
 key 覆蓋 **加密貨幣**（`BTC/USD`、`ETH/USD`…）；股票/外匯可能需要更高 tier 或不同
 symbol 格式。
 
+### 3.5 抓取歷史 tick（London Strategic Edge REST API）
+
+```text
+gtv> fetch mco MCO 20000          # 抓取 MCO 歷史 tick 進表 `mco`
+gtv> fetch tsla TSLA 100000       # (symbol, ts, price, bid, ask, volume)
+gtv> SELECT count(*) FROM mco;
+```
+
+底層 `GET https://api.londonstrategicedge.com/tickdata?symbol=eq.<sym>`。優先使用
+`LSE_API_KEY` 環境變數，未設定時用站方公開 key。注意 `lse_live_*` key 僅限 WebSocket，
+在 REST API 會回 `Unauthorized`。
+
 ---
 
 ## 4. TC1–TC15 使用案例
@@ -275,6 +287,7 @@ asof [t ...]               knn <node> [k] [--mask ids]
 save <table> <path>        load <table> <path>
 loadcsv <table> <path>     bgload <table> <path> [ms]
 live <table> <symbol...>   串流 LSE 即時 tick（需 LSE_API_KEY）
+fetch <table> <symbol> [limit]  抓取 LSE 歷史 tick（REST API）
 tt <table> <T>             pattern [T]        delta
 udf [x ...]                remote <host:port> <sql>
 ```

@@ -31,4 +31,5 @@ tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 futures-util = "0.3"
 serde_json = "1"
+ureq = "2"
 cudarc = { version = "0.19", optional = true, default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading", "cuda-13000"] }

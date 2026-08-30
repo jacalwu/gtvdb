@@ -105,6 +105,18 @@ Streams `(symbol, price, bid, ask, ts)` ticks over `wss://ws.londonstrategicedge
 live key covers **crypto** symbols (`BTC/USD`, `ETH/USD`, …); stock/forex symbols may
 require a higher tier or a different symbol format.
 
+### 3.5 Fetch historical ticks (London Strategic Edge REST API)
+
+```text
+gtv> fetch mco MCO 20000          # pull historical ticks for MCO into `mco`
+gtv> fetch tsla TSLA 100000       # (symbol, ts, price, bid, ask, volume)
+gtv> SELECT count(*) FROM mco;
+```
+
+Backed by `GET https://api.londonstrategicedge.com/tickdata?symbol=eq.<sym>`.
+Uses the `LSE_API_KEY` env var when set, otherwise the site's public key. Note the
+`lse_live_*` key is WebSocket-only and returns `Unauthorized` on the REST API.
+
 ---
 
 ## 4. TC1–TC15 Use Cases
@@ -278,6 +290,7 @@ asof [t ...]               knn <node> [k] [--mask ids]
 save <table> <path>        load <table> <path>
 loadcsv <table> <path>     bgload <table> <path> [ms]
 live <table> <symbol...>   stream LSE live ticks (needs LSE_API_KEY)
+fetch <table> <symbol> [limit]  pull LSE historical ticks (REST API)
 tt <table> <T>             pattern [T]        delta
 udf [x ...]                remote <host:port> <sql>
 ```
