@@ -296,6 +296,7 @@ FROM t;
 | — | `signal` | 純量（z → buy/sell/hold） |
 | — | `read_yahoo` | 表函數（日線 OHLCV） |
 | — | `cross_sectional_signal` | 表函數（fetch+momentum+zscore+signal+隔日報酬） |
+| — | `relative_strength` | 表函數（標的 vs 指數 vs 同行） |
 
 ---
 

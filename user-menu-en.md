@@ -300,6 +300,7 @@ Quant operators (phase 2):
 | — | `signal` | scalar (z → buy/sell/hold) |
 | — | `read_yahoo` | table fn (daily OHLCV) |
 | — | `cross_sectional_signal` | table fn (fetch+momentum+zscore+signal+next-day ret) |
+| — | `relative_strength` | table fn (target vs indices vs peers) |
 
 ---
 

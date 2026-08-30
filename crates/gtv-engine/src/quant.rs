@@ -936,3 +936,179 @@ impl TableFunctionImpl for CrossSectionalSignalTableFunction {
         Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
     }
 }
+
+// ---------------------------------------------------------------------------
+// relative_strength(target, indices, peers, n) — target vs indices vs peers
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Default)]
+pub struct RelativeStrengthTableFunction;
+
+impl RelativeStrengthTableFunction {
+    fn schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("ts", DataType::Int64, false),
+            Field::new("close", DataType::Float64, false),
+            Field::new("target_mom", DataType::Float64, false),
+            Field::new("target_z", DataType::Float64, false),
+            Field::new("idx_mean_mom", DataType::Float64, false),
+            Field::new("peer_mean_mom", DataType::Float64, false),
+            Field::new("excess_vs_idx", DataType::Float64, false),
+            Field::new("excess_vs_peer", DataType::Float64, false),
+            Field::new("signal", DataType::Utf8, false),
+        ]))
+    }
+}
+
+impl TableFunctionImpl for RelativeStrengthTableFunction {
+    fn call_with_args(&self, args: TableFunctionArgs) -> DfResult<Arc<dyn TableProvider>> {
+        let exprs = args.exprs();
+        let target = expr_to_string(
+            exprs.first().ok_or_else(|| {
+                DataFusionError::Execution("relative_strength(target, indices, peers, n): missing target".into())
+            })?,
+        )?;
+        let indices_str = expr_to_string(
+            exprs.get(1).ok_or_else(|| {
+                DataFusionError::Execution("relative_strength(target, indices, peers, n): missing indices".into())
+            })?,
+        )?;
+        let peers_str = expr_to_string(
+            exprs.get(2).ok_or_else(|| {
+                DataFusionError::Execution("relative_strength(target, indices, peers, n): missing peers".into())
+            })?,
+        )?;
+        let n = expr_to_i64(
+            exprs.get(3).ok_or_else(|| {
+                DataFusionError::Execution("relative_strength(target, indices, peers, n): missing n".into())
+            })?,
+        )?
+        .max(1) as usize;
+
+        let indices: Vec<String> = indices_str
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let peers: Vec<String> = peers_str
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        // Fetch all series: symbol -> (ts -> close)
+        let mut series: std::collections::BTreeMap<String, Vec<(i64, f64)>> =
+            std::collections::BTreeMap::new();
+        let mut fetch = |sym: &str| -> DfResult<()> {
+            let daily = crate::yahoo::fetch_daily(sym, "1y")
+                .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+            let v: Vec<(i64, f64)> = daily.iter().map(|d| (d.ts, d.close)).collect();
+            series.insert(sym.to_string(), v);
+            Ok(())
+        };
+        fetch(&target)?;
+        for i in &indices {
+            fetch(i)?;
+        }
+        for p in &peers {
+            fetch(p)?;
+        }
+
+        // momentum per symbol: symbol -> (ts -> mom)
+        let mut mom_map: std::collections::BTreeMap<String, std::collections::HashMap<i64, f64>> =
+            std::collections::BTreeMap::new();
+        for (sym, rows) in &series {
+            let close: Vec<f64> = rows.iter().map(|&(_, c)| c).collect();
+            let mom = gtv_array::quant::momentum(&close, n);
+            let mut m = std::collections::HashMap::new();
+            for (k, &(ts, _)) in rows.iter().enumerate() {
+                m.insert(ts, mom[k]);
+            }
+            mom_map.insert(sym.clone(), m);
+        }
+        let get_mom = |sym: &str, ts: i64| -> f64 {
+            mom_map
+                .get(sym)
+                .and_then(|m| m.get(&ts))
+                .copied()
+                .unwrap_or(0.0)
+        };
+
+        // Cross-sectional z of target within (target + peers) per day.
+        let mut peer_ts: std::collections::BTreeSet<i64> = std::collections::BTreeSet::new();
+        for p in &peers {
+            if let Some(m) = mom_map.get(p) {
+                peer_ts.extend(m.keys().copied());
+            }
+        }
+        let mut target_z_map: std::collections::HashMap<i64, f64> =
+            std::collections::HashMap::new();
+        for &ts in &peer_ts {
+            let mut vals = vec![get_mom(&target, ts)];
+            for p in &peers {
+                vals.push(get_mom(p, ts));
+            }
+            let zs = gtv_array::quant::zscore(&vals);
+            target_z_map.insert(ts, zs[0]);
+        }
+
+        // Iterate the target's own days.
+        let mut ts_out = Vec::new();
+        let mut close_out = Vec::new();
+        let mut tm_out = Vec::new();
+        let mut tz_out = Vec::new();
+        let mut im_out = Vec::new();
+        let mut pm_out = Vec::new();
+        let mut exi_out = Vec::new();
+        let mut exp_out = Vec::new();
+        let mut sig_out = Vec::new();
+
+        for &(ts, close) in &series[&target] {
+            let tm = get_mom(&target, ts);
+            let idx_mean = if indices.is_empty() {
+                0.0
+            } else {
+                indices.iter().map(|i| get_mom(i, ts)).sum::<f64>() / indices.len() as f64
+            };
+            let peer_mean = if peers.is_empty() {
+                0.0
+            } else {
+                peers.iter().map(|p| get_mom(p, ts)).sum::<f64>() / peers.len() as f64
+            };
+            let tz = target_z_map.get(&ts).copied().unwrap_or(0.0);
+            let sig = if tm > idx_mean && tm > peer_mean {
+                "buy"
+            } else if tm < idx_mean && tm < peer_mean {
+                "sell"
+            } else {
+                "hold"
+            };
+            ts_out.push(ts);
+            close_out.push(close);
+            tm_out.push(tm);
+            tz_out.push(tz);
+            im_out.push(idx_mean);
+            pm_out.push(peer_mean);
+            exi_out.push(tm - idx_mean);
+            exp_out.push(tm - peer_mean);
+            sig_out.push(sig.to_string());
+        }
+
+        let schema = Self::schema();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(ts_out)) as ArrayRef,
+                Arc::new(Float64Array::from(close_out)) as ArrayRef,
+                Arc::new(Float64Array::from(tm_out)) as ArrayRef,
+                Arc::new(Float64Array::from(tz_out)) as ArrayRef,
+                Arc::new(Float64Array::from(im_out)) as ArrayRef,
+                Arc::new(Float64Array::from(pm_out)) as ArrayRef,
+                Arc::new(Float64Array::from(exi_out)) as ArrayRef,
+                Arc::new(Float64Array::from(exp_out)) as ArrayRef,
+                Arc::new(arrow::array::StringArray::from(sig_out)) as ArrayRef,
+            ],
+        )?;
+        Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
+    }
+}

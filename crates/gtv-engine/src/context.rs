@@ -57,6 +57,7 @@ impl GtvContext {
         ctx.register_udtf("read_parquet", Arc::new(crate::csv::ReadParquetTableFunction::new()));
         ctx.register_udtf("read_yahoo", Arc::new(crate::yahoo::ReadYahooTableFunction::new()));
         ctx.register_udtf("cross_sectional_signal", Arc::new(crate::quant::CrossSectionalSignalTableFunction));
+        ctx.register_udtf("relative_strength", Arc::new(crate::quant::RelativeStrengthTableFunction));
         ctx.register_udtf("read_tickdata", Arc::new(crate::tickdata::ReadTickdataTableFunction));
         let hft_reg = Arc::new(RwLock::new(HftRegistry::default()));
         {
