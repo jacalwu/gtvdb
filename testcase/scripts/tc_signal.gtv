@@ -1,0 +1,4 @@
+loadcsv daily testcase/hft/data/signal_daily.csv
+ALTER SESSION SET sqlmode = full
+SELECT symbol, ts, close, ret, z, signal(z, 0.5, -0.5) AS sig FROM (SELECT symbol, ts, close, ret, zscore(ret) OVER (PARTITION BY ts) AS z FROM (SELECT symbol, ts, close, momentum(close,1) OVER (PARTITION BY symbol ORDER BY ts) AS ret FROM daily) t1) t2 ORDER BY ts, symbol;
+quit
