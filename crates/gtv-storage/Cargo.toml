@@ -10,3 +10,4 @@ parquet.workspace = true
 thiserror.workspace = true
 memmap2 = "0.9"
 bytes = "1"
+chrono = "0.4"

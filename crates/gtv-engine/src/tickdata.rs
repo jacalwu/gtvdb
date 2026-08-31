@@ -14,6 +14,7 @@ use anyhow::{anyhow, Result};
 use datafusion::catalog::{TableFunctionArgs, TableFunctionImpl};
 use datafusion::datasource::{MemTable, TableProvider};
 use datafusion::error::{DataFusionError, Result as DfResult};
+use gtv_storage::StaticCache;
 
 use crate::expr_util::{expr_to_i64, expr_to_string};
 
@@ -129,9 +130,83 @@ fn pct_encode(s: &str) -> String {
     out
 }
 
+/// Local cache root (`GTV_DATA_DIR`, default `data/static`).
+fn data_dir() -> std::path::PathBuf {
+    std::env::var("GTV_DATA_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("data/static"))
+}
+
+/// Read-through `fetch_history`: check the per-day static cache first; only hit
+/// the LSE REST API on a miss, then write each day's ticks back to the cache.
+pub fn fetch_history(symbol: &str, limit: usize, key: &str) -> Result<Vec<HistTick>> {
+    let cache = StaticCache::new(data_dir());
+    let today = chrono::Local::now().date_naive();
+    let today_s = today.format("%Y-%m-%d").to_string();
+    if let Some(latest) = cache.latest_date("lse", symbol) {
+        if let Ok(l) = chrono::NaiveDate::parse_from_str(&latest, "%Y-%m-%d") {
+            if l >= today - chrono::Duration::days(2) {
+                let batches = cache.read_days("lse", symbol, &today_s, &today_s)?;
+                let ticks = hist_batches_to_ticks(&batches);
+                if !ticks.is_empty() {
+                    return Ok(ticks.into_iter().take(limit).collect());
+                }
+            }
+        }
+    }
+
+    let ticks = fetch_history_web(symbol, limit, key)?;
+    if !ticks.is_empty() {
+        let mut by_day: std::collections::BTreeMap<String, Vec<HistTick>> =
+            std::collections::BTreeMap::new();
+        for t in &ticks {
+            by_day
+                .entry(StaticCache::date_from_us(t.ts_us))
+                .or_default()
+                .push(t.clone());
+        }
+        for (date, day_ticks) in by_day {
+            let batch = hist_to_batch(&day_ticks);
+            cache.write_day("lse", &date, symbol, &batch)?;
+        }
+    }
+    Ok(ticks)
+}
+
+/// Convert cached hist-schema batches back to ticks.
+fn hist_batches_to_ticks(batches: &[RecordBatch]) -> Vec<HistTick> {
+    use arrow::array::{as_primitive_array, as_string_array};
+    use arrow::datatypes::{Float64Type, Int64Type};
+    let mut out = Vec::new();
+    for b in batches {
+        let symbol = b
+            .column_by_name("symbol")
+            .map(|c| as_string_array(c).value(0).to_string())
+            .unwrap_or_default();
+        let ts = as_string_array(b.column_by_name("ts").unwrap());
+        let ts_us = as_primitive_array::<Int64Type>(b.column_by_name("ts_us").unwrap());
+        let price = as_primitive_array::<Float64Type>(b.column_by_name("price").unwrap());
+        let bid = as_primitive_array::<Float64Type>(b.column_by_name("bid").unwrap());
+        let ask = as_primitive_array::<Float64Type>(b.column_by_name("ask").unwrap());
+        let volume = as_primitive_array::<Float64Type>(b.column_by_name("volume").unwrap());
+        for i in 0..b.num_rows() {
+            out.push(HistTick {
+                symbol: symbol.clone(),
+                ts: ts.value(i).to_string(),
+                ts_us: ts_us.value(i),
+                price: price.value(i),
+                bid: bid.value(i),
+                ask: ask.value(i),
+                volume: volume.value(i),
+            });
+        }
+    }
+    out
+}
+
 /// Fetch up to `limit` historical ticks for `symbol`, paging past the API's
 /// 10,000-row-per-request cap with a `ts` keyset cursor.
-pub fn fetch_history(symbol: &str, limit: usize, key: &str) -> Result<Vec<HistTick>> {
+pub fn fetch_history_web(symbol: &str, limit: usize, key: &str) -> Result<Vec<HistTick>> {
     const PAGE: usize = 10_000;
     let sym = normalize_symbol(symbol);
     let mut ticks: Vec<HistTick> = Vec::new();

@@ -119,6 +119,20 @@ Uses the `LSE_API_KEY` env var when set, otherwise the site's public key. Note t
 Pagination is automatic: the API caps each request at 10,000 rows, so `fetch`/
 `read_tickdata` page with a `ts` keyset cursor up to `limit`.
 
+### Static data cache (per-day directories)
+
+`yahoo`/`fetch`/`read_yahoo`/`read_tickdata` are **read-through cached**: before
+hitting the web API they check `<GTV_DATA_DIR>/<source>/<date>/<symbol>.parquet`
+(default `data/static`), and on a miss they fetch once and write per-day Parquet
+files, so subsequent runs are fully offline.
+
+```sh
+export GTV_DATA_DIR=/data/gtv_static   # optional; default ./data/static
+gtv> yahoo hsi ^HSI --range 3mo        # 1st: fetch + cache 64 day files
+gtv> yahoo hsi ^HSI --range 3mo        # 2nd: cache hit, no network
+find $GTV_DATA_DIR/yahoo -name '*.parquet' | head   # per-day files
+```
+
 ```sql
 -- full mode: same fetch as a SQL table function
 SELECT * FROM read_tickdata('TSLA', 25000);

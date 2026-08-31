@@ -117,6 +117,19 @@ gtv> SELECT count(*) FROM mco;
 在 REST API 會回 `Unauthorized`。自動分頁：API 單次上限 10000 列，`fetch`/`read_tickdata`
 會用 `ts` keyset 游標翻頁直到 `limit`。
 
+### 靜態數據快取（按天分目錄）
+
+`yahoo`/`fetch`/`read_yahoo`/`read_tickdata` 是 **read-through 快取**：打 Web API 前先
+檢查 `<GTV_DATA_DIR>/<source>/<date>/<symbol>.parquet`（預設 `data/static`），缺資料才
+抓取一次並按天寫入 Parquet，之後每次執行完全離線。
+
+```sh
+export GTV_DATA_DIR=/data/gtv_static   # 可選，預設 ./data/static
+gtv> yahoo hsi ^HSI --range 3mo        # 第一次：抓取 + 快取 64 天檔案
+gtv> yahoo hsi ^HSI --range 3mo        # 第二次：命中快取，零網路
+find $GTV_DATA_DIR/yahoo -name '*.parquet' | head   # 按天檔案
+```
+
 ```sql
 -- full 模式：同樣的抓取做成 SQL 表函數
 SELECT * FROM read_tickdata('TSLA', 25000);

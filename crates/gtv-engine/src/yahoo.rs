@@ -6,8 +6,10 @@
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
-use arrow::array::{ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray};
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::array::{as_primitive_array, ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray};
+use arrow::datatypes::{DataType, Field, Int64Type, Schema, SchemaRef};
+use chrono::{Duration, NaiveDate};
+use gtv_storage::StaticCache;
 use datafusion::catalog::{TableFunctionArgs, TableFunctionImpl};
 use datafusion::datasource::{MemTable, TableProvider};
 use datafusion::error::{DataFusionError, Result as DfResult};
@@ -109,8 +111,116 @@ impl TableFunctionImpl for ReadYahooTableFunction {
     }
 }
 
-/// Fetch daily OHLCV for a symbol over a Yahoo `range` ("1mo".."max").
+/// Local cache root (`GTV_DATA_DIR`, default `data/static`).
+fn data_dir() -> std::path::PathBuf {
+    std::env::var("GTV_DATA_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("data/static"))
+}
+
+/// Read-through `fetch_daily`: check the per-day static cache first; only hit
+/// Yahoo when the data is missing/stale, then write each day back to the cache.
 pub fn fetch_daily(symbol: &str, range: &str) -> Result<Vec<YahooDaily>> {
+    let cache = StaticCache::new(data_dir());
+    let (start, end) = range_dates(range);
+    let (start_s, end_s) = (
+        start.format("%Y-%m-%d").to_string(),
+        end.format("%Y-%m-%d").to_string(),
+    );
+
+    // Cache hit if the latest cached day is within 2 days of the range end.
+    if let Some(latest) = cache.latest_date("yahoo", symbol) {
+        if let Ok(l) = NaiveDate::parse_from_str(&latest, "%Y-%m-%d") {
+            if l >= end - Duration::days(2) {
+                let batches = cache.read_days("yahoo", symbol, &start_s, &end_s)?;
+                let rows = batches_to_rows(&batches)?;
+                if !rows.is_empty() {
+                    return Ok(rows);
+                }
+            }
+        }
+    }
+
+    // Miss -> fetch from Yahoo and populate the per-day cache.
+    let rows = fetch_daily_web(symbol, range)?;
+    if !rows.is_empty() {
+        let mut by_day: std::collections::BTreeMap<String, Vec<YahooDaily>> =
+            std::collections::BTreeMap::new();
+        for r in &rows {
+            by_day
+                .entry(StaticCache::date_from_secs(r.ts))
+                .or_default()
+                .push(r.clone());
+        }
+        for (date, day_rows) in by_day {
+            let batch = yahoo_to_batch(&day_rows);
+            cache.write_day("yahoo", &date, symbol, &batch)?;
+        }
+    }
+    Ok(rows)
+}
+
+/// Calendar date range implied by a Yahoo `range` string.
+fn range_dates(range: &str) -> (NaiveDate, NaiveDate) {
+    let end = chrono::Local::now().date_naive();
+    let days = match range {
+        "5d" => 5,
+        "1mo" => 31,
+        "3mo" => 92,
+        "6mo" => 183,
+        "1y" => 366,
+        "2y" => 731,
+        "5y" => 1827,
+        "max" => 3650,
+        _ => 366,
+    };
+    (end - Duration::days(days), end)
+}
+
+/// Convert cached yahoo-schema batches back to rows.
+fn batches_to_rows(batches: &[RecordBatch]) -> Result<Vec<YahooDaily>> {
+    let mut out = Vec::new();
+    for b in batches {
+        let ts = as_primitive_array::<Int64Type>(b.column_by_name("ts").unwrap());
+        let open = as_primitive_array::<arrow::datatypes::Float64Type>(b.column_by_name("open").unwrap());
+        let high = as_primitive_array::<arrow::datatypes::Float64Type>(b.column_by_name("high").unwrap());
+        let low = as_primitive_array::<arrow::datatypes::Float64Type>(b.column_by_name("low").unwrap());
+        let close = as_primitive_array::<arrow::datatypes::Float64Type>(b.column_by_name("close").unwrap());
+        let adj = as_primitive_array::<arrow::datatypes::Float64Type>(b.column_by_name("adjclose").unwrap());
+        let vol = as_primitive_array::<arrow::datatypes::Float64Type>(b.column_by_name("volume").unwrap());
+        for i in 0..b.num_rows() {
+            out.push(YahooDaily {
+                symbol: "".into(), // patched below if a symbol column exists
+                ts: ts.value(i),
+                open: open.value(i),
+                high: high.value(i),
+                low: low.value(i),
+                close: close.value(i),
+                adjclose: adj.value(i),
+                volume: vol.value(i),
+            });
+        }
+    }
+    // Restore symbols: each cached day file is single-symbol, so read the symbol
+    // once per batch.
+    let mut k = 0;
+    for bb in batches {
+        let sym = bb
+            .column_by_name("symbol")
+            .map(|c| arrow::array::as_string_array(c).value(0).to_string())
+            .unwrap_or_default();
+        for _ in 0..bb.num_rows() {
+            if k < out.len() {
+                out[k].symbol = sym.clone();
+            }
+            k += 1;
+        }
+    }
+    Ok(out)
+}
+
+/// Fetch daily OHLCV for a symbol over a Yahoo `range` ("1mo".."max").
+pub fn fetch_daily_web(symbol: &str, range: &str) -> Result<Vec<YahooDaily>> {
     let url = format!(
         "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range={range}&interval=1d"
     );

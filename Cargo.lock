@@ -2049,6 +2049,7 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "bytes",
+ "chrono",
  "memmap2",
  "parquet",
  "thiserror 2.0.20",
