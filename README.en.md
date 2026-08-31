@@ -93,3 +93,11 @@ gtv> remote 127.0.0.1:50051 SELECT * FROM numbers ORDER BY n
 `QueryService.Execute` takes SQL and returns the result batches encoded as an
 Arrow IPC stream (the Flight wire format); the client-side `gtv_proto::query_remote`
 decodes them for display.
+
+
+Current performance is limited by hardware. performance forcast are listed below.
+
+Case	current（3.2 GB/s）	DDR5 MC（8–10×）	HBM（25–30×）
+TC1 1M fused	6.68 ms	0.7–0.8 ms	0.22–0.27 ms
+TC2 1M OFI	18.00 ms	1.8–2.25 ms	0.6–0.72 ms
+TC4 100k 512d	79.28 ms	7.9–9.9 ms	2.6–3.2 ms
