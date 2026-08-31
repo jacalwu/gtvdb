@@ -2050,6 +2050,7 @@ dependencies = [
  "arrow",
  "bytes",
  "chrono",
+ "libc",
  "memmap2",
  "parquet",
  "thiserror 2.0.20",

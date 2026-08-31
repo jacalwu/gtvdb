@@ -190,8 +190,22 @@ impl IvfIndex {
         let data = &self.data;
         let ids = &self.ids;
         let dim = self.dim;
+        let n = ids.len();
         par_topk_over(&positions, k, |pos| {
             let i = pos as usize;
+            // IVF probes are *indirect* row reads (positions within probed lists):
+            // prefetch the next row so the 2 KB DRAM fetch overlaps the current
+            // row's distance computation (hardware prefetch cannot follow the
+            // non-contiguous list positions).
+            #[cfg(target_arch = "x86_64")]
+            if i + 1 < n {
+                unsafe {
+                    std::arch::x86_64::_mm_prefetch(
+                        data.as_ptr().add((i + 1) * dim) as *const _,
+                        std::arch::x86_64::_MM_HINT_T0,
+                    );
+                }
+            }
             let row = &data[i * dim..(i + 1) * dim];
             (squared_l2(query, row, use_simd), ids[i])
         })

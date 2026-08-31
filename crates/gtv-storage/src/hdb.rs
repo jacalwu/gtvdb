@@ -373,10 +373,25 @@ fn decode_symbol_column(batch: &RecordBatch, dict: &SymDictionary) -> RecordBatc
 /// Memory-map a Parquet file and read it through the mapped bytes (the OS page
 /// cache is accessed directly, avoiding an explicit user-space `read` copy of
 /// the raw file).
+/// Best-effort huge-page hint for large read-only mappings: on Linux with THP
+/// in `madvise` mode this lets the kernel back the mapping with transparent huge
+/// pages, cutting TLB misses on long streaming scans. No-op elsewhere.
+fn madvise_hugepages(mmap: &memmap2::Mmap) {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        if mmap.len() >= 2 * 1024 * 1024 {
+            libc::madvise(mmap.as_ptr() as *mut libc::c_void, mmap.len(), libc::MADV_HUGEPAGE);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = mmap;
+}
+
 pub fn read_parquet_mmap(path: &Path) -> Result<Vec<RecordBatch>> {
     let file = fs::File::open(path)?;
     // SAFETY: the mapping is read-only and the file is not modified while mapped.
     let mmap = unsafe { memmap2::Mmap::map(&file).map_err(StorageError::from)? };
+    madvise_hugepages(&mmap);
     // Zero-copy: `Bytes::from_owner` wraps the mmap (no user-space file copy).
     let bytes = bytes::Bytes::from_owner(mmap);
     let builder = ParquetRecordBatchReaderBuilder::try_new(bytes)

@@ -321,6 +321,21 @@ impl VectorIndex for FlatIndex {
         let use_simd = false;
 
         let scored = par_topk(n, k, filter_mask, |i| {
+            // Manual prefetch of the row `PREFETCH_DIST` ahead: the exact KNN scan
+            // streams a large (possibly >L3) contiguous corpus, so software
+            // prefetch lets the load pipeline overlap the DRAM round-trip instead
+            // of waiting on the hardware prefetcher's tail latency.
+            #[cfg(target_arch = "x86_64")]
+            const PREFETCH_DIST: usize = 8;
+            #[cfg(target_arch = "x86_64")]
+            if i + PREFETCH_DIST < n {
+                unsafe {
+                    std::arch::x86_64::_mm_prefetch(
+                        data.as_ptr().add((i + PREFETCH_DIST) * dim) as *const _,
+                        std::arch::x86_64::_MM_HINT_T0,
+                    );
+                }
+            }
             let row = &data[i * dim..(i + 1) * dim];
             (squared_l2(query, row, use_simd), ids[i])
         });
