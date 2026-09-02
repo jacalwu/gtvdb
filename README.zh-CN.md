@@ -3,6 +3,8 @@
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Language: Rust](https://img.shields.io/badge/Language-Rust-orange.svg)](https://www.rust-lang.org/)
 
+
+天下武功無堅不破，唯快不破
 > **「司令！經過我多年的研究，我終於研發出這個集四種超級功能於一身的單引擎資料庫——『攞你命 3000』！」**
 
 普通人做系統，要開一個 Neo4j 睇圖拓撲，開一個 kdb+ 睇時序，再開一個 Milvus 做向量，最後仲要掛個 ClickHouse 做 OLAP 分析……**廢！極之廢！**
