@@ -12,16 +12,18 @@ use anyhow::{anyhow, Result};
 
 mod lse;
 use arrow::array::{
-    ArrayRef, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray,
-    TimestampNanosecondArray, UInt64Array,
+    as_primitive_array, ArrayRef, BooleanArray, Float64Array, Int64Array, RecordBatch,
+    StringArray, TimestampNanosecondArray, UInt16Array, UInt64Array,
 };
 use arrow::compute::{cast, concat_batches, filter_record_batch};
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::datatypes::{
+    DataType, Field, Float64Type, Int64Type, Schema, SchemaRef, UInt64Type,
+};
 use arrow::util::pretty::print_batches;
 use rustyline::DefaultEditor;
 
 use gtv_array::{asof, window};
-use gtv_core::{EdgeTable, NodeTable, TemporalGraph, VectorIndex};
+use gtv_core::{EdgeTable, NodeTable, TemporalCSR, TemporalGraph, VectorIndex};
 use gtv_delta::{DeltaEdge, LsmStore};
 use gtv_engine::hft_exec::KernelPlan;
 use gtv_engine::GtvContext;
@@ -691,6 +693,125 @@ async fn run(
             ctx.register_csv(path, table)?;
             println!("loaded `{table}` from {path}");
         }
+        "aj_from" | "register_aj" => {
+            // aj_from <table> [tol_ns] — bind the as-of join right side to a table
+            // (columns t, bid, ask; spread = ask - bid).
+            let table = require_arg(&tokens, 1, "aj_from <table> [tol_ns]")?;
+            let tol = optional_arg(&tokens, 2)
+                .map_or(Ok(500_000i64), |s| s.parse::<i64>())?;
+            let batches = ctx.sql(&format!("SELECT * FROM {table}")).await?;
+            let times = extract_i64(&batches, "t")?;
+            let price = extract_f64(&batches, "bid")?;
+            let ask = extract_f64(&batches, "ask")?;
+            let spread: Vec<f64> = ask.iter().zip(&price).map(|(a, p)| a - p).collect();
+            let n = times.len();
+            ctx.register_asof_join_multi(times, price, spread, tol);
+            println!("registered aj/asof_join from `{table}` ({n} right rows, tol {tol}ns)");
+        }
+        "aj_bench" => {
+            // aj_bench <left_table> <right_table> [tol_ns] — full left×right as-of
+            // join (two-pointer merge; both `t` columns must be ascending).
+            // Returns match count + a Σspread checksum, and (with SET DURATION=ON)
+            // the sweep time only — data extraction happens before the timer.
+            let left_table = require_arg(&tokens, 1, "aj_bench <left_table> <right_table> [tol_ns]")?;
+            let right_table = require_arg(&tokens, 2, "aj_bench <left_table> <right_table> [tol_ns]")?;
+            let tol = optional_arg(&tokens, 3)
+                .map_or(Ok(500_000i64), |s| s.parse::<i64>())?;
+            let left_batches = ctx
+                .sql(&format!("SELECT t FROM {left_table} ORDER BY t"))
+                .await?;
+            let left_t = extract_i64(&left_batches, "t")?;
+            let right_batches = ctx
+                .sql(&format!("SELECT t, bid, ask FROM {right_table} ORDER BY t"))
+                .await?;
+            let right_t = extract_i64(&right_batches, "t")?;
+            let right_price = extract_f64(&right_batches, "bid")?;
+            let right_ask = extract_f64(&right_batches, "ask")?;
+
+            let t0 = Instant::now();
+            let mut j = 0usize;
+            let mut hits = 0usize;
+            let mut sum = 0.0f64;
+            let rlen = right_t.len();
+            for &lt in &left_t {
+                while j < rlen && right_t[j] <= lt {
+                    j += 1;
+                }
+                if j > 0 && lt - right_t[j - 1] <= tol {
+                    hits += 1;
+                    sum += right_ask[j - 1] - right_price[j - 1];
+                }
+            }
+            let us = t0.elapsed().as_secs_f64() * 1e6;
+            println!(
+                "aj_bench {left_table}×{right_table}: {hits}/{} matched, Σspread={sum:.6}",
+                left_t.len()
+            );
+            if *timing {
+                println!("duration: {us:.3} µs (kernel, aj_bench)");
+            }
+        }
+        "wash_from" | "register_wash" => {
+            // wash_from <table> — build a temporal transfer graph from a table
+            // (columns src, dst, valid_from, valid_to, optional edge_type).
+            let table = require_arg(&tokens, 1, "wash_from <table>")?;
+            let batches = ctx.sql(&format!("SELECT * FROM {table}")).await?;
+            let src = extract_u64(&batches, "src")?;
+            let dst = extract_u64(&batches, "dst")?;
+            let vf = extract_i64(&batches, "valid_from")?;
+            let vt = extract_i64(&batches, "valid_to")?;
+            let et: Vec<u16> =
+                if batches.iter().any(|b| b.column_by_name("edge_type").is_some()) {
+                    extract_u64(&batches, "edge_type")?
+                        .into_iter()
+                        .map(|v| v as u16)
+                        .collect()
+                } else {
+                    vec![1u16; src.len()]
+                };
+            let n = src.len();
+            let node_count = src
+                .iter()
+                .chain(dst.iter())
+                .copied()
+                .map(|v| v as usize)
+                .max()
+                .unwrap_or(0)
+                + 1;
+            let csr = TemporalCSR::from_arrays(
+                &UInt64Array::from(src),
+                &UInt64Array::from(dst),
+                &TimestampNanosecondArray::from(vf),
+                &TimestampNanosecondArray::from(vt),
+                &UInt16Array::from(et),
+                node_count,
+            )
+            .map_err(|e| anyhow!("build CSR: {e}"))?;
+            ctx.register_wash_trade(&csr);
+            println!("registered wash/wash_trade from `{table}` ({n} edges, {node_count} nodes)");
+        }
+        "knn_from" | "register_knn" => {
+            // knn_from <name> <table> [dim] — register a vector collection from a
+            // table (columns id, v0..v{dim-1}).
+            let name = require_arg(&tokens, 1, "knn_from <name> <table> [dim]")?;
+            let table = require_arg(&tokens, 2, "knn_from <name> <table> [dim]")?;
+            let batches = ctx.sql(&format!("SELECT * FROM {table}")).await?;
+            let ids = extract_u64(&batches, "id")?;
+            let dim = match optional_arg(&tokens, 3) {
+                Some(s) => s.parse::<usize>()?,
+                None => infer_vec_dim(&batches)?,
+            };
+            let n = ids.len();
+            let mut vectors = vec![vec![0.0f32; dim]; n];
+            for d in 0..dim {
+                let vals = extract_f64(&batches, &format!("v{d}"))?;
+                for (i, v) in vals.iter().enumerate() {
+                    vectors[i][d] = *v as f32;
+                }
+            }
+            ctx.register_knn(name, ids, vectors, None)?;
+            println!("registered knn collection `{name}` from `{table}` ({n} × {dim})");
+        }
         "hdb_save" => {
             // hdb_save <table> <date> [root] — persist a table to the HDB layout
             // (<root>/<date>/<table>/<symbol>.parquet, split by `symbol` if present).
@@ -1170,6 +1291,10 @@ fn print_help() {
          \x20 pattern [T]           temporal pattern matching (ring/path/diamond)\n\
          \x20 delta                 LSM delta buffer insert + compaction demo\n\
          \x20 udf [x ...]           WASM sandbox UDF (x * 1.1) over prices\n\
+         \x20 aj_from <table> [tol] bind aj/asof_join right side to a table (t, bid, ask)\n\
+         \x20 aj_bench <left> <right> [tol]  full left×right as-of join sweep (1M×1M)\n\
+         \x20 wash_from <table>     bind wash/wash_trade to a table (src, dst, valid_from, valid_to)\n\
+         \x20 knn_from <name> <t> [d]  register a vector collection from a table (id, v0..v{{d-1}})\n\
          \x20 remote <host:port> <sql>  execute SQL on a remote gtv-server\n\
          \x20 quit | exit\n\
          \n\
@@ -1207,4 +1332,69 @@ fn require_arg<'a>(tokens: &'a [&'a str], idx: usize, usage: &str) -> Result<&'a
 
 fn optional_arg<'a>(tokens: &'a [&'a str], idx: usize) -> Option<&'a str> {
     tokens.get(idx).copied()
+}
+
+// ---------------------------------------------------------------------------
+// Column extraction helpers for the `*_from <table>` registration commands.
+// ---------------------------------------------------------------------------
+
+/// Concatenate a named column across all batches and cast it to `Int64`.
+fn extract_i64(batches: &[RecordBatch], col: &str) -> Result<Vec<i64>> {
+    let mut out = Vec::new();
+    for b in batches {
+        let arr = b
+            .column_by_name(col)
+            .ok_or_else(|| anyhow!("table has no column `{col}`"))?;
+        let casted = cast(arr, &DataType::Int64)?;
+        out.extend_from_slice(as_primitive_array::<Int64Type>(casted.as_ref()).values());
+    }
+    Ok(out)
+}
+
+/// Concatenate a named column across all batches and cast it to `Float64`.
+fn extract_f64(batches: &[RecordBatch], col: &str) -> Result<Vec<f64>> {
+    let mut out = Vec::new();
+    for b in batches {
+        let arr = b
+            .column_by_name(col)
+            .ok_or_else(|| anyhow!("table has no column `{col}`"))?;
+        let casted = cast(arr, &DataType::Float64)?;
+        out.extend_from_slice(as_primitive_array::<Float64Type>(casted.as_ref()).values());
+    }
+    Ok(out)
+}
+
+/// Concatenate a named column across all batches and cast it to `UInt64`.
+fn extract_u64(batches: &[RecordBatch], col: &str) -> Result<Vec<u64>> {
+    let mut out = Vec::new();
+    for b in batches {
+        let arr = b
+            .column_by_name(col)
+            .ok_or_else(|| anyhow!("table has no column `{col}`"))?;
+        let casted = cast(arr, &DataType::UInt64)?;
+        out.extend_from_slice(as_primitive_array::<UInt64Type>(casted.as_ref()).values());
+    }
+    Ok(out)
+}
+
+/// Infer the vector dimension from `v0`, `v1`, ... `vN` columns in the schema.
+fn infer_vec_dim(batches: &[RecordBatch]) -> Result<usize> {
+    let first = batches.first().ok_or_else(|| anyhow!("table is empty"))?;
+    let dim = first
+        .schema()
+        .fields()
+        .iter()
+        .filter(|f| {
+            f.name()
+                .strip_prefix('v')
+                .map_or(false, |rest| {
+                    !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit())
+                })
+        })
+        .count();
+    if dim == 0 {
+        Err(anyhow!("no `v0..vN` vector columns found in table"))
+    } else {
+        Ok(dim)
+    }
 }
