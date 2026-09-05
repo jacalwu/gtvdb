@@ -118,7 +118,7 @@ SQL 範例(tick → 日 bar,資料需按 ts 升冪):
 ## 6. 決策與提醒
 
 ```
-規則: max(p_up, p_down) >= THRESHOLD(預設 0.75)
+規則: 對最後一根的 raw `p_up` 做因果校準(Platt/isotonic,擬合於決策日之前已解析的歷史),以 `max(p_cal, 1-p_cal) >= THRESHOLD(預設 0.75)` 觸發提醒
       → 提醒「SYM 未來 10 交易日 ↑ 機率 73%(n=20 analogs, 歷史hit 71%)」
       否則 → 「無明顯訊號(p_up=…, p_down=…)」
 ```
@@ -147,7 +147,10 @@ SQL 範例(tick → 日 bar,資料需按 ts 升冪):
 | `RANGE` | `5y` | Yahoo 拉取長度 |
 | `HORIZON` | `10` | 未來交易日(≈2 週) |
 | `K` | `20` | 類比數 |
-| `THRESHOLD` | `0.75` | 提醒門檻(校準建議值;用戶可隨時用環境變數調整) |
+| `THRESHOLD` | `0.75` | 提醒門檻(作用於**校準後**機率;用戶可調) |
+| `METHOD` | `platt` | 機率縮放:`platt`/`iso`/`raw`(不縮放)。決策用 `p_cal` |
+| `CAL` | `30` | 用於擬合校準器的 walk-forward 歷史比例(%) |
+| `CALMODEL` | (空) | 指定已存校準模型路徑則直接復用、跳過重新擬合 |
 | `DATA_ROOT` | `./analytics_data` | 冷層/快取 root |
 | `OUT_DIR` | `./analytics_out` | 輸出目錄 |
 | `ALERT` | `none` | `none`/`telegram`(webhook env)/`mail` |

@@ -95,7 +95,7 @@ if not tables:
 hdr, body = tables[-1]
 def col(name): return hdr.index(name)
 rows = []
-for cells in body[1:]:
+for cells in body:
     rows.append({
         "t": int(cells[col("t")]), "p_up": float(cells[col("p_up")]),
         "p_down": float(cells[col("p_down")]), "up": int(cells[col("up")]) == 1,

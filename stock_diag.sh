@@ -116,7 +116,7 @@ if not tables:
 hdr, body = tables[-1]
 def col(name): return hdr.index(name)
 R = []
-for cells in body[1:]:
+for cells in body:
     row = {}
     for name in ["t","close","p_up","p_down","up","n_analogs","actual_ret",
                  "q05","q10","q25","q50","q75","q90","q95","bar_ret","vol20",

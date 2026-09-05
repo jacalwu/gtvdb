@@ -573,11 +573,15 @@ fn walk_compute(
     let m = n - horizon; // decision/outcome rows [0, m): bar i has outcome close[i+H]
     let k = k.max(1);
 
-    // First decision bar with at least `warmup` past-labelled rows.
-    let start = horizon.saturating_add(warmup).saturating_sub(1).max(horizon + 1);
+    // Warmup adapts to the available history so short series still evaluate
+    // (leave >= 20 decision rows); explicit large values are clamped.
+    let max_warm = (m as i64 - horizon as i64 - 19).max(1) as usize; // keep >= 20 eval rows
+    let warm = warmup.min(max_warm).max(1);
+    let start = horizon.saturating_add(warm).saturating_sub(1).max(horizon + 1);
     if start >= m {
         return Err(DataFusionError::Execution(format!(
-            "fwd_walk: warmup {warmup} leaves no rows to evaluate (m={m}, start={start})"
+            "fwd_walk: history too short (n={n}, horizon={horizon}) for warmup {warmup} (need ~{} bars+)",
+            horizon * 2 + 40
         )));
     }
 
