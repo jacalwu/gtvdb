@@ -11,7 +11,8 @@
 - 輸入:股票代碼(如 `AAPL`、`2513.HK`),歷史行情(日線或 tick)。
 - 輸出:
   - 決策日(最後一根日 K)的 `p_up`、`p_down`,與模型摘要(hit-rate/樣本數);
-  - 當 `max(p_up, p_down) ≥ THRESHOLD(預設 0.70)` 時觸發提醒(上漲/下跌方向)。
+  - 當 `max(p_up, p_down) ≥ THRESHOLD(預設 0.75,walk-forward 校準後建議值;
+    可用環境變數 `THRESHOLD` 隨時調整)` 時觸發提醒(上漲/下跌方向)。
 - 名詞定義:
   - **「未來 2 週」= 未來 10 個交易日**(日線只存在交易日,天然跳過週末)。
     日曆 14 天 vs 交易日 10 天,以交易日為準,避免假日誤差。
@@ -114,7 +115,7 @@ SQL 範例(tick → 日 bar,資料需按 ts 升冪):
 ## 6. 決策與提醒
 
 ```
-規則: max(p_up, p_down) >= THRESHOLD(0.70)
+規則: max(p_up, p_down) >= THRESHOLD(預設 0.75)
       → 提醒「SYM 未來 10 交易日 ↑ 機率 73%(n=20 analogs, 歷史hit 71%)」
       否則 → 「無明顯訊號(p_up=…, p_down=…)」
 ```
@@ -128,10 +129,10 @@ SQL 範例(tick → 日 bar,資料需按 ts 升冪):
 
 ```
 用法:
-  ./stock_analysis.sh AAPL                     # 全預設(Yahoo 5y, 門檻 0.7)
-  SYMBOL=TSLA ./stock_analysis.sh
-  SOURCE=yahoo RANGE=2y THRESHOLD=0.75 ./stock_analysis.sh TSLA
-  DATA_DIR=/data ./stock_analysis.sh 2513.HK
+  ./stock_analysis.sh HK.00700                 # 全預設(SOURCE=futu, 門檻 0.75)
+  SYMBOL=TSLA ./stock_analysis.sh              # 或 SOURCE=yahoo ./stock_analysis.sh TSLA
+  HORIZON=14 THRESHOLD=0.8 START=2022-01-01 ./stock_analysis.sh HK.00700
+  SOURCE=parquet FILE=analytics_out/HK_00700_bars.parquet ./stock_analysis.sh HK.00700  # 免重抓
 ```
 
 環境變數(預設):
@@ -143,7 +144,7 @@ SQL 範例(tick → 日 bar,資料需按 ts 升冪):
 | `RANGE` | `5y` | Yahoo 拉取長度 |
 | `HORIZON` | `10` | 未來交易日(≈2 週) |
 | `K` | `20` | 類比數 |
-| `THRESHOLD` | `0.70` | 提醒門檻 |
+| `THRESHOLD` | `0.75` | 提醒門檻(校準建議值;用戶可隨時用環境變數調整) |
 | `DATA_ROOT` | `./analytics_data` | 冷層/快取 root |
 | `OUT_DIR` | `./analytics_out` | 輸出目錄 |
 | `ALERT` | `none` | `none`/`telegram`(webhook env)/`mail` |
@@ -174,10 +175,10 @@ SQL 範例(tick → 日 bar,資料需按 ts 升冪):
 ## 9. 驗收
 
 1. **合成測試**:構造「已知單邊趨勢」的 tick/日線(前段多頭、後段空頭),
-   驗證 `p_up/p_down` 方向正確、`>0.7` 時 script exit=3 且訊息含方向。
+   驗證 `p_up/p_down` 方向正確、`≥門檻(預設 0.75)` 時 script exit=3 且訊息含方向。
 2. **真實資料 smoke**(無 key):`yahoo` 拉 `2513.HK`/`0100.HK`,全流程可跑,
    輸出含 p/決策與 hit_rate 欄位。
-3. **hit-rate 報告**:全歷史 leave-one-out 的 `p≥0.7` 桶實際漲率 ≥ 0.65(容差),
+3. **hit-rate 報告**:walk-forward 的建議門檻桶(`p≥0.75`)實際方向命中率 ≥ 0.65(容差),
    否則調門檻/特徵(Phase B)。
 4. 重跑冪等:同一天重跑結果一致(資料有 cache),無重複抓取。
 

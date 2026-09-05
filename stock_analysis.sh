@@ -10,10 +10,11 @@
 #   ./stock_analysis.sh HK.00700                 # SOURCE=futu (default), HORIZON=10, K=20
 #   SOURCE=yahoo ./stock_analysis.sh 0700.HK     # Yahoo free feed (Yahoo code format)
 #   SOURCE=parquet FILE=./bars.parquet ./stock_analysis.sh 0700.HK   # reuse a saved table
-#   HORIZON=14 THRESHOLD=0.7 PERIOD=1d ./stock_analysis.sh HK.00700
+#   HORIZON=14 THRESHOLD=0.8 PERIOD=1d ./stock_analysis.sh HK.00700
 #
 # Env (defaults): SYMBOL (positional), SOURCE=futu|yahoo|parquet, PERIOD=1d,
-#   ADJUST=qfq, HORIZON=10, K=20, THRESHOLD=0.70, START=<6y back>, END=<today>,
+#   ADJUST=qfq, HORIZON=10, K=20, THRESHOLD=0.75 (calibrated default; override any time),
+#   START=<6y back>, END=<today>,
 #   FILE=(parquet), OUT_DIR=./analytics_out, GTV_PROFILE=release
 #
 # Exit codes: 0 ok/no alert · 1 data/param error · 3 alert triggered (cron: check 3).
@@ -31,7 +32,7 @@ PERIOD="${PERIOD:-1d}"
 ADJUST="${ADJUST:-qfq}"
 HORIZON="${HORIZON:-10}"            # trading days ≈ 2 weeks
 K="${K:-20}"
-THRESHOLD="${THRESHOLD:-0.70}"
+THRESHOLD="${THRESHOLD:-0.75}"   # alert when max(p_up,p_down) >= THRESHOLD (user-adjustable)
 START="${START:-$(date -d '6 years ago' +%F 2>/dev/null || date -v-6y +%F)}"
 END="${END:-$(date +%F)}"
 FILE="${FILE:-}"                    # required when SOURCE=parquet
