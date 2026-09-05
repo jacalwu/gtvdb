@@ -117,8 +117,30 @@ impl GtvContext {
     }
 
     /// Remove a registered table (no-op when absent).
+    ///
+    /// Clears both the DataFusion catalog entry and the compiled-kernel table
+    /// registry (`hft_reg`), so a later `drop table` / `DROP TABLE` fully
+    /// releases the underlying record batches.
     pub fn deregister_table(&self, name: &str) {
         let _ = self.ctx.deregister_table(name);
+        if let Ok(mut reg) = self.hft_reg.write() {
+            reg.tables.remove(name);
+        }
+    }
+
+    /// Whether `name` resolves to a registered table (kernel registry or the
+    /// DataFusion catalog). Querying with `LIMIT 0` resolves the name during
+    /// planning, so `Err` means the table does not exist.
+    pub async fn has_table(&self, name: &str) -> bool {
+        if self
+            .hft_reg
+            .read()
+            .map(|r| r.tables.contains_key(name))
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        self.ctx.sql(&format!("SELECT * FROM {name} LIMIT 0")).await.is_ok()
     }
 
     /// Load a CSV file from disk and register it as `name` (method 1:

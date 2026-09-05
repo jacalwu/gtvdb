@@ -9,3 +9,4 @@ pub mod hft_ops;
 pub mod micro;
 pub mod quant;
 pub mod window;
+pub mod window_simd;

@@ -2,6 +2,10 @@
 
 use arrow::array::Float64Array;
 
+/// Fused single-pass `mavg` + `msum` + `deltas` (NT stores on x86_64).
+/// See [`crate::window_simd::fused_ma_ms_delta`].
+pub use crate::window_simd::fused_ma_ms_delta;
+
 /// kdb `mavg[n] x`: trailing moving average over a window of `n`.
 ///
 /// The first `n-1` elements are averaged over the available prefix (cumulative
