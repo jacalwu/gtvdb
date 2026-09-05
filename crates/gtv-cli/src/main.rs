@@ -655,6 +655,15 @@ async fn run(
         }
         "help" | "?" => print_help(),
         "tables" => show_tables(demo),
+        "providers" => {
+            println!("registered market providers ({})", gtv_engine::market::registry().names().len());
+            for (name, desc) in gtv_engine::market::registry().list() {
+                println!("  {name:<10} {desc}");
+            }
+            println!(
+                "  use: klines('provider', code, period[, start[, end[, max[, adjust]]]])\n       ticks('provider', code[, max])"
+            );
+        }
         "neighbors" => {
             let node = require_arg(&tokens, 1, "neighbors <node> [T]")?.parse::<u64>()?;
             let t = optional_arg(&tokens, 2).map_or(Ok(DEFAULT_T), |s| s.parse::<i64>())?;
@@ -1626,6 +1635,10 @@ const DF_TABLE_FNS: &[&str] = &[
     "match",
     "covariance_matrix",
     "cov",
+    "klines",
+    "market_klines",
+    "ticks",
+    "market_ticks",
 ];
 
 /// Read a data file, auto-detecting CSV vs Parquet by extension.
@@ -1722,7 +1735,9 @@ fn print_help() {
     println!(
         "commands:\n\
          \x20 help | ?              this help\n\
-         \x20 tables                show node/edge tables and price series\n\
+         \x20 tables                show node/edge tables and price series
+         \x20 providers             list registered market providers (futu/yahoo/...)
+         \x20 klines('p','code',...) / ticks('p','code')  fetch market data (see providers)\n\
          \x20 neighbors <node> [T]  temporal neighbors at time T (default 0)\n\
          \x20 khop <node> <k> [T]   k-hop traversal at time T\n\
          \x20 mavg <n> / msum <n>   rolling average/sum over the price series\n\

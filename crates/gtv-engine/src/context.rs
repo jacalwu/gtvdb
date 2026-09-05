@@ -60,6 +60,7 @@ impl GtvContext {
         ctx.register_udtf("cross_sectional_signal", Arc::new(crate::quant::CrossSectionalSignalTableFunction));
         ctx.register_udtf("relative_strength", Arc::new(crate::quant::RelativeStrengthTableFunction));
         ctx.register_udtf("read_tickdata", Arc::new(crate::tickdata::ReadTickdataTableFunction));
+        crate::market::register_udtfs(&ctx);
         let hft_reg = Arc::new(RwLock::new(HftRegistry::default()));
         {
             let tt = Arc::new(crate::hft_tf::TickToTradeTableFunction::new(hft_reg.clone()));

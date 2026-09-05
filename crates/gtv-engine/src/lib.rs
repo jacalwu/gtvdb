@@ -14,6 +14,7 @@ pub mod hft_exec;
 pub mod hft_tf;
 pub mod knn;
 pub mod micro;
+pub mod market;
 pub mod quant;
 pub mod tickdata;
 pub mod udf;
