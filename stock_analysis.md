@@ -26,12 +26,28 @@
 | Yahoo 日線 | `yahoo <table> SYM --range 5y` | 否 | symbol, ts(Int64 ns), open/high/low/close, adjclose, volume | 預設來源,無 key、日線直接可用 |
 | LSE 歷史 tick | `fetch <table> SYM [--limit N]` | `LSE_API_KEY` | symbol, ts, ts_us(Int64 µs), price, bid/ask, volume | tick 級;需先日線化 |
 | 既有樣本 | `testcase/data/stocks_{MCO,NVDA,TSLA}_tick.parquet` | 否 | 合成 tick(price…) | 離線開發/測試 |
+| Futu OpenD 快照 | futuapi skill: `get_snapshot.py US.AAPL` | OpenD 登入+行情權限 | 最新價、開高低收、量、買賣盤 | 盤中即時/點位確認 |
+| Futu OpenD 歷史 K 線 | futuapi skill: `get_kline.py US.AAPL --start …` | OpenD 登入(日K免額度?) | time_key, open/high/low/close, volume | 真實歷史日線(美股/港股/…最多20年) |
+
 
 整備原則:
 - 統一註冊為「tick 表」或「日線表」;`yahoo` 直接給日線(有 open/high/low/close),
   可直接建 bar 表;tick 來源需先日線化(§3)。
 - 拉到後立即 `hdb_save <table> <date> …` 或寫入冷層,之後重跑用
   `hc_load`/`hdb_scan` 載入,避免每日重抓(見 §8 銜接)。
+
+### 2.1 Futu/OpenD 前置條件與橋接
+
+- **OpenD 需由使用者在有 GUI 的機器登入**(牛牛號 + 首次問卷/協議;futuapi skill
+  明訂禁以 SDK `unlock_trade` 解鎖、一律用 GUI 手動);登入後監聽
+  `127.0.0.1:11111`。headless server 無法完成登入 → 由使用者桌面端執行。
+- 行情腳本已由 `futuapi` skill 提供(agent 全域 skills),例:
+  - 快照:`python get_snapshot.py US.AAPL HK.00700` → JSON(最新價/開高低收/量/買賣盤)
+  - 歷史日 K:`python get_kline.py US.AAPL --ktype K_DAY --start 2024-01-01 --end …` → JSON(K 線)
+  - 代碼格式:`US.AAPL` / `HK.00700`(美股/港股前綴)。
+- 橋接進 gtvdb:腳本輸出 JSON → 轉 CSV(ts, open, high, low, close, volume)→
+  `loadcsv`/`load` 註冊;欄位對齊 §3 bar 表(Yahoo 同構)。
+- `SOURCE=futu` 時分析流程與 yahoo 相同,只差「拉資料」這一段換成 OpenD。
 
 ---
 
@@ -121,7 +137,7 @@ calibration(分桶 p vs 實際漲率),p≥70% 的桶實際命中率不足時調 
 | 變數 | 預設 | 意義 |
 |---|---|---|
 | `SYMBOL` | (必填/參數) | 股票代碼 |
-| `SOURCE` | `yahoo` | `yahoo`(免key) / `lse`(需 LSE_API_KEY) / `parquet`(樣本檔) |
+| `SOURCE` | `yahoo` | `yahoo`(免key) / `lse`(LSE_API_KEY) / `futu`(OpenD 登入,§2.1) / `parquet`(樣本檔) |
 | `RANGE` | `5y` | Yahoo 拉取長度 |
 | `HORIZON` | `10` | 未來交易日(≈2 週) |
 | `K` | `20` | 類比數 |
@@ -191,6 +207,7 @@ calibration(分桶 p vs 實際漲率),p≥70% 的桶實際命中率不足時調 
 | 日線化 `first/last` 聚合或 `ohlc(name, bucket)` | SQL/既有 | 確認語意後選用 |
 | `stddev` 窗 / lead 窗 | DataFusion 內建 | 確認可用,否則新增小 UDF |
 | 冷層每日累積(`hdb_flush` + `hc_load`) | 既有(M1 已完成) | 直接用 |
+| futu JSON → CSV 橋接(`get_snapshot/kline.py` 輸出餵 `loadcsv`) | shell/python 小工具 | **新增(§2.1)** |
 
 附錄 B:範例輸出(目標格式)
 
