@@ -915,11 +915,12 @@ async fn run(
             println!("hdb_scan: loaded `{table}` {start}..{end} ({rows} rows)");
         }
         "rollover" => {
-            // rollover <table> <date> [root] — freeze the hot (today/in-memory)
-            // table into the cold partition store under <date>, then clear it
-            // (same schema, 0 rows) so the next day starts fresh.
-            let table = require_arg(&tokens, 1, "rollover <table> <date> [root]")?;
-            let date = require_arg(&tokens, 2, "rollover <table> <date> [root]")?;
+            // rollover <table> [date] [root] — freeze the hot (today/in-memory)
+            // table into the cold partition store under <date> (default: the
+            // current UTC date key), then clear it (same schema, 0 rows) so
+            // the next day starts fresh.
+            let table = require_arg(&tokens, 1, "rollover <table> [date] [root]")?;
+            let date = optional_arg(&tokens, 2).map(str::to_string).unwrap_or_else(today_key);
             let root = optional_arg(&tokens, 3).unwrap_or("hdb");
             let batches = ctx.sql(&format!("SELECT * FROM {table}")).await?;
             let Some(first) = batches.first() else {
@@ -931,7 +932,7 @@ async fn run(
                 return Ok(Action::Continue);
             }
             let hdb = HdbStore::new(root);
-            let n = hdb.write_table(date, table, &all)?;
+            let n = hdb.write_table(&date, table, &all)?;
             let empty = RecordBatch::new_empty(first.schema());
             ctx.register_batches(table, empty.schema(), vec![empty])?;
             println!(
@@ -1029,14 +1030,14 @@ async fn run(
             let table2 = table.clone();
             let root2 = root.clone();
             tokio::spawn(async move {
-                let mut date_key = chrono::Utc::now().format("%Y.%m.%d").to_string();
+                let mut date_key = today_key();
                 let mut last_rows = 0usize;
                 let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval.max(1)));
                 // first tick fires immediately; skip it.
                 ticker.tick().await;
                 loop {
                     ticker.tick().await;
-                    let today = chrono::Utc::now().format("%Y.%m.%d").to_string();
+                    let today = today_key();
                     if today != date_key {
                         // (a) date changed: roll the previous open day into cold storage.
                         match ctx2.sql(&format!("SELECT * FROM {table2}")).await {
@@ -1572,6 +1573,45 @@ async fn drop_named(
     Ok(Action::Continue)
 }
 
+/// UTC date key used for hot/cold rollover (`YYYY.MM.DD`).
+///
+/// Test hook: `GTV_TODAY=YYYY.MM.DD` pins the date for the whole process, or
+/// `GTV_TODAY_FILE=<path>` is re-read on every check (write a new date into
+/// the file to simulate crossing midnight while the REPL stays alive — used by
+/// the CI rollover test). Falls back to the real UTC clock.
+fn today_key() -> String {
+    let from_env = std::env::var("GTV_TODAY").ok().filter(|s| !s.trim().is_empty());
+    let from_file = std::env::var("GTV_TODAY_FILE")
+        .ok()
+        .filter(|p| !p.trim().is_empty())
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    if let Some(d) = from_env.or(from_file) {
+        if is_date_key(&d) {
+            return d;
+        }
+        eprintln!("today_key: ignoring malformed override `{d}` (expected YYYY.MM.DD)");
+    }
+    chrono::Utc::now().format("%Y.%m.%d").to_string()
+}
+
+/// True when `s` looks like a `YYYY.MM.DD` partition key.
+fn is_date_key(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 10
+        && b[0].is_ascii_digit()
+        && b[1].is_ascii_digit()
+        && b[2].is_ascii_digit()
+        && b[3].is_ascii_digit()
+        && b[4] == b'.'
+        && b[5].is_ascii_digit()
+        && b[6].is_ascii_digit()
+        && b[7] == b'.'
+        && b[8].is_ascii_digit()
+        && b[9].is_ascii_digit()
+}
+
 /// DataFusion table functions that have no KernelPlan fast path, callable as
 /// bare `fn(args)` shorthands in HFT mode.
 const DF_TABLE_FNS: &[&str] = &[
@@ -1700,9 +1740,10 @@ fn print_help() {
          \x20 hdb_save <table> <date> [root]  persist table to HDB partitions\n\
          \x20 hdb_load <table> <date> <sym> [root]  read one HDB partition\n\
          \x20 hdb_scan <table> <start> <end> [sym] [root]  scan HDB date range\n\
-         \x20 rollover <table> <date> [root]  freeze today's hot table into a cold partition\n\
+         \x20 rollover <table> [date] [root]  freeze today's hot table into a cold partition\n\
          \x20 hc_load <dst> <src> <from> <to> [--sym X] [--root DIR]  hot+cold range view (sorted by t)\n\
          \x20 hdb_flush <table> [root] [secs]  background flush: auto-rollover on date change + checkpoint\n\
+         \x20 (GTV_TODAY / GTV_TODAY_FILE override the UTC date key — CI day-rollover test hook)\n\
          \x20 tt <table> <T>        time-travel: table snapshot as-of T\n\
          \x20 pattern [T]           temporal pattern matching (ring/path/diamond)\n\
          \x20 delta                 LSM delta buffer insert + compaction demo\n\
