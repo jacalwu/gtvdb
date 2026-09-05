@@ -104,8 +104,10 @@ SQL 範例(tick → 日 bar,資料需按 ts 升冪):
   (DataFusion 純 SQL 做 kNN 較勉強 → 新 table fn 走 registry-by-name,
   與現有 `knn/ohlc/var_historical` 同模式。)
 
-**後續(Phase B)**:logistic / 加權投票;回報 walk-forward hit-rate 與
-calibration(分桶 p vs 實際漲率),p≥70% 的桶實際命中率不足時調 threshold。
+**後續(Phase B)**: ✅ 已实现 walk-forward 校准与 threshold 建议
+(`fwd_walk` 严格 past-only 回放 + `stock_calib.sh` 分桶 p vs 實際漲率、
+方向命中率×門檻表,自动建议阈值;HK.00700 H=10 实测建议 ≥0.75 → 68% 命中/
+281 信号)。可選:logistic / 加權投票、多股聚合。
 
 ---
 
@@ -191,11 +193,11 @@ calibration(分桶 p vs 實際漲率),p≥70% 的桶實際命中率不足時調 
 
 ## 11. 里程碑
 
-| 里程碑 | 內容 | 依賴 |
+| 里程碑 | 內容 | 狀態 |
 |---|---|---|
-| **M1** | `yahoo/parquet` 拉資料 → bar 表 → SQL 特徵 → `fwd_proba` table fn(MVP kNN)→ script v1(決策+exit code) | 新增 engine `fwd_proba`;驗證 ohlc/first_value 日線化 |
-| **M2** | leave-one-out hit-rate/calibration 報告 + threshold 自動調整 + 特徵擴充 | M1 |
-| **M3** | 每日排程(cron)+ 提醒(telegram/mail)+ hdb 增量累積(§8) | M1/M2 |
+| **M1** | `yahoo/parquet` 拉資料 → bar 表 → SQL 特徵 → `fwd_proba` table fn(MVP kNN)→ script v1(決策+exit code) | ✅ 已实现(`stock_analysis.sh`,SOURCE=futu 預設) |
+| **M2** | leave-one-out hit-rate/calibration 報告 + threshold 自動調整 + 特徵擴充 | ✅ 已实现 walk-forward 校准(`fwd_walk` + `stock_calib.sh`);logistic/加權可選 |
+| **M3** | 每日排程(cron)+ 提醒(telegram/mail)+ hdb 增量累積(§8) | 待做 |
 
 ---
 

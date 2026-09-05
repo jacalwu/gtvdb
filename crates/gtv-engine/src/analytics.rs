@@ -325,6 +325,232 @@ impl TableFunctionImpl for FwdProbaTableFunction {
     }
 }
 
+// ---------------------------------------------------------------------------
+// fwd_walk(name, horizon, k [, warmup] [, feats]) — walk-forward calibration
+// ---------------------------------------------------------------------------
+
+// Strictly-causal walk-forward twin of [`FwdProbaTableFunction`]: for every
+// bar `p` in `[warmup, m)` it predicts using **only** labelled rows before
+// `p` (neighbours + z-normalisation statistics are recomputed from `[0,p)`),
+// then records the realised outcome. The result is the honest backtest of the
+// historical-analog rule — feed the rows to a calibration/bucketing layer
+// (see `stock_calib.sh`) to obtain hit-rate by confidence bucket and a
+// threshold suggestion.
+
+fn walk_output_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("t", DataType::Int64, false),
+        Field::new("close", DataType::Float64, false),
+        Field::new("p_up", DataType::Float64, false),
+        Field::new("p_down", DataType::Float64, false),
+        Field::new("up", DataType::Int64, false), // realised: close[t+H] > close[t]
+        Field::new("n_analogs", DataType::Int64, false),
+    ]))
+}
+
+/// z-normalisation statistics (mean, std) of feature rows `[0, p)`.
+fn z_stats(feats: &[Vec<f64>]) -> (Vec<f64>, Vec<f64>) {
+    let d = feats.first().map_or(0, |r| r.len());
+    let n = feats.len() as f64;
+    let mut mean = vec![0.0f64; d];
+    for r in feats {
+        for (j, v) in r.iter().enumerate() {
+            mean[j] += v;
+        }
+    }
+    if n > 0.0 {
+        for v in mean.iter_mut() {
+            *v /= n;
+        }
+    }
+    let mut std = vec![0.0f64; d];
+    for r in feats {
+        for (j, v) in r.iter().enumerate() {
+            let z = v - mean[j];
+            std[j] += z * z;
+        }
+    }
+    for v in std.iter_mut() {
+        *v = (*v / n.max(1.0)).sqrt();
+        if *v == 0.0 {
+            *v = 1.0;
+        }
+    }
+    (mean, std)
+}
+
+fn z_apply(feats: &[Vec<f64>], mean: &[f64], std: &[f64]) -> Vec<Vec<f64>> {
+    feats
+        .iter()
+        .map(|r| {
+            r.iter()
+                .zip(mean.iter().zip(std.iter()))
+                .map(|(v, (m, s))| (v - m) / s)
+                .collect()
+        })
+        .collect()
+}
+
+/// Walk-forward prediction rows: `(t, close, p_up, p_down, up, n_analogs)`.
+fn walk_compute(
+    times: Vec<i64>,
+    closes: Vec<f64>,
+    feats: Vec<Vec<f64>>,
+    horizon: usize,
+    k: usize,
+    warmup: usize,
+) -> Result<RecordBatch> {
+    let n = closes.len();
+    if n < horizon + 2 {
+        return Err(DataFusionError::Execution(format!(
+            "fwd_walk: need > {horizon}+1 bars (got {n})"
+        )));
+    }
+    let m = n - horizon; // labelled rows [0, m)
+    let labels: Vec<bool> = (0..m).map(|i| closes[i + horizon] > closes[i]).collect();
+    let warm = warmup.clamp(1, m.saturating_sub(1));
+    let k = k.max(1);
+
+    let mut t = Vec::new();
+    let mut close = Vec::new();
+    let mut p_up = Vec::new();
+    let mut p_down = Vec::new();
+    let mut up = Vec::new();
+    let mut n_analogs = Vec::new();
+
+    for p in warm..m {
+        // Training set = labelled rows strictly before p, recomputed each step
+        // so the exercise is fully causal (no future leakage).
+        let (mean, std) = z_stats(&feats[..p]);
+        let scaled = z_apply(&feats[..p], &mean, &std);
+        let q = {
+            let mut v = Vec::with_capacity(feats[p].len());
+            for (x, (m_, s)) in feats[p].iter().zip(mean.iter().zip(std.iter())) {
+                v.push((x - m_) / s);
+            }
+            v
+        };
+        let mut dists: Vec<(f64, usize)> = (0..p)
+            .map(|j| (sq_dist(&scaled[j], &q), j))
+            .collect();
+        dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        let used = dists.len().min(k);
+        let ups = dists[..used].iter().filter(|(_, j)| labels[*j]).count();
+        let pu = ups as f64 / used as f64;
+        let pd = (used - ups) as f64 / used as f64;
+        t.push(times[p]);
+        close.push(closes[p]);
+        p_up.push(pu);
+        p_down.push(pd);
+        up.push(labels[p] as i64);
+        n_analogs.push(used as i64);
+    }
+
+    if t.is_empty() {
+        return Err(DataFusionError::Execution(format!(
+            "fwd_walk: warmup {warm} leaves no rows to evaluate (m={m})"
+        )));
+    }
+    RecordBatch::try_new(
+        walk_output_schema(),
+        vec![
+            Arc::new(Int64Array::from(t)) as ArrayRef,
+            Arc::new(Float64Array::from(close)) as ArrayRef,
+            Arc::new(Float64Array::from(p_up)) as ArrayRef,
+            Arc::new(Float64Array::from(p_down)) as ArrayRef,
+            Arc::new(Int64Array::from(up)) as ArrayRef,
+            Arc::new(Int64Array::from(n_analogs)) as ArrayRef,
+        ],
+    )
+    .map_err(|e| DataFusionError::Execution(format!("fwd_walk output: {e}")))
+}
+
+/// `fwd_walk(name, horizon, k [, warmup] [, feats])` table function.
+#[derive(Debug)]
+pub struct FwdWalkTableFunction {
+    registry: Arc<RwLock<HftRegistry>>,
+}
+
+impl FwdWalkTableFunction {
+    pub fn new(registry: Arc<RwLock<HftRegistry>>) -> Self {
+        Self { registry }
+    }
+}
+
+impl TableFunctionImpl for FwdWalkTableFunction {
+    fn call_with_args(
+        &self,
+        args: TableFunctionArgs,
+    ) -> Result<Arc<dyn datafusion::datasource::TableProvider>> {
+        let exprs = args.exprs();
+        let name = expr_to_string(exprs.first().ok_or_else(|| {
+            DataFusionError::Execution("fwd_walk(name, horizon, k [, warmup] [, feats]): missing name".into())
+        })?)?;
+        let horizon = expr_to_i64(exprs.get(1).ok_or_else(|| {
+            DataFusionError::Execution("fwd_walk: missing horizon".into())
+        })?)?
+        .max(1) as usize;
+        let k = expr_to_i64(exprs.get(2).ok_or_else(|| {
+            DataFusionError::Execution("fwd_walk: missing k".into())
+        })?)?
+        .max(1) as usize;
+
+        let reg = self.registry.read().map_err(|_| {
+            DataFusionError::Execution("hft registry poisoned".into())
+        })?;
+        let batches = reg.tables.get(&name).ok_or_else(|| {
+            DataFusionError::Execution(format!("fwd_walk: unknown table `{name}`"))
+        })?;
+        let batches: Vec<RecordBatch> = batches.iter().cloned().collect();
+        drop(reg);
+
+        let times = pick_i64(&batches, &["t", "ts", "time", "ts_us"], "time")?;
+        let closes = pick_f64(&batches, &["close", "price", "adjclose"], "close/price")?;
+        if times.len() != closes.len() || times.is_empty() {
+            return Err(DataFusionError::Execution(format!(
+                "fwd_walk: table `{name}` is empty or columns are ragged"
+            )));
+        }
+        let warmup = match exprs.get(3) {
+            Some(e) => expr_to_i64(e)?.max(1) as usize,
+            None => (k.max(2) * 10).max(20), // default warm-up ≈ 20 (or k*10) past bars
+        };
+        let feats = match exprs.get(4) {
+            Some(fe) => {
+                let csv = expr_to_string(fe)?;
+                let names: Vec<String> = csv
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if names.is_empty() {
+                    auto_features(&closes)
+                } else {
+                    let mut feats = vec![Vec::with_capacity(names.len()); closes.len()];
+                    for fn_ in &names {
+                        let col = col_f64(&batches, fn_)?;
+                        if col.len() != closes.len() {
+                            return Err(DataFusionError::Execution(format!(
+                                "fwd_walk: column `{fn_}` length {} != rows {}",
+                                col.len(),
+                                closes.len()
+                            )));
+                        }
+                        for (i, v) in col.into_iter().enumerate() {
+                            feats[i].push(v);
+                        }
+                    }
+                    feats
+                }
+            }
+            None => auto_features(&closes),
+        };
+
+        let out = walk_compute(times, closes, feats, horizon, k, warmup)?;
+        Ok(Arc::new(MemTable::try_new(out.schema(), vec![vec![out]])?))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -345,6 +571,27 @@ mod tests {
         assert!(pu > pd, "p_up={pu} should exceed p_down={pd} on a rising series");
         assert!(pu >= 0.5);
         assert_eq!(cols[4].as_ref().len(), 1);
+    }
+
+
+    #[test]
+    fn walk_on_rising_series_is_fully_up_and_causal() {
+        // Strictly rising closes: every walk-forward bar has only up-labelled
+        // history, so p_up == 1 and every prediction is correct.
+        let n = 120;
+        let horizon = 3usize;
+        let times: Vec<i64> = (0..n as i64).collect();
+        let closes: Vec<f64> = (0..n).map(|i| 100.0 + i as f64).collect();
+        let feats = auto_features(&closes);
+        let batch = walk_compute(times, closes, feats, horizon, 5, 30).unwrap();
+        let cols = batch.columns();
+        let pu = as_primitive_array::<Float64Type>(cols[2].as_ref());
+        let up = as_primitive_array::<Int64Type>(cols[4].as_ref());
+        assert_eq!(up.len(), 120 - horizon - 30);
+        for i in 0..up.len() {
+            assert_eq!(pu.value(i), 1.0, "row {i}: p_up must be 1 on pure uptrend");
+            assert_eq!(up.value(i), 1);
+        }
     }
 
     #[test]

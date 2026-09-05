@@ -1714,6 +1714,7 @@ const DF_TABLE_FNS: &[&str] = &[
     "ticks",
     "market_ticks",
     "fwd_proba",
+    "fwd_walk",
 ];
 
 /// Read a data file, auto-detecting CSV vs Parquet by extension.
@@ -1816,6 +1817,7 @@ fn print_help() {
          \x20                       [--max N] [--adjust qfq]  fetch K-lines -> session table\n\
          \x20 md ticks  <provider> <table> <code...> [--max N]  fetch ticks -> session table\n\
          \x20 fwd_proba('<table>',H,K[,feats])  P(up/down) over next H bars (historical analog)\n\
+         \x20 fwd_walk('<table>',H,K[,warmup][,feats])  strict walk-forward rows (calibration)\n\
          \x20 klines('provider','code',...) / ticks('provider','code')  direct fetch (see providers)\n\
          \x20 neighbors <node> [T]  temporal neighbors at time T (default 0)\n\
          \x20 khop <node> <k> [T]   k-hop traversal at time T\n\

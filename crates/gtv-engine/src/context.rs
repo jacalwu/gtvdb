@@ -86,6 +86,10 @@ impl GtvContext {
                 "fwd_proba",
                 Arc::new(crate::analytics::FwdProbaTableFunction::new(hft_reg.clone())),
             );
+            ctx.register_udtf(
+                "fwd_walk",
+                Arc::new(crate::analytics::FwdWalkTableFunction::new(hft_reg.clone())),
+            );
         }
         Self {
             ctx,
