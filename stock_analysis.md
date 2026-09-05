@@ -108,7 +108,10 @@ SQL 範例(tick → 日 bar,資料需按 ts 升冪):
 **後續(Phase B)**: ✅ 已实现 walk-forward 校准与 threshold 建议
 (`fwd_walk` 严格 past-only 回放 + `stock_calib.sh` 分桶 p vs 實際漲率、
 方向命中率×門檻表,自动建议阈值;HK.00700 H=10 实测建议 ≥0.75 → 68% 命中/
-281 信号)。可選:logistic / 加權投票、多股聚合。
+281 信号)。✅ as-of 回归测试(`fwd_regress` + `stock_regress.sh`):指定过去
+任一日为决策日→预测方向与价格波动区间,再与真实未来比对方向命中/区间
+覆盖率/收益偏差,判断算法是否合理(HK.00700 12 个月度 as-of 实测:方向命中
+66.7%、band 覆盖 83.3%)。可選:logistic / 加權投票、多股聚合。
 
 ---
 
@@ -212,6 +215,7 @@ SQL 範例(tick → 日 bar,資料需按 ts 升冪):
 | 冷層每日累積(`hdb_flush` + `hc_load`) | 既有(M1 已完成) | 直接用 |
 | 統一 provider 拉數(`klines('futu',…)` / REPL `md klines`) | market 框架 | ✅ 已实现(`market/` + `main.rs` `md` 命令) |
 | `stock_analysis.sh`(SOURCE=futu 預設) | shell | ✅ 已实现(見 §7;退出碼 0/1/3) |
+| as-of 回归测试:`fwd_regress(name,asof_ns,H,k[,feats])` + `stock_regress.sh` | engine table fn + shell | ✅ 已实现(单/多 as-of 日期,输出方向命中、band 覆盖率、收益偏差) |
 
 附錄 B:範例輸出(目標格式)
 

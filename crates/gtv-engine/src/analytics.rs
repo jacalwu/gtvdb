@@ -551,6 +551,264 @@ impl TableFunctionImpl for FwdWalkTableFunction {
     }
 }
 
+// ---------------------------------------------------------------------------
+// fwd_regress(name, asof_ns, horizon, k [, feats]) — as-of date regression test
+// ---------------------------------------------------------------------------
+
+const DAY_NS: i64 = 86_400_000_000_000;
+
+fn pct(sorted: &[f64], p: f64) -> f64 {
+    if sorted.is_empty() {
+        return f64::NAN;
+    }
+    let idx = ((p * (sorted.len() - 1) as f64).round() as usize).min(sorted.len() - 1);
+    sorted[idx]
+}
+
+fn regress_output_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("t", DataType::Int64, false),            // decision bar ts
+        Field::new("close", DataType::Float64, false),      // decision bar close
+        Field::new("p_up", DataType::Float64, false),
+        Field::new("p_down", DataType::Float64, false),
+        Field::new("n_analogs", DataType::Int64, false),
+        // predicted forward range (ratios: +0.05 == +5%) over next H bars
+        Field::new("pred_lo", DataType::Float64, false),
+        Field::new("pred_hi", DataType::Float64, false),
+        Field::new("pred_ret", DataType::Float64, false),
+        // realised path after the decision bar
+        Field::new("act_lo", DataType::Float64, false),
+        Field::new("act_hi", DataType::Float64, false),
+        Field::new("act_ret", DataType::Float64, false),
+        Field::new("up", DataType::Int64, false),           // 1 up / 0 down / -1 future missing
+        Field::new("n_future", DataType::Int64, false),     // realised bars available (< H if partial)
+    ]))
+}
+
+/// As-of regression: treat `asof` (a calendar day, ns) as the decision date.
+/// Only bars on/before that day are used to score the last one; the forecast
+/// (direction + range band) is then compared with the realised next-H path.
+fn regress_compute(
+    times: Vec<i64>,
+    closes: Vec<f64>,
+    feats: Vec<Vec<f64>>,
+    asof_ns: i64,
+    horizon: usize,
+    k: usize,
+) -> Result<RecordBatch> {
+    let n = closes.len();
+    if n < 2 {
+        return Err(DataFusionError::Execution(
+            "fwd_regress: table is empty".into(),
+        ));
+    }
+    // prefix = bars within the as-of calendar day (ts < asof + 1 day, so both
+    // Futu's UTC-midnight labels and Yahoo's exchange-midnight labels count).
+    let cut = asof_ns.saturating_add(DAY_NS);
+    let e = match times.iter().position(|&t| t >= cut) {
+        Some(i) => i.saturating_sub(1),
+        None => n - 1,
+    };
+    if times[e] >= cut {
+        return Err(DataFusionError::Execution(format!(
+            "fwd_regress: asof {} is before the first bar",
+            asof_ns
+        )));
+    }
+    let p = e + 1; // prefix length
+    if p < horizon + 2 {
+        return Err(DataFusionError::Execution(format!(
+            "fwd_regress: asof leaves only {p} bars (need > {}), too early",
+            horizon + 1
+        )));
+    }
+    let m = p - horizon; // labelled rows within prefix
+    let labels: Vec<bool> = (0..m).map(|i| closes[i + horizon] > closes[i]).collect();
+    let k = k.max(1);
+
+    // z-normalise over the labelled prefix and score the decision bar (= last
+    // bar of the prefix), mirroring fwd_proba but with no post-asof data.
+    let (mean, std) = z_stats(&feats[..m]);
+    let scaled = z_apply(&feats[..m], &mean, &std);
+    let q: Vec<f64> = feats[p - 1]
+        .iter()
+        .zip(mean.iter().zip(std.iter()))
+        .map(|(v, (mu, s))| (v - mu) / s)
+        .collect();
+    let mut dists: Vec<(f64, usize)> = (0..m)
+        .map(|j| (sq_dist(&scaled[j], &q), j))
+        .collect();
+    dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let used = dists.len().min(k);
+    let ups = dists[..used].iter().filter(|(_, j)| labels[*j]).count();
+    let p_up = ups as f64 / used as f64;
+    let p_down = (used - ups) as f64 / used as f64;
+
+    // Forward range forecast from the same neighbours: each analog day's
+    // realised path over the following H bars, relative to its own close.
+    let mut lows = Vec::with_capacity(used);
+    let mut highs = Vec::with_capacity(used);
+    let mut hrets = Vec::with_capacity(used);
+    for (_, j) in dists[..used].iter() {
+        let base = closes[*j];
+        if base <= 0.0 {
+            continue;
+        }
+        let mut lo = f64::INFINITY;
+        let mut hi = f64::NEG_INFINITY;
+        for h in 1..=horizon {
+            let r = closes[j + h] / base - 1.0;
+            lo = lo.min(r);
+            hi = hi.max(r);
+        }
+        lows.push(lo);
+        highs.push(hi);
+        hrets.push(closes[j + horizon] / base - 1.0);
+    }
+    lows.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    highs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    hrets.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let pred_lo = if lows.is_empty() { f64::NAN } else { pct(&lows, 0.10) };
+    let pred_hi = if highs.is_empty() { f64::NAN } else { pct(&highs, 0.90) };
+    let pred_ret = if hrets.is_empty() {
+        f64::NAN
+    } else {
+        hrets.iter().sum::<f64>() / hrets.len() as f64
+    };
+
+    // Realised path after the decision bar.
+    let n_future = (n - 1 - e).min(horizon) as i64;
+    let (act_lo, act_hi, act_ret, up) = if n_future > 0 {
+        let base = closes[e];
+        let mut lo = f64::INFINITY;
+        let mut hi = f64::NEG_INFINITY;
+        for h in 1..=(n_future as usize) {
+            let r = closes[e + h] / base - 1.0;
+            lo = lo.min(r);
+            hi = hi.max(r);
+        }
+        let full = n_future as usize == horizon;
+        let ret = closes[e + n_future as usize] / base - 1.0;
+        let up = if full {
+            if ret > 0.0 { 1 } else { 0 }
+        } else {
+            -1
+        };
+        (lo, hi, ret, up)
+    } else {
+        (f64::NAN, f64::NAN, f64::NAN, -1)
+    };
+
+    RecordBatch::try_new(
+        regress_output_schema(),
+        vec![
+            Arc::new(Int64Array::from(vec![times[e]])) as ArrayRef,
+            Arc::new(Float64Array::from(vec![closes[e]])) as ArrayRef,
+            Arc::new(Float64Array::from(vec![p_up])) as ArrayRef,
+            Arc::new(Float64Array::from(vec![p_down])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![used as i64])) as ArrayRef,
+            Arc::new(Float64Array::from(vec![pred_lo])) as ArrayRef,
+            Arc::new(Float64Array::from(vec![pred_hi])) as ArrayRef,
+            Arc::new(Float64Array::from(vec![pred_ret])) as ArrayRef,
+            Arc::new(Float64Array::from(vec![act_lo])) as ArrayRef,
+            Arc::new(Float64Array::from(vec![act_hi])) as ArrayRef,
+            Arc::new(Float64Array::from(vec![act_ret])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![up])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![n_future])) as ArrayRef,
+        ],
+    )
+    .map_err(|e| DataFusionError::Execution(format!("fwd_regress output: {e}")))
+}
+
+/// `fwd_regress(name, asof_ns, horizon, k [, feats])` table function — as-of
+/// regression test (one decision bar per call). `asof_ns` is an epoch-ns
+/// calendar-day anchor; bars on/before that day are the training prefix.
+#[derive(Debug)]
+pub struct FwdRegressTableFunction {
+    registry: Arc<RwLock<HftRegistry>>,
+}
+
+impl FwdRegressTableFunction {
+    pub fn new(registry: Arc<RwLock<HftRegistry>>) -> Self {
+        Self { registry }
+    }
+}
+
+impl TableFunctionImpl for FwdRegressTableFunction {
+    fn call_with_args(
+        &self,
+        args: TableFunctionArgs,
+    ) -> Result<Arc<dyn datafusion::datasource::TableProvider>> {
+        let exprs = args.exprs();
+        let name = expr_to_string(exprs.first().ok_or_else(|| {
+            DataFusionError::Execution(
+                "fwd_regress(name, asof_ns, horizon, k [, feats]): missing name".into(),
+            )
+        })?)?;
+        let asof_ns = expr_to_i64(exprs.get(1).ok_or_else(|| {
+            DataFusionError::Execution("fwd_regress: missing asof_ns".into())
+        })?)?;
+        let horizon = expr_to_i64(exprs.get(2).ok_or_else(|| {
+            DataFusionError::Execution("fwd_regress: missing horizon".into())
+        })?)?
+        .max(1) as usize;
+        let k = expr_to_i64(exprs.get(3).ok_or_else(|| {
+            DataFusionError::Execution("fwd_regress: missing k".into())
+        })?)?
+        .max(1) as usize;
+
+        let reg = self.registry.read().map_err(|_| {
+            DataFusionError::Execution("hft registry poisoned".into())
+        })?;
+        let batches = reg.tables.get(&name).ok_or_else(|| {
+            DataFusionError::Execution(format!("fwd_regress: unknown table `{name}`"))
+        })?;
+        let batches: Vec<RecordBatch> = batches.iter().cloned().collect();
+        drop(reg);
+
+        let times = pick_i64(&batches, &["t", "ts", "time", "ts_us"], "time")?;
+        let closes = pick_f64(&batches, &["close", "price", "adjclose"], "close/price")?;
+        if times.len() != closes.len() || times.is_empty() {
+            return Err(DataFusionError::Execution(format!(
+                "fwd_regress: table `{name}` is empty or columns are ragged"
+            )));
+        }
+        let feats = match exprs.get(4) {
+            Some(fe) => {
+                let csv = expr_to_string(fe)?;
+                let names: Vec<String> = csv
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if names.is_empty() {
+                    auto_features(&closes)
+                } else {
+                    let mut feats = vec![Vec::with_capacity(names.len()); closes.len()];
+                    for fn_ in &names {
+                        let col = col_f64(&batches, fn_)?;
+                        if col.len() != closes.len() {
+                            return Err(DataFusionError::Execution(format!(
+                                "fwd_regress: column `{fn_}` length {} != rows {}",
+                                col.len(),
+                                closes.len()
+                            )));
+                        }
+                        for (i, v) in col.into_iter().enumerate() {
+                            feats[i].push(v);
+                        }
+                    }
+                    feats
+                }
+            }
+            None => auto_features(&closes),
+        };
+
+        let out = regress_compute(times, closes, feats, asof_ns, horizon, k)?;
+        Ok(Arc::new(MemTable::try_new(out.schema(), vec![vec![out]])?))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -592,6 +850,52 @@ mod tests {
             assert_eq!(pu.value(i), 1.0, "row {i}: p_up must be 1 on pure uptrend");
             assert_eq!(up.value(i), 1);
         }
+    }
+
+
+    #[test]
+    fn regress_rising_series_asof_matches_actual() {
+        // Strictly rising closes, as-of in the middle: forecast must be up
+        // (p_up == 1) and the realised path must sit inside the band.
+        let n = 120;
+        let horizon = 3usize;
+        let base = 1_700_000_000_000_000_000i64;
+        let times: Vec<i64> = (0..n as i64).map(|i| base + i * DAY_NS).collect();
+        let closes: Vec<f64> = (0..n).map(|i| 100.0 + i as f64).collect();
+        let feats = auto_features(&closes);
+        // asof = bar 90 -> 90 bars in prefix, next 3 bars available as future.
+        let batch = regress_compute(times, closes, feats, base + 90 * DAY_NS, horizon, 5).unwrap();
+        let cols = batch.columns();
+        let f = |i: usize| as_primitive_array::<Float64Type>(cols[i].as_ref()).value(0);
+        let u = as_primitive_array::<Int64Type>(cols[11].as_ref()).value(0);
+        let nf = as_primitive_array::<Int64Type>(cols[12].as_ref()).value(0);
+        assert_eq!(u, 1, "pure uptrend must realise up");
+        assert_eq!(nf, 3);
+        assert_eq!(f(2), 1.0); // p_up == 1
+        // cols: 5 pred_lo, 6 pred_hi, 7 pred_ret, 8 act_lo, 9 act_hi, 10 act_ret
+        assert!(f(7) > 0.0, "pred_ret positive on uptrend");
+        assert!(f(5) > 0.0 && f(6) > 0.0 && f(8) > 0.0 && f(9) > 0.0);
+        // Analog forecasts lag a deterministic drift by a couple of ticks
+        // (neighbour baselines sit a few bars earlier); allow small tolerance.
+        let tol = 0.02;
+        assert!(f(8) >= f(5) - tol && f(9) <= f(6) + tol, "actual ~inside band");
+        assert!((f(10) - f(7)).abs() < 1e-3, "predicted H-ret ~ actual on pure drift");
+    }
+
+    #[test]
+    fn regress_without_future_reports_up_minus_one() {
+        let n = 12;
+        let horizon = 10usize;
+        let base = 1_700_000_000_000_000_000i64;
+        let times: Vec<i64> = (0..n as i64).map(|i| base + i * DAY_NS).collect();
+        let closes: Vec<f64> = (0..n).map(|i| 100.0 + i as f64).collect();
+        let feats = auto_features(&closes);
+        let batch = regress_compute(times, closes, feats, base + 11 * DAY_NS, horizon, 5).unwrap(); // no future bars
+        let cols = batch.columns();
+        let u = as_primitive_array::<Int64Type>(cols[11].as_ref()).value(0);
+        let nf = as_primitive_array::<Int64Type>(cols[12].as_ref()).value(0);
+        assert_eq!(u, -1);
+        assert_eq!(nf, 0);
     }
 
     #[test]

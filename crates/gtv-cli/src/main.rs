@@ -1715,6 +1715,7 @@ const DF_TABLE_FNS: &[&str] = &[
     "market_ticks",
     "fwd_proba",
     "fwd_walk",
+    "fwd_regress",
 ];
 
 /// Read a data file, auto-detecting CSV vs Parquet by extension.
