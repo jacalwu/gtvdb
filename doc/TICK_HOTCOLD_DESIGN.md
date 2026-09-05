@@ -49,8 +49,10 @@ tick 資料的生命週期極不均勻:
 
 1. **當天**:`live`(LSE 串流)/ `loadcsv` / `bgload` 寫入本機表(沿用現有
    `register_batches` + GTV_HOME catalog 做 crash 後重建)。
-2. **定期或換日 rollover**:把當天表整批寫成 immutable 歷史 partition,寫完
-   更新 manifest,再開新當天表。
+2. **換日 rollover**:把當天表整批寫成 immutable 歷史 partition,寫完
+   更新 manifest,再開新當天表。觸發見 §10 Q2:偵測到 UTC 日期鍵改變即自動
+   flush(以現有 `hdb_flush` 背景 task 為基底),另提供手動 `rollover` 指令
+   立即封存。
    - 現有 `hdb_flush` 背景 task 已做「定時 flush」;只差「換日時清空當天表並
      指到新日期」與「flush 到遠端 root」。
 3. **當天資料易失性**:可接受數秒行情損失 → 不需 WAL;要零損失再引入
@@ -71,7 +73,9 @@ tick 資料的生命週期極不均勻:
     __all.parquet          # 無 symbol 欄位時單檔(或 * 符號)
 ```
 
-**manifest**(每 table 一個,TSV,和 catalog.tsv/tc_duration 同風格,免新 dependency):
+**manifest**(每 table 一個,TSV,和 catalog.tsv/tc_duration 同風格,免新
+dependency)。**定位:derived 的索引/驗證物,不是 layout 的唯一事實來源**
+(目錄樹才是,見 §10 Q3):
 
 ```
 # gtv history manifest v1  table=trade  schema_sha=…  sorted_by=t
@@ -156,9 +160,44 @@ read routing(#15):當天=leader 強一致;歷史 immutable → follower/快取�
 
 ---
 
-## 10. 開放問題
+## 10. 開放問題 → 決策記錄(已定案)
 
-- 當天表要「一檔多表名」共用嗎(同一天多個來源,如 MCO+NVDA+TSLA 各一表)?
-- rollover 觸發:UTC 0 點 / exchange 收盤 / 手動 `rollover` 指令,哪種為主?
-- 遠端 root 直接用現有 HdbStore layout,還是 M2 就換成 manifest 驅動的目錄
-  (決定 manifest 是否反向成為 layout 的唯一事實來源)?
+**Q1. 當天表是否「多來源共表」?(如 MCO+NVDA+TSLA 併成一張當天表)**
+
+**決定:不共用,每個來源/每個 table name 各自一張當天表**;熱冷分層是
+per-table 的。理由:
+
+- SQL/算子/HFT registry(`tick_to_trade('mco')` 依名字查表)都建立在「表名」上,
+  併表會破壞名字→資料的對應;
+- 多 symbol 來源本來就自帶 `sym` 欄位,冷層也依 sym 拆檔,不需要跨表合併;
+- 若要跨來源一起看,用查詢期 view(SELECT ... UNION)即可,那是讀端的事,
+  不是儲存層該決定的。
+
+**Q2. rollover 觸發時機(UTC 0 點 / exchange 收盤 / 手動)?**
+
+**決定:日期鍵改變自動 + 手動兜底,預設 UTC 日期鍵。**
+
+- 熱層每個 table 記一個 `date_key`(= partition 日期);當「下一次寫入或定時
+  tick」偵測到本地 UTC 日期 ≠ `date_key` 時,先把舊日期當天表 flush 成
+  immutable partition 再繼續寫新日期(先寫後寫皆可,寫完再開新表);
+- 提供手動 `rollover <table>`(或 `rollover all`)立即封存,供測試/收盤後立刻
+  落盤;`hdb_flush` 背景定時 flush 保留為「未換日也定期落盤」的保險;
+- exchange 收盤行事曆**不做進 M1**:日期鍵預設 UTC,可被 `GTV_TZ` 環境變數
+  覆寫;M4 分散化後再引入交易日曆。
+
+**Q3. 遠端 root 用現有 HdbStore layout,還是 manifest 反過來當唯一事實來源?**
+
+**決定:layout(目錄樹)是唯一事實來源;manifest 是 derived(可重建的索引/驗證物),不是**
+
+- M1/M2 沿用 `HdbStore` layout:`<root>/<date>/<table>/<sym>.parquet`,kdb 風格
+  ——「目錄本身即 catalog」,掃目錄就能列出有哪些 partition,不需 metadata 先存在;
+- manifest v1(#16)定位為**派生的快取/驗證層**:schema_sha(換日與載入前驗證)、
+  sorted_by、rows/bytes/sha256(prune 與拉檔校驗),可隨時由掃描目錄重建;
+  manifest 與目錄不一致時以目錄為準並重建 manifest,而不是拒絕服務;
+- 理由:把 metadata 當 source of truth 會產生第二份狀態、有 drift 風險,
+  而 kdb 幾十年的 HDB 也證明「無 manifest、純目錄」是可靠的。
+
+**仍延後(不阻塞 M1)**:exchange 交易日曆;跨來源 view 語法糖;遠端真正掛上
+S3/MinIO(M3);manifest 成為協調器專用 metadata service 的輸入(#16 主體,
+屆時由服務維護一份真正 authoritative 的 metadata)。
+
