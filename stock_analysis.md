@@ -137,7 +137,7 @@ calibration(分桶 p vs 實際漲率),p≥70% 的桶實際命中率不足時調 
 | 變數 | 預設 | 意義 |
 |---|---|---|
 | `SYMBOL` | (必填/參數) | 股票代碼 |
-| `SOURCE` | `yahoo` | `yahoo`(免key) / `lse`(LSE_API_KEY) / `futu`(OpenD 登入,§2.1) / `parquet`(樣本檔) |
+| `SOURCE` | `futu` | `futu`(OpenD,預設) / `yahoo`(免key) / `parquet`(已存 bars 檔,免重抓) |
 | `RANGE` | `5y` | Yahoo 拉取長度 |
 | `HORIZON` | `10` | 未來交易日(≈2 週) |
 | `K` | `20` | 類比數 |
@@ -203,11 +203,12 @@ calibration(分桶 p vs 實際漲率),p≥70% 的桶實際命中率不足時調 
 
 | 元件 | 類型 | 狀態 |
 |---|---|---|
-| `fwd_proba(name, horizon, k, feats)` | engine table fn(registry-by-name) | **新增** |
-| 日線化 `first/last` 聚合或 `ohlc(name, bucket)` | SQL/既有 | 確認語意後選用 |
-| `stddev` 窗 / lead 窗 | DataFusion 內建 | 確認可用,否則新增小 UDF |
+| `fwd_proba(name, horizon, k, feats)` | engine table fn(registry-by-name) | ✅ 已实现(`analytics.rs`;feats 省略→自动特征 mom5/mom10/vol10/above_sma20) |
+| 日線化 `first/last` 聚合或 `ohlc(name, bucket)` | SQL/既有 | 確認語意後選用(日線源直接可用) |
+| `stddev` 窗 / lead 窗 | DataFusion 內建 | 可用(內置自動特徵已覆蓋) |
 | 冷層每日累積(`hdb_flush` + `hc_load`) | 既有(M1 已完成) | 直接用 |
-| futu JSON → CSV 橋接(`get_snapshot/kline.py` 輸出餵 `loadcsv`) | shell/python 小工具 | **新增(§2.1)** |
+| 統一 provider 拉數(`klines('futu',…)` / REPL `md klines`) | market 框架 | ✅ 已实现(`market/` + `main.rs` `md` 命令) |
+| `stock_analysis.sh`(SOURCE=futu 預設) | shell | ✅ 已实现(見 §7;退出碼 0/1/3) |
 
 附錄 B:範例輸出(目標格式)
 

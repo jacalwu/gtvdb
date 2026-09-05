@@ -1186,6 +1186,80 @@ async fn run(
                 all.len()
             );
         }
+        "md" => {
+            // md klines|ticks <provider> <table> <code...> [flags] — pull market
+            // data through the unified provider framework and register it as a
+            // session table (visible to fwd_proba/hdb/... like fetch/yahoo do).
+            let kind = require_arg(&tokens, 1, "md klines|ticks <provider> <table> <code...>")?.to_lowercase();
+            let provider = require_arg(&tokens, 2, "md klines|ticks <provider> <table> <code...>")?.to_string();
+            let table = require_arg(&tokens, 3, "md klines|ticks <provider> <table> <code...>")?.to_string();
+            let mut codes: Vec<String> = Vec::new();
+            let mut period = "1d".to_string();
+            let mut start = String::new();
+            let mut end = String::new();
+            let mut max = 0usize;
+            let mut adjust = "qfq".to_string();
+            let mut i = 4;
+            while i < tokens.len() {
+                match tokens[i] {
+                    "--period" => {
+                        if let Some(v) = tokens.get(i + 1) { period = v.to_string(); i += 2; } else { i += 1; }
+                    }
+                    "--start" => {
+                        if let Some(v) = tokens.get(i + 1) { start = v.to_string(); i += 2; } else { i += 1; }
+                    }
+                    "--end" => {
+                        if let Some(v) = tokens.get(i + 1) { end = v.to_string(); i += 2; } else { i += 1; }
+                    }
+                    "--max" => {
+                        if let Some(v) = tokens.get(i + 1) { max = v.parse::<usize>().unwrap_or(max); i += 2; } else { i += 1; }
+                    }
+                    "--adjust" => {
+                        if let Some(v) = tokens.get(i + 1) { adjust = v.to_string(); i += 2; } else { i += 1; }
+                    }
+                    _ => { codes.push(tokens[i].to_string()); i += 1; }
+                }
+            }
+            if codes.is_empty() {
+                return Err(anyhow!("md {kind}: need at least one code"));
+            }
+            let rows: usize = match kind.as_str() {
+                "klines" => {
+                    let req = gtv_engine::market::KlineReq {
+                        provider: provider.clone(),
+                        codes: codes.clone(),
+                        period,
+                        start: (!start.is_empty()).then(|| start.clone()),
+                        end: (!end.is_empty()).then(|| end.clone()),
+                        max,
+                        adjust,
+                    };
+                    let batches = gtv_engine::market::fetch_klines(&req)?;
+                    let n: usize = batches.iter().map(|b| b.num_rows()).sum();
+                    if n == 0 {
+                        return Err(anyhow!("md klines: no data for {} (period/range too narrow?)", codes.join(",")));
+                    }
+                    ctx.register_batches(&table, gtv_engine::market::kline_schema(), batches)?;
+                    n
+                }
+                "ticks" => {
+                    let req = gtv_engine::market::TickReq {
+                        provider: provider.clone(),
+                        codes: codes.clone(),
+                        max,
+                    };
+                    let batches = gtv_engine::market::fetch_ticks(&req)?;
+                    let n: usize = batches.iter().map(|b| b.num_rows()).sum();
+                    if n == 0 {
+                        return Err(anyhow!("md ticks: no tick data for {} (market open? provider supports ticks?)", codes.join(",")));
+                    }
+                    ctx.register_batches(&table, gtv_engine::market::tick_schema(), batches)?;
+                    n
+                }
+                other => return Err(anyhow!("md: unknown kind `{other}` (klines|ticks)")),
+            };
+            println!("md {kind}: `{table}` <- {provider}/{} ({} rows)", codes.join(","), rows);
+        }
         "live" => {
             // live <table> <symbol...> — stream LSE ticks into a session table.
             let table = require_arg(&tokens, 1, "live <table> <symbol...>")?.to_string();
@@ -1639,6 +1713,7 @@ const DF_TABLE_FNS: &[&str] = &[
     "market_klines",
     "ticks",
     "market_ticks",
+    "fwd_proba",
 ];
 
 /// Read a data file, auto-detecting CSV vs Parquet by extension.
@@ -1737,7 +1812,11 @@ fn print_help() {
          \x20 help | ?              this help\n\
          \x20 tables                show node/edge tables and price series
          \x20 providers             list registered market providers (futu/yahoo/...)
-         \x20 klines('p','code',...) / ticks('p','code')  fetch market data (see providers)\n\
+         \x20 md klines <provider> <table> <code...> [--period 1d] [--start] [--end]\n\
+         \x20                       [--max N] [--adjust qfq]  fetch K-lines -> session table\n\
+         \x20 md ticks  <provider> <table> <code...> [--max N]  fetch ticks -> session table\n\
+         \x20 fwd_proba('<table>',H,K[,feats])  P(up/down) over next H bars (historical analog)\n\
+         \x20 klines('provider','code',...) / ticks('provider','code')  direct fetch (see providers)\n\
          \x20 neighbors <node> [T]  temporal neighbors at time T (default 0)\n\
          \x20 khop <node> <k> [T]   k-hop traversal at time T\n\
          \x20 mavg <n> / msum <n>   rolling average/sum over the price series\n\
