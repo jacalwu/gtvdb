@@ -21,7 +21,8 @@
 #
 # Env: SYMBOL (positional), SOURCE=futu|yahoo|parquet, PERIOD=1d, ADJUST=qfq,
 #   HORIZON=10, K=20, WARMUP=<auto>, START=<6y back>, END=<today>, FILE=,
-#   REGIME=vol|kmeans, OUT_DIR=./analytics_out, GTV_PROFILE=release
+#   REGIME=vol|kmeans, CAL=<%% of history for calibration fit, 0=off>,
+#   OUT_DIR=./analytics_out, GTV_PROFILE=release
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -37,6 +38,7 @@ HORIZON="${HORIZON:-10}"
 K="${K:-20}"
 WARMUP="${WARMUP:-}"
 REGIME="${REGIME:-vol}"
+CAL="${CAL:-30}"               # 0 = no probability scaling report
 START="${START:-$(date -d '6 years ago' +%F 2>/dev/null || date -v-6y +%F)}"
 END="${END:-$(date +%F)}"
 FILE="${FILE:-}"
@@ -75,7 +77,17 @@ if [ ! -f "$PARQUET_FILE" ] && [ -n "$MD_LINE" ]; then
 fi
 
 WALK_ARGS="'$TBL',$HORIZON,$K"
-[ -n "$WARMUP" ] && WALK_ARGS="'$TBL',$HORIZON,$K,$WARMUP"
+CALF=""
+if [ "$CAL" != "0" ]; then
+  CALF="$(awk "BEGIN{printf \"%.3f\", $CAL/100}")"
+fi
+if [ -n "$CALF" ] && [ -n "$WARMUP" ]; then
+  WALK_ARGS="'$TBL',$HORIZON,$K,$WARMUP,$CALF"
+elif [ -n "$CALF" ]; then
+  WALK_ARGS="'$TBL',$HORIZON,$K,$CALF"
+elif [ -n "$WARMUP" ]; then
+  WALK_ARGS="'$TBL',$HORIZON,$K,$WARMUP"
+fi
 
 {
   echo "load $TBL $PARQUET_FILE"
@@ -83,10 +95,10 @@ WALK_ARGS="'$TBL',$HORIZON,$K"
   echo "quit"
 } | "$BIN" > "$DIAG_LOG" 2>&1 || { echo "gtv diag failed:"; tail -5 "$DIAG_LOG" >&2; exit 1; }
 
-python3 - "$DIAG_LOG" "$SYMBOL" "$HORIZON" "$K" "$REGIME" "$OUT_DIR" <<'PY'
+python3 - "$DIAG_LOG" "$SYMBOL" "$HORIZON" "$K" "$REGIME" "$CAL" "$OUT_DIR" <<'PY'
 import sys, math, statistics
 log = open(sys.argv[1], encoding="utf-8", errors="replace").read()
-sym, H, K, regime, out_dir = sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), sys.argv[5], sys.argv[6]
+sym, H, K, regime, cal, out_dir = sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), sys.argv[5], sys.argv[6], sys.argv[7]
 
 tables, cur = [], None
 for l in log.splitlines():
@@ -105,9 +117,15 @@ hdr, body = tables[-1]
 def col(name): return hdr.index(name)
 R = []
 for cells in body[1:]:
-    R.append({name: float(cells[col(name)]) for name in
-             ["t","close","p_up","p_down","up","n_analogs","actual_ret",
-              "q05","q10","q25","q50","q75","q90","q95","bar_ret","vol20"]})
+    row = {}
+    for name in ["t","close","p_up","p_down","up","n_analogs","actual_ret",
+                 "q05","q10","q25","q50","q75","q90","q95","bar_ret","vol20",
+                 "cal_p_up_iso","cal_p_up_platt"]:
+        try:
+            row[name] = float(cells[col(name)])
+        except (ValueError, IndexError):
+            row[name] = float("nan")
+    R.append(row)
 if not R:
     sys.exit("fwd_walk produced no evaluation rows")
 n = len(R)
@@ -190,6 +208,28 @@ with open(f"{out_dir}/tail_error_stats.csv","w") as f:
         f.write(f"{name},{c},{mae:.6f},{bias:.6f},{q10:.6f},{q90:.6f}\n")
 print("tail errors (pred=q50): " + "; ".join(
     f"{name}: n={c} MAE={pct(mae)} bias={pct(bias)}" for name,c,mae,bias,*_ in tail_rows))
+
+# ---------------- probability scaling comparison (raw vs calibrated) --------
+if cal != "0":
+    test = [r for r in R if math.isfinite(r.get("cal_p_up_iso", float("nan")))]
+    if len(test) >= 30:
+        def ece_brier(rows, key):
+            bins = [[] for _ in range(10)]
+            for r in rows:
+                b = min(9, max(0, int(r[key] * 10)))
+                bins[b].append(r)
+            ece = sum(abs(sum(x["up"] > 0 for x in bb)/len(bb) - sum(x[key] for x in bb)/len(bb))
+                      * len(bb)/len(rows) for bb in bins if bb)
+            brier = sum((r[key] - (1.0 if r["up"] > 0 else 0.0))**2 for r in rows)/len(rows)
+            return ece, brier
+        print("\nprobability scaling (on causal hold-out, n=%d):" % len(test))
+        print(f"  {'method':<10}{'ECE':>8}{'Brier':>9}{'p@0.75 hit':>12}")
+        for name, key in [("raw", "p_up"), ("isotonic", "cal_p_up_iso"), ("platt", "cal_p_up_platt")]:
+            e, b = ece_brier(test, key)
+            strong = [r for r in test if max(r[key], 1.0 - r[key]) >= 0.75]
+            hit = ("-" if not strong else
+                   f"{sum(((r[key] >= 0.5)) == (r['up'] > 0) for r in strong) / len(strong) * 100:.0f}%")
+            print(f"  {name:<10}{e*100:>7.1f}%{b:>9.4f}{hit:>12}  (n_sig={len(strong)})")
 
 # ---------------- 4) regime performance --------------------------------------
 def kmeans(rows, k=3, iters=40):

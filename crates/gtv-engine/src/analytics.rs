@@ -32,6 +32,8 @@ use arrow::record_batch::RecordBatch;
 use datafusion::catalog::{TableFunctionArgs, TableFunctionImpl};
 use datafusion::datasource::MemTable;
 use datafusion::error::{DataFusionError, Result};
+use datafusion::logical_expr::Expr;
+use datafusion::scalar::ScalarValue;
 
 use crate::expr_util::{expr_to_i64, expr_to_string};
 use crate::hft_exec::HftRegistry;
@@ -337,6 +339,19 @@ impl TableFunctionImpl for FwdProbaTableFunction {
 // (see `stock_calib.sh`) to obtain hit-rate by confidence bucket and a
 // threshold suggestion.
 
+fn lit_f64(e: &Expr) -> Option<f64> {
+    if let Expr::Literal(sv, _) = e {
+        match sv {
+            ScalarValue::Float64(Some(v)) => Some(*v),
+            ScalarValue::Int64(Some(v)) => Some(*v as f64),
+            ScalarValue::Utf8(Some(s)) => s.parse::<f64>().ok(),
+            _ => None,
+        }
+    } else {
+        None
+    }
+}
+
 fn walk_output_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("t", DataType::Int64, false),
@@ -356,6 +371,10 @@ fn walk_output_schema() -> Arc<Schema> {
         Field::new("q95", DataType::Float64, false),
         Field::new("bar_ret", DataType::Float64, false), // decision-bar daily return
         Field::new("vol20", DataType::Float64, false),   // trailing-20d vol at decision day
+        // calibrated probabilities (NaN in the fitting window); empty unless
+        // fwd_walk is called with a calib fraction (e.g. ,30 -> 30%)
+        Field::new("cal_p_up_iso", DataType::Float64, false),
+        Field::new("cal_p_up_platt", DataType::Float64, false),
     ]))
 }
 
@@ -427,6 +446,106 @@ fn trailing_vol(closes: &[f64], end: usize, win: usize) -> f64 {
     (ss / cnt as f64 - mean * mean).max(0.0).sqrt()
 }
 
+// ---------------------------------------------------------------------------
+// Probability calibration (isotonic PAV + Platt), used by fwd_walk
+// ---------------------------------------------------------------------------
+
+/// Isotonic regression (pool-adjacent-violators) over (score, label) pairs.
+/// Returns a right-continuous step function: `apply_iso(q, &xs, &ys)`.
+fn isotonic_fit(scores: &[f64], labels: &[f64]) -> (Vec<f64>, Vec<f64>) {
+    let mut pairs: Vec<(f64, f64)> = scores.iter().copied().zip(labels.iter().copied()).collect();
+    pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    // stack of (run_sum, run_count, run_end_score)
+    let mut stack: Vec<(f64, f64, f64)> = Vec::new();
+    for (x, y) in pairs {
+        stack.push((y, 1.0, x));
+        while stack.len() >= 2 {
+            let n = stack.len();
+            let (s2, c2, _) = stack[n - 1];
+            let (s1, c1, _) = stack[n - 2];
+            if s2 / c2 >= s1 / c1 - 1e-12 {
+                break;
+            }
+            let (sn, cn) = (s1 + s2, c1 + c2);
+            let x_end = stack.pop().unwrap().2;
+            stack.pop();
+            stack.push((sn, cn, x_end));
+        }
+    }
+    // build step edges: for each block, its mean applies for x in (prev_edge, block.last]
+    let mut edges: Vec<(f64, f64)> = Vec::new();
+    for (s, c, x_end) in &stack {
+        edges.push((*x_end, s / c));
+    }
+    let xs: Vec<f64> = edges.iter().map(|(x, _)| *x).collect();
+    let ys: Vec<f64> = edges.iter().map(|(_, y)| *y).collect();
+    (xs, ys)
+}
+
+/// Query the isotonic step function at `q` (clamped outside its range).
+fn iso_apply(q: f64, xs: &[f64], ys: &[f64]) -> f64 {
+    if xs.is_empty() {
+        return q;
+    }
+    if q <= xs[0] {
+        return ys[0];
+    }
+    if q >= xs[xs.len() - 1] {
+        return *ys.last().unwrap();
+    }
+    // first edge whose x >= q -> that block's mean
+    match xs.iter().position(|&x| x >= q) {
+        Some(i) => ys[i],
+        None => *ys.last().unwrap(),
+    }
+}
+
+/// Platt scaling: p' = sigmoid(a * f + b), fit by Newton steps on log-loss.
+fn platt_fit(scores: &[f64], labels: &[f64]) -> (f64, f64) {
+    // label smoothing (Lin, Wu 2007) avoids over-confident extremes
+    let (npos, nneg) = (
+        labels.iter().filter(|&&y| y > 0.0).count() as f64,
+        labels.iter().filter(|&&y| y <= 0.0).count() as f64,
+    );
+    let (targets, x): (Vec<f64>, Vec<f64>) = labels
+        .iter()
+        .zip(scores.iter())
+        .map(|(&y, &f)| {
+            let t = if y > 0.0 { (npos + 1.0) / (npos + 2.0) } else { 1.0 / (nneg + 2.0) };
+            (t, f)
+        })
+        .unzip();
+    let (mut a, mut b) = (1.0f64, 0.0f64);
+    for _ in 0..100 {
+        let (mut g0, mut g1, mut h00, mut h01, mut h11) = (0.0, 0.0, 0.0, 0.0, 0.0);
+        for (f, t) in x.iter().zip(targets.iter()) {
+            let p = 1.0 / (1.0 + (-(a * f + b)).exp());
+            let e = p - t; // gradient of log-loss in (a,b)
+            g0 += e * f;
+            g1 += e;
+            let w = p * (1.0 - p);
+            h00 += w * f * f;
+            h01 += w * f;
+            h11 += w;
+        }
+        let det = h00 * h11 - h01 * h01;
+        if det.abs() < 1e-12 {
+            break;
+        }
+        let (da, db) = ((g0 * h11 - g1 * h01) / det, (g1 * h00 - g0 * h01) / det);
+        a -= da;
+        b -= db;
+        if da * da + db * db < 1e-10 {
+            break;
+        }
+    }
+    (a, b)
+}
+
+fn platt_apply(q: f64, a: f64, b: f64) -> f64 {
+    1.0 / (1.0 + (-(a * q + b)).exp())
+}
+
 /// Strictly-causal walk-forward rows: `(t, close, p_up, p_down, up, n_analogs,
 /// actual_ret, q05..q95, bar_ret, vol20)`.
 ///
@@ -443,6 +562,7 @@ fn walk_compute(
     horizon: usize,
     k: usize,
     warmup: usize,
+    cal_frac: f64,
 ) -> Result<RecordBatch> {
     let n = closes.len();
     if n < horizon + 2 {
@@ -471,8 +591,10 @@ fn walk_compute(
     let mut q_cols = vec![Vec::new(); 7];
     let mut bar_ret = Vec::new();
     let mut vol20 = Vec::new();
+    let mut idx = Vec::new();
 
     for i in start..m {
+        idx.push(i as i64);
         let lab_n = i - horizon + 1; // labelled training rows j in [0, lab_n), j+H <= i
         let (mean, std) = z_stats(&feats[..lab_n]);
         let scaled = z_apply(&feats[..lab_n], &mean, &std);
@@ -520,6 +642,30 @@ fn walk_compute(
         vol20.push(trailing_vol(&closes, i, 20));
     }
 
+    // --- causal probability calibration ---
+    // Fit on the earliest cal_frac of walk decisions (outcomes already
+    // resolved by the time later decisions fire) and apply only to decisions
+    // whose bar index is past the last training outcome (gap = horizon).
+    let eval_len = up.len();
+    let mut cal_iso = vec![f64::NAN; eval_len];
+    let mut cal_platt = vec![f64::NAN; eval_len];
+    if cal_frac > 0.0 && eval_len >= 60 {
+        let train_n = (((eval_len as f64) * cal_frac.clamp(0.1, 0.5)) as usize).max(20);
+        let train_n = train_n.min(eval_len.saturating_sub(30));
+        if train_n >= 20 {
+            let labelsf: Vec<f64> = up[..train_n].iter().map(|&u| if u > 0 { 1.0 } else { 0.0 }).collect();
+            let (iso_x, iso_y) = isotonic_fit(&p_up[..train_n], &labelsf);
+            let (pa, pb) = platt_fit(&p_up[..train_n], &labelsf);
+            let last_train_idx = idx[train_n - 1];
+            for r in train_n..eval_len {
+                if idx[r] >= last_train_idx + horizon as i64 {
+                    cal_iso[r] = iso_apply(p_up[r], &iso_x, &iso_y);
+                    cal_platt[r] = platt_apply(p_up[r], pa, pb);
+                }
+            }
+        }
+    }
+
     let cols: Vec<ArrayRef> = vec![
         Arc::new(Int64Array::from(t)),
         Arc::new(Float64Array::from(close)),
@@ -537,6 +683,8 @@ fn walk_compute(
         Arc::new(Float64Array::from(std::mem::take(&mut q_cols[6]))),
         Arc::new(Float64Array::from(bar_ret)),
         Arc::new(Float64Array::from(vol20)),
+        Arc::new(Float64Array::from(cal_iso)),
+        Arc::new(Float64Array::from(cal_platt)),
     ];
     RecordBatch::try_new(walk_output_schema(), cols)
         .map_err(|e| DataFusionError::Execution(format!("fwd_walk output: {e}")))
@@ -588,11 +736,42 @@ impl TableFunctionImpl for FwdWalkTableFunction {
                 "fwd_walk: table `{name}` is empty or columns are ragged"
             )));
         }
-        let warmup = match exprs.get(3) {
-            Some(e) => expr_to_i64(e)?.max(1) as usize,
-            None => (k.max(2) * 10).max(20), // default warm-up ≈ 20 (or k*10) past bars
-        };
-        let feats = match exprs.get(4) {
+        // Optional positional args:
+        //   arg3: numeric in (0,1) -> calibration fraction (warmup auto);
+        //         numeric >= 1 -> warmup (default ~k*10); string -> feats CSV
+        //   arg4: numeric in (0,1) -> calibration fraction (overrides arg3)
+        //         string (if arg3 was numeric) -> feats CSV
+        //   arg5: feats CSV when arg4 was the calibration fraction
+        let warm_default = (k.max(2) * 10).max(20);
+        let mut warmup = warm_default;
+        let mut cal_frac = 0.0f64;
+        let mut feats_expr: Option<&Expr> = None;
+        if let Some(e) = exprs.get(3) {
+            if let Some(v) = lit_f64(e) {
+                if (0.0..1.0).contains(&v) {
+                    cal_frac = v.clamp(0.05, 0.9);
+                } else {
+                    warmup = (v as i64).max(1) as usize;
+                }
+            } else {
+                feats_expr = Some(e);
+            }
+        }
+        if let Some(e) = exprs.get(4) {
+            if let Some(v) = lit_f64(e) {
+                if (0.0..1.0).contains(&v) {
+                    cal_frac = v.clamp(0.05, 0.9);
+                } else {
+                    warmup = (v as i64).max(1) as usize;
+                }
+            } else if feats_expr.is_none() {
+                feats_expr = Some(e);
+            }
+        }
+        if feats_expr.is_none() {
+            feats_expr = exprs.get(5);
+        }
+        let feats = match feats_expr {
             Some(fe) => {
                 let csv = expr_to_string(fe)?;
                 let names: Vec<String> = csv
@@ -623,7 +802,7 @@ impl TableFunctionImpl for FwdWalkTableFunction {
             None => auto_features(&closes),
         };
 
-        let out = walk_compute(times, closes, feats, horizon, k, warmup)?;
+        let out = walk_compute(times, closes, feats, horizon, k, warmup, cal_frac)?;
         Ok(Arc::new(MemTable::try_new(out.schema(), vec![vec![out]])?))
     }
 }
@@ -918,7 +1097,7 @@ mod tests {
         let times: Vec<i64> = (0..n as i64).collect();
         let closes: Vec<f64> = (0..n).map(|i| 100.0 + i as f64).collect();
         let feats = auto_features(&closes);
-        let batch = walk_compute(times, closes, feats, horizon, 5, 30).unwrap();
+        let batch = walk_compute(times, closes, feats, horizon, 5, 30, 0.0).unwrap();
         let cols = batch.columns();
         let pu = as_primitive_array::<Float64Type>(cols[2].as_ref());
         let up = as_primitive_array::<Int64Type>(cols[4].as_ref());
@@ -986,5 +1165,63 @@ mod tests {
         let err = compute(vec![0, 1], vec![1.0, 2.0], vec![vec![0.0], vec![0.1]], 5, 3)
             .unwrap_err();
         assert!(err.to_string().contains("need > 5+1 bars"), "{err}");
+    }
+
+    #[test]
+    fn calibration_is_monotone_and_in_range() {
+        // isotonic & platt both map scores monotonically into [0,1]
+        let n = 200usize;
+        let scores: Vec<f64> = (0..n).map(|i| i as f64 / (n - 1) as f64).collect();
+        // labels: increasing truth with noise -> reasonable curve
+        let labels: Vec<f64> = scores.iter().map(|&s| (s * 0.6 + 0.15)).collect();
+        let (xs, ys) = isotonic_fit(&scores, &labels);
+        let mut prev = -1.0f64;
+        for &q in &scores {
+            let v = iso_apply(q, &xs, &ys);
+            assert!((0.0..=1.0).contains(&v), "iso out of range {v}");
+            assert!(v + 1e-9 >= prev, "iso must be non-decreasing: {prev}->{v}");
+            prev = v;
+        }
+        let (a, b) = platt_fit(&scores, &labels);
+        prev = -1.0f64;
+        for &q in &scores {
+            let v = platt_apply(q, a, b);
+            assert!(v > 0.0 && v < 1.0, "platt out of (0,1): {v}");
+            assert!(v + 1e-9 >= prev, "platt must be non-decreasing");
+            prev = v;
+        }
+    }
+
+    #[test]
+    fn walk_cal_columns_fill_only_causal_region() {
+        // A gentle trending series with wobble so p_up isn't degenerate.
+        let n = 500usize;
+        let base = 1_700_000_000_000_000_000i64;
+        let times: Vec<i64> = (0..n as i64).map(|i| base + i * DAY_NS).collect();
+        let closes: Vec<f64> = (0..n)
+            .map(|i| {
+                let t = i as f64;
+                100.0 + t * 0.08 + 4.0 * (t / 23.0).sin()
+            })
+            .collect();
+        let feats = auto_features(&closes);
+        let horizon = 5usize;
+        let batch = walk_compute(times, closes, feats, horizon, 10, 40, 0.4).unwrap();
+        let cols = batch.columns();
+        assert_eq!(cols.len(), 18);
+        let iso = as_primitive_array::<Float64Type>(cols[16].as_ref());
+        let platt = as_primitive_array::<Float64Type>(cols[17].as_ref());
+        let mut finite = 0usize;
+        for i in 0..iso.len() {
+            let iv = iso.value(i);
+            let pv = platt.value(i);
+            if iv.is_finite() {
+                assert!(pv.is_finite(), "iso finite but platt NaN at {i}");
+                assert!((0.0..=1.0).contains(&iv) && (0.0..=1.0).contains(&pv));
+                finite += 1;
+            }
+        }
+        assert!(finite > 0, "calibrated region must be populated");
+        assert!(finite < iso.len() as usize, "fitting window must stay NaN");
     }
 }

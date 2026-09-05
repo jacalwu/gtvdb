@@ -6,6 +6,11 @@
 > regime_performance.csv`（regime 默认 vol20 分桶，`REGIME=kmeans` 可选确定性 k-means）。
 > HK.00700 H=10 实测：ECE=0.10、宽 band 欠覆盖(90%→82%)、左尾 bias -9.8pp/右尾 +13.7pp、
 > 高波动 regime 命中率最高(57-58%) —— 详见下方各节解读与后续优化。
+> **概率缩放已实现**：`fwd_walk(...,cal_frac)`（arg3/arg4 传 0~1 小数，如 `,0.3`）
+> 用最早一段历史决策（outcome 已解析、跳过 H 根成果窗口保证因果）拟合
+> isotonic(PAV) 与 Platt，只对后续行输出 `cal_p_up_iso/cal_p_up_platt`。
+> HK.00700 H=10 因果留出区实测：ECE raw 8.5% → isotonic 3.5% → Platt 1.5%，
+> Brier 0.260→0.249；原 70 次 p≥0.75 喊单命中仅 56%，校准后不再虚高。
 
 > 目標：在現有 Rust 回測框架中，加入 4 類關鍵診斷：
 > - calibration plot（p_up vs empirical）
