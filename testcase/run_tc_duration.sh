@@ -12,8 +12,10 @@
 # The `*_from <table>` REPL commands (added in Phase 2) bind the operators to a
 # loaded table, so TC1/TC3/TC4 now run on the same fixed data as TC2/TC5.
 #
-# Each test case runs once as warmup (discarded) and then `ITERS` measured runs;
-# the script reports the min (best) and average. Results are persisted to a TSV
+# Each test case runs once as warmup (discarded) and then `ITERS` measured runs
+# (default 5); the script reports the min and the mean of those runs. The
+# `Δ(µs)` / `Δ%` columns compare this round's **average** with the previous
+# round's average (loaded from $RESULT_FILE). Results are persisted to a TSV
 # with the binary sha + dataset shas for cross-version attribution.
 #
 # Usage:
@@ -28,6 +30,7 @@ cd "$repo"
 
 PROFILE="${GTV_PROFILE:-release}"
 BIN="${GTV_BIN:-$repo/target/$PROFILE/gtv}"
+#BIN="${GTV_BIN:-taskset -c 3 $repo/target/$PROFILE/gtv}"
 DATA_CSV="${DATA_CSV:-$here/data/pt_test_tab.csv}"
 EDGES_CSV="${EDGES_CSV:-$here/data/edges_1m.csv}"
 VECTORS_CSV="${VECTORS_CSV:-$here/data/vectors_1m.csv}"
@@ -38,8 +41,8 @@ PT_T="${PT_T:-500000}"                                  # point-in-time query ti
 WASH_T="${WASH_T:-1000000}"                             # wash query time (all edges active)
 KNN_QUERY="${KNN_QUERY:-0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5}"
 VEC_DIM="${VEC_DIM:-8}"
-ITERS="${ITERS:-3}"
-WARMUP="${WARMUP:-1}"
+ITERS="${ITERS:-10}"
+WARMUP="${WARMUP:-3}"
 RESULT_FILE="${RESULT_FILE:-$here/tc_duration_last.tsv}"
 
 case "$PROFILE" in
@@ -48,7 +51,7 @@ case "$PROFILE" in
 esac
 
 if [[ ! -x "$BIN" ]]; then
-  echo "gtv binary not found at $BIN" >&2
+  echo "gtv banary not found at $BIN" >&2
   echo "build it once with: cargo build --$PROFILE -p gtv-cli --bin gtv" >&2
   exit 1
 fi
@@ -92,6 +95,7 @@ TCS=(
 # Run one query `iters` times (plus `warmup` discarded runs) in a fresh REPL
 # session and print the measured durations in µs, one per line.
 run_query() {
+  sleep 0.1
   local preamble="$1" query="$2"
   local session=""
   local i
@@ -109,13 +113,13 @@ run_query() {
   for ((i = 0; i < ITERS; i++)); do session+="$query"$'\n'; done
 
   printf 'SET DURATION = ON;\n%squit\n' "$session" \
-    | "$BIN" 2>&1 \
+    | taskset -c 3 "$BIN" 2>&1 \
     | sed -n 's/^duration: \([0-9][0-9.]*\) µs.*/\1/p' \
     | tail -n +$((WARMUP + 1))
 }
 
-# Load the previous round keyed by "tc|scale": value = min_us.
-declare -A last_min=()
+# Load the previous round keyed by "tc|scale": value = avg_us.
+declare -A last_avg=()
 last_bin=""; last_data=""
 if [[ -f "$RESULT_FILE" ]]; then
   while IFS=$'\t' read -r id op scale q min avg; do
@@ -128,9 +132,9 @@ if [[ -f "$RESULT_FILE" ]]; then
     fi
     [[ -z "$id" ]] && continue
     if [[ -z "$avg" ]]; then
-      last_min["$id|demo"]="$q"
+      last_avg["$id|demo"]="$q"
     else
-      last_min["$id|$scale"]="$min"
+      last_avg["$id|$scale"]="$avg"
     fi
   done < "$RESULT_FILE"
 fi
@@ -143,7 +147,7 @@ fi
 } > "$RESULT_FILE.new"
 
 printf '%-4s %-8s %-6s %14s %14s %14s %14s %10s\n' \
-  "TC" "op" "scale" "min(µs)" "avg(µs)" "last min" "Δ(µs)" "Δ%"
+  "TC" "op" "scale" "min(µs)" "avg(µs)" "last avg" "Δ(µs)" "Δ%"
 printf '%-4s %-8s %-6s %14s %14s %14s %14s %10s\n' \
   "----" "------" "------" "--------" "--------" "--------" "--------" "--------"
 
@@ -156,11 +160,11 @@ for entry in "${TCS[@]}"; do
 
   printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$id" "$op" "$scale" "$query" "$min_us" "$avg_us" >> "$RESULT_FILE.new"
 
-  if [[ -n "${last_min["$id|$scale"]:-}" ]]; then
-    delta="$(awk -v n="$min_us" -v o="${last_min["$id|$scale"]}" 'BEGIN{printf "%.3f", n-o}')"
-    pct="$(awk -v n="$min_us" -v o="${last_min["$id|$scale"]}" 'BEGIN{if(o>0) printf "%+.1f", (n-o)/o*100; else print "-"}')"
+  if [[ -n "${last_avg["$id|$scale"]:-}" ]]; then
+    delta="$(awk -v n="$avg_us" -v o="${last_avg["$id|$scale"]}" 'BEGIN{printf "%.3f", n-o}')"
+    pct="$(awk -v n="$avg_us" -v o="${last_avg["$id|$scale"]}" 'BEGIN{if(o>0) printf "%+.1f", (n-o)/o*100; else print "-"}')"
     printf '%-4s %-8s %-6s %14s %14s %14s %14s %9s%%\n' \
-      "$id" "$op" "$scale" "$min_us" "$avg_us" "${last_min["$id|$scale"]}" "$delta" "$pct"
+      "$id" "$op" "$scale" "$min_us" "$avg_us" "${last_avg["$id|$scale"]}" "$delta" "$pct"
   else
     printf '%-4s %-8s %-6s %14s %14s %14s %14s %10s\n' \
       "$id" "$op" "$scale" "$min_us" "$avg_us" "—" "—" "—"
@@ -169,7 +173,7 @@ done
 
 mv "$RESULT_FILE.new" "$RESULT_FILE"
 echo
-echo "results saved to $RESULT_FILE (min = best of $ITERS measured runs, warmup=$WARMUP)"
+echo "results saved to $RESULT_FILE (avg = mean of $ITERS measured runs, warmup=$WARMUP)"
 echo "datasets: pt_test_tab=$DATA_SHA edges=$EDGES_SHA vectors=$VECTORS_SHA"
 echo "tick data: mco=$MCO_SHA nvda=$NVDA_SHA tsla=$TSLA_SHA (2.5M rows each)"
 echo "run  : bin=$BIN_SHA git=$GIT_SHA date=$NOW"
