@@ -307,6 +307,7 @@ FROM t;
 | — | `ohlc` | 表函數（tick → OHLCV K 線） |
 | — | `zscore` / `momentum` | 視窗（截面 / 技術指標） |
 | — | `signal` | 純量（z → buy/sell/hold） |
+| `trunc` | — | 純量：Oracle 式時間分桶 `trunc(ts, 'DD')`（SS/MI/HH/DD/MM/YYYY）與數值截斷 `trunc(x[, digits])` |
 | — | `read_yahoo` | 表函數（日線 OHLCV） |
 | — | `cross_sectional_signal` | 表函數（fetch+momentum+zscore+signal+隔日報酬） |
 | — | `relative_strength` | 表函數（標的 vs 指數 vs 同行） |

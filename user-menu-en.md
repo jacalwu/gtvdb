@@ -312,6 +312,7 @@ Quant operators (phase 2):
 | — | `ohlc` | table fn (tick → OHLCV bars) |
 | — | `zscore` / `momentum` | window (cross-sectional / technical) |
 | — | `signal` | scalar (z → buy/sell/hold) |
+| `trunc` | — | scalar: Oracle-style time bucket `trunc(ts, 'DD')` (SS/MI/HH/DD/MM/YYYY) and numeric trunc toward zero `trunc(x[, digits])` |
 | — | `read_yahoo` | table fn (daily OHLCV) |
 | — | `cross_sectional_signal` | table fn (fetch+momentum+zscore+signal+next-day ret) |
 | — | `relative_strength` | table fn (target vs indices vs peers) |
