@@ -152,7 +152,7 @@ read routing(#15):當天=leader 強一致;歷史 immutable → follower/快取�
 | 里程碑 | 內容 | 關聯 issue | 新寫量 |
 |---|---|---|---|
 | M0 | 已具備:本機 hdb_save/scan/flush + mmap + cache | — | 0 |
-| **M1** | 單機 hot+cold:當天表 + 歷史 root 依日期 union 查詢、rollover 指令 | — | 中(REPL 指令 + 載入器) |
+| **M1** | ✅ 單機 hot+cold:`rollover`(熱表封存→冷 partition + 清空)與 `hc_load`(冷 range + 當天 hot 依日期 union,ORDER BY t) | — | 已實作(gtv-cli,debug 驗證) |
 | M2 | per-table manifest v1 + schema_sha 驗證 | #16 | 小 |
 | M3 | 遠端 root 真正掛 S3/MinIO;mmap 拉檔快取 | #7 | 中 |
 | M4 | 分散:coordinator 跨日 map/reduce、各節點當天/歷史分工 | #14/#15 | 大 |

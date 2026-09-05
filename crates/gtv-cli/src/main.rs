@@ -914,6 +914,82 @@ async fn run(
             ctx.register_batches(table, first.schema(), batches)?;
             println!("hdb_scan: loaded `{table}` {start}..{end} ({rows} rows)");
         }
+        "rollover" => {
+            // rollover <table> <date> [root] — freeze the hot (today/in-memory)
+            // table into the cold partition store under <date>, then clear it
+            // (same schema, 0 rows) so the next day starts fresh.
+            let table = require_arg(&tokens, 1, "rollover <table> <date> [root]")?;
+            let date = require_arg(&tokens, 2, "rollover <table> <date> [root]")?;
+            let root = optional_arg(&tokens, 3).unwrap_or("hdb");
+            let batches = ctx.sql(&format!("SELECT * FROM {table}")).await?;
+            let Some(first) = batches.first() else {
+                return Err(anyhow!("table `{table}` does not exist"));
+            };
+            let all = concat_batches(&first.schema(), &batches)?;
+            if all.num_rows() == 0 {
+                println!("rollover: `{table}` is empty (no-op)");
+                return Ok(Action::Continue);
+            }
+            let hdb = HdbStore::new(root);
+            let n = hdb.write_table(date, table, &all)?;
+            let empty = RecordBatch::new_empty(first.schema());
+            ctx.register_batches(table, empty.schema(), vec![empty])?;
+            println!(
+                "rollover: froze {} rows of `{table}` -> {}/{date}/{table}/ ({} partition(s)); hot table cleared",
+                all.num_rows(),
+                hdb.root().display(),
+                n
+            );
+        }
+        "hc_load" => {
+            // hc_load <dst> <src> <from> <to> [root] — hot+cold load: cold
+            // partitions of `src` in [from,to] merged with the currently
+            // registered hot `src` (the open day), sorted by `t`, registered
+            // as `dst`. `dst` must differ from `src` so the live table is
+            // never replaced by its own view.
+            let dst = require_arg(&tokens, 1, "hc_load <dst> <src> <from> <to> [root]")?;
+            let src = require_arg(&tokens, 2, "hc_load <dst> <src> <from> <to> [root]")?;
+            let from = require_arg(&tokens, 3, "hc_load <dst> <src> <from> <to> [root]")?;
+            let to = require_arg(&tokens, 4, "hc_load <dst> <src> <from> <to> [root]")?;
+            let root = optional_arg(&tokens, 5).unwrap_or("hdb");
+            if dst == src {
+                return Err(anyhow!("hc_load: dst must differ from src (use a view name)"));
+            }
+            let hdb = HdbStore::new(root);
+            let cold = hdb.scan(src, from, to, &[])?;
+            let cold_rows: usize = cold.iter().map(|b| b.num_rows()).sum();
+            let mut combined = cold;
+            if ctx.has_table(src).await {
+                let hot = ctx.sql(&format!("SELECT * FROM {src}")).await?;
+                let hot_rows: usize = hot.iter().map(|b| b.num_rows()).sum();
+                if hot_rows > 0 {
+                    println!("hc_load: merging hot `{src}` ({hot_rows} rows)");
+                    combined.extend(hot);
+                }
+            }
+            let Some(first) = combined.first() else {
+                return Err(anyhow!("no data for `{src}` in {from}..{to} (cold) or hot"));
+            };
+            let all = concat_batches(&first.schema(), &combined)?;
+            let has_t = all.column_by_name("t").is_some();
+            let tmp = "__hc_tmp";
+            ctx.register_batches(tmp, first.schema(), vec![all])?;
+            let ordered = if has_t {
+                ctx.sql(&format!("SELECT * FROM {tmp} ORDER BY t")).await?
+            } else {
+                ctx.sql(&format!("SELECT * FROM {tmp}")).await?
+            };
+            ctx.deregister_table(tmp);
+            let Some(ofirst) = ordered.first() else {
+                return Err(anyhow!("hc_load: no rows after ordering"));
+            };
+            ctx.register_batches(dst, ofirst.schema(), ordered)?;
+            println!(
+                "hc_load: `{dst}` <- `{src}` {from}..{to} (cold {cold_rows} rows{}\
+                 , sorted by t)",
+                if ctx.has_table(src).await { " + hot" } else { "" }
+            );
+        }
         "hdb_flush" => {
             // hdb_flush <table> [root] [interval_secs] — background task that
             // flushes the memory table to HDB (symbol-enumerated) on an interval.
@@ -1544,6 +1620,8 @@ fn print_help() {
          \x20 hdb_save <table> <date> [root]  persist table to HDB partitions\n\
          \x20 hdb_load <table> <date> <sym> [root]  read one HDB partition\n\
          \x20 hdb_scan <table> <start> <end> [sym] [root]  scan HDB date range\n\
+         \x20 rollover <table> <date> [root]  freeze today's hot table into a cold partition\n\
+         \x20 hc_load <dst> <src> <from> <to> [root]  hot+cold range view (sorted by t)\n\
          \x20 hdb_flush <table> [root] [secs]  background HDB flush (sym-enumerated)\n\
          \x20 tt <table> <T>        time-travel: table snapshot as-of T\n\
          \x20 pattern [T]           temporal pattern matching (ring/path/diamond)\n\
