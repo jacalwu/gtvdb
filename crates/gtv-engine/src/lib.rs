@@ -4,6 +4,7 @@
 //! DataFusion UDFs / table functions so they can be driven from SQL.
 
 pub mod asof;
+pub mod analytics;
 pub mod context;
 pub mod csv;
 pub mod datetime;

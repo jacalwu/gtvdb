@@ -81,6 +81,10 @@ impl GtvContext {
             ctx.register_udtf("l2", l2);
             let ohlc = Arc::new(crate::quant::OhlcTableFunction::new(hft_reg.clone()));
             ctx.register_udtf("ohlc", ohlc);
+            ctx.register_udtf(
+                "fwd_proba",
+                Arc::new(crate::analytics::FwdProbaTableFunction::new(hft_reg.clone())),
+            );
         }
         Self {
             ctx,
