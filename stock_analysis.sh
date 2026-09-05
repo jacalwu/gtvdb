@@ -91,6 +91,7 @@ for r in rows:
     elif tables:
         tables[-1][1].append([c.strip() for c in r.split("|")])
 if not tables:
+    sys.stderr.write("log tail:\n" + "\n".join(log.splitlines()[-10:]) + "\n")
     sys.exit("no fwd_proba table in output")
 hdr, body = tables[-1]
 line = body[0]

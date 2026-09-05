@@ -90,6 +90,7 @@ for l in log.splitlines():
     elif cur is not None and len(cells) >= len(cur[0]):
         cur[1].append(cells)
 if not tables:
+    sys.stderr.write("log tail:\n" + "\n".join(log.splitlines()[-10:]) + "\n")
     sys.exit("no fwd_walk table in output")
 hdr, body = tables[-1]
 def col(name): return hdr.index(name)
