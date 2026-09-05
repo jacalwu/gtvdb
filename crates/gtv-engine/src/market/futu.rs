@@ -226,47 +226,68 @@ impl MarketProvider for FutuProvider {
     }
 
     fn fetch_klines(&self, req: &KlineReq) -> Result<Vec<RecordBatch>> {
+        let cache = super::cache::MarketCache::new();
         let mut batches = Vec::new();
         for code in &req.codes {
-            let mut args = vec![
-                "--action".to_string(),
-                "klines".to_string(),
-                "--code".to_string(),
-                code.clone(),
-                "--period".to_string(),
-                req.period.clone(),
-                "--adjust".to_string(),
-                req.adjust.clone(),
-            ];
-            if let Some(s) = &req.start {
-                args.push("--start".to_string());
-                args.push(s.clone());
-            }
-            if let Some(e) = &req.end {
-                args.push("--end".to_string());
-                args.push(e.clone());
-            }
-            if req.max > 0 {
-                args.push("--max".to_string());
-                args.push(req.max.to_string());
-            }
-            let out = run_bridge(&args)
-                .with_context(|| format!("futu klines `{code}` period={}", req.period))?;
-            let rows: Vec<KlineRow> = rows_of(&out)
-                .into_iter()
-                .map(|r| KlineRow {
-                    provider: self.name.clone(),
-                    symbol: code.clone(),
-                    ts_ns: i64_at(&r, "ts_ns"),
-                    open: f64_at(&r, "open"),
-                    high: f64_at(&r, "high"),
-                    low: f64_at(&r, "low"),
-                    close: f64_at(&r, "close"),
-                    volume: f64_at(&r, "volume"),
-                    turnover: f64_at(&r, "turnover"),
-                    adjclose: f64_at(&r, "adjclose"),
-                })
-                .collect();
+            let code_own = code.clone();
+            let period = req.period.clone();
+            let adjust = req.adjust.clone();
+            let start = req.start.clone();
+            let end = req.end.clone();
+            let max = req.max;
+            let rows = super::cache::cached_klines(
+                &cache,
+                "futu",
+                code,
+                &period,
+                &adjust,
+                start,
+                end,
+                max,
+                move |norm: &KlineReq| {
+                    let mut args = vec![
+                        "--action".to_string(),
+                        "klines".to_string(),
+                        "--code".to_string(),
+                        code_own.clone(),
+                        "--period".to_string(),
+                        norm.period.clone(),
+                        "--adjust".to_string(),
+                        norm.adjust.clone(),
+                    ];
+                    if let Some(s) = &norm.start {
+                        args.push("--start".to_string());
+                        args.push(s.clone());
+                    }
+                    if let Some(e) = &norm.end {
+                        args.push("--end".to_string());
+                        args.push(e.clone());
+                    }
+                    if norm.max > 0 {
+                        args.push("--max".to_string());
+                        args.push(norm.max.to_string());
+                    }
+                    let out = run_bridge(&args)
+                        .with_context(|| format!("futu klines `{code_own}` period={}", norm.period))?;
+                    let rows: Vec<KlineRow> = rows_of(&out)
+                        .into_iter()
+                        .map(|r| KlineRow {
+                            provider: "futu".to_string(),
+                            symbol: code_own.clone(),
+                            ts_ns: i64_at(&r, "ts_ns"),
+                            open: f64_at(&r, "open"),
+                            high: f64_at(&r, "high"),
+                            low: f64_at(&r, "low"),
+                            close: f64_at(&r, "close"),
+                            volume: f64_at(&r, "volume"),
+                            turnover: f64_at(&r, "turnover"),
+                            adjclose: f64_at(&r, "adjclose"),
+                        })
+                        .collect();
+                    Ok(rows)
+                },
+            )
+            .with_context(|| format!("futu klines `{code}` period={period}"))?;
             if !rows.is_empty() {
                 batches.push(kline_to_batch(&rows));
             }

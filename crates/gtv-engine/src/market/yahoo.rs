@@ -204,16 +204,28 @@ impl MarketProvider for YahooProvider {
     }
 
     fn fetch_klines(&self, req: &KlineReq) -> Result<Vec<RecordBatch>> {
+        let cache = super::cache::MarketCache::new();
         let mut batches = Vec::new();
         for code in &req.codes {
-            let rows = fetch_rows(
+            let code_own = code.clone();
+            let period = req.period.clone();
+            let start = req.start.clone();
+            let end = req.end.clone();
+            let max = req.max;
+            let rows = super::cache::cached_klines(
+                &cache,
+                "yahoo",
                 code,
-                &req.period,
-                req.start.as_deref(),
-                req.end.as_deref(),
-                req.max,
-            )
-            .with_context(|| format!("yahoo klines `{code}` period={}", req.period))?;
+                &period,
+                "none", // Yahoo serves unadjusted close + adjclose column
+                start,
+                end,
+                max,
+                move |norm: &KlineReq| {
+                    fetch_rows(&code_own, &norm.period, norm.start.as_deref(), norm.end.as_deref(), norm.max)
+                        .with_context(|| format!("yahoo klines `{code_own}` period={}", norm.period))
+                },
+            )?;
             if !rows.is_empty() {
                 batches.push(kline_to_batch(&rows));
             }

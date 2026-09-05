@@ -34,6 +34,7 @@
 //!   intraday ticks must be captured by subscribing while the market is open).
 //! * `yahoo` — daily + intraday minute bars; no tick feed.
 
+pub mod cache;
 pub mod futu;
 pub mod yahoo;
 

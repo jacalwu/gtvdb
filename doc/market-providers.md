@@ -154,3 +154,20 @@ gtv> klines('yahoo','AAPL','5m','','')                              # 最近 ~10
   其余未知名市场按 UTC 标签处理。
 - Futu SDK 日志偶发混入 stdout，Rust 侧按 `{"ok"` 起始行稳健提取 JSON，
   不受影响（调试 bridge 请直接跑 `python3 futu_bridge.py ...`）。
+
+## 本地缓存（引擎内置）
+
+`klines(...)`/`md` 已内置**本地缓存优先 + 增量补齐**（`market::cache`），
+历史数据只拉一次：
+
+- 每个 `(provider, symbol, period, adjust)` 一个 parquet + meta（覆盖区间）；
+  请求区间完全被覆盖 → 直接读盘，不碰 provider；
+- 区间外扩 → 只拉**缺失的头/尾段**并合并（按 ts 升序、去重）；
+- 复权价 `qfq/hfq` 会被除权重新定价 → 缓存超过 5 天自动整段重拉；
+- 日内(分K)且范围含**今天** → 绕过缓存（当日K仍在变动）；
+- 目录：`GTV_MARKET_DIR`（默认 `data/market`）；`GTV_MARKET_CACHE=0` 关闭。
+
+```bash
+GTV_MARKET_DIR=/path/cache ./gtv          # 指定缓存目录
+GTV_MARKET_CACHE=0 ./stock_analysis.sh HK.00700   # 强制现抽
+```
