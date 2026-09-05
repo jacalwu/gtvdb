@@ -41,6 +41,8 @@ impl GtvContext {
         }
         ctx.register_udf(crate::quant::xbar_udf());
         ctx.register_udf(crate::quant::signal_udf());
+        ctx.register_udf(crate::datetime::truncate_udf());
+        ctx.register_udf(crate::datetime::trunc_udf());
         for udwf in crate::micro::micro_window_udfs() {
             ctx.register_udwf(udwf);
         }

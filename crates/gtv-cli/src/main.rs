@@ -5,12 +5,15 @@
 //! built-in command is executed as SQL.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::{anyhow, Result};
 
+mod catalog;
 mod lse;
+use crate::catalog::Catalog;
 use arrow::array::{
     as_primitive_array, ArrayRef, BooleanArray, Float64Array, Int64Array, RecordBatch,
     StringArray, TimestampNanosecondArray, UInt16Array, UInt64Array,
@@ -88,6 +91,33 @@ async fn main() -> Result<()> {
     let ctx = GtvContext::new();
     register_tables(&ctx, &demo)?;
 
+    // Optional table persistence: when GTV_HOME points at a directory, tables
+    // registered via `loadcsv` / `load` / `CREATE TABLE … AS SELECT` survive
+    // restarts (see catalog.rs).
+    let mut catalog = match std::env::var("GTV_HOME") {
+        Ok(h) if !h.trim().is_empty() => {
+            let cat = Catalog::open(Path::new(&h))?;
+            if !cat.is_empty() {
+                let restored = cat.replay(&ctx);
+                let total = cat.names().count();
+                println!(
+                    "catalog: restored {restored}/{total} table(s) from {}",
+                    cat.home().display()
+                );
+            } else {
+                println!(
+                    "catalog: persistence on — tables saved to {}",
+                    cat.home().display()
+                );
+            }
+            Some(cat)
+        }
+        _ => None,
+    };
+    if catalog.is_none() {
+        println!("catalog: off — export GTV_HOME=<dir> to persist loadcsv/CREATE TABLE across restarts");
+    }
+
     let mut rl = DefaultEditor::new()?;
     let mut mode = SqlMode::default();
     let mut timing = false;
@@ -101,7 +131,9 @@ async fn main() -> Result<()> {
                     continue;
                 }
                 let _ = rl.add_history_entry(&line);
-                let result = run(&demo, &ctx, &line, &mut mode, &mut timing, &mut cache).await;
+                let result =
+                    run(&demo, &ctx, &line, &mut mode, &mut timing, &mut cache, &mut catalog)
+                        .await;
                 match result {
                     Ok(Action::Continue) => {}
                     Ok(Action::Quit) => break,
@@ -570,11 +602,24 @@ async fn run(
     mode: &mut SqlMode,
     timing: &mut bool,
     cache: &mut HashMap<String, KernelPlan>,
+    catalog: &mut Option<Catalog>,
 ) -> Result<Action> {
     let tokens: Vec<&str> = line.split_whitespace().collect();
     let Some(cmd) = tokens.first().copied() else {
         return Ok(Action::Continue);
     };
+
+    // With persistence enabled, intercept CREATE TABLE / DROP TABLE so the
+    // table is snapshotted (or removed) in the catalog. Without persistence
+    // these fall through to DataFusion's native in-memory DDL, as before.
+    if let Some(cat) = catalog.as_mut() {
+        if is_ddl_keyword(line, "create table") {
+            return create_table_persisted(ctx, cat, line, *timing).await;
+        }
+        if is_ddl_keyword(line, "drop table") {
+            return drop_table_sql(ctx, cat, line).await;
+        }
+    }
     match cmd {
         "set" | "SET" => {
             // SET DURATION = ON | OFF
@@ -685,6 +730,10 @@ async fn run(
             };
             ctx.register_batches(table, first.schema(), batches)?;
             println!("loaded `{table}` from {path}");
+            if let Some(cat) = catalog.as_mut() {
+                cat.record_parquet(table, path)?;
+                println!("catalog: persisted `{table}` (reloads {path})");
+            }
         }
         "loadcsv" => {
             // Method 1/2: load CSV from disk and assign it to a session table.
@@ -692,6 +741,10 @@ async fn run(
             let path = require_arg(&tokens, 2, "loadcsv <table> <path>")?;
             ctx.register_csv(path, table)?;
             println!("loaded `{table}` from {path}");
+            if let Some(cat) = catalog.as_mut() {
+                cat.record_csv(table, path)?;
+                println!("catalog: persisted `{table}` (reloads {path})");
+            }
         }
         "aj_from" | "register_aj" => {
             // aj_from <table> [tol_ns] — bind the as-of join right side to a table
@@ -1108,6 +1161,63 @@ async fn run(
                 let _ = print_batches(&batches);
             }
         }
+        "catalog" => {
+            match catalog.as_ref() {
+                Some(cat) => {
+                    if cat.is_empty() {
+                        println!("catalog: empty — tables persist to {}", cat.home().display());
+                    } else {
+                        println!(
+                            "catalog at {} ({} table(s)):",
+                            cat.home().display(),
+                            cat.names().count()
+                        );
+                        println!("name            kind      rows   created              path");
+                        for e in cat.iter() {
+                            let kind = match e.kind {
+                                crate::catalog::Kind::Csv => "csv",
+                                crate::catalog::Kind::Parquet => "parquet",
+                                crate::catalog::Kind::Snapshot => "snapshot",
+                            };
+                            println!(
+                                "{:<14} {:<9} {:>6}  {:<20} {}",
+                                e.name,
+                                kind,
+                                e.rows,
+                                e.created,
+                                e.path.display()
+                            );
+                        }
+                    }
+                }
+                None => println!(
+                    "catalog: disabled — export GTV_HOME=<dir> to persist tables across restarts"
+                ),
+            }
+        }
+        "drop" => {
+            // drop table [if exists] <name> — the SQL `DROP TABLE <name>` is
+            // intercepted too when persistence is on (see drop_table_sql).
+            let mut rest = tokens[1..].to_vec();
+            if rest.first().is_none_or(|w| !w.eq_ignore_ascii_case("table")) {
+                return Err(anyhow!("usage: drop table <name>  (or DROP TABLE <name>)"));
+            }
+            rest.remove(0);
+            let mut if_exists = false;
+            if rest.first().is_some_and(|w| w.eq_ignore_ascii_case("if")) {
+                if_exists = true;
+                if rest.get(1).is_some_and(|w| w.eq_ignore_ascii_case("not")) {
+                    rest.drain(0..3); // `if not exists`
+                } else {
+                    rest.drain(0..2); // `if exists`
+                }
+            }
+            let name = rest
+                .first()
+                .copied()
+                .ok_or_else(|| anyhow!("usage: drop table <name>"))?;
+            return drop_named(ctx, catalog.as_mut(), name, if_exists).await;
+        }
         "quit" | "exit" => return Ok(Action::Quit),
         "sql" => {
             let q = line.get(3..).unwrap_or("").trim();
@@ -1154,6 +1264,154 @@ async fn run(
             }
             run_sql(ctx, line, timing).await?;
         }
+    }
+    Ok(Action::Continue)
+}
+
+/// True when `line` starts with the SQL keyword `kw` (exactly, or followed by
+/// whitespace). Byte-level compare, so no UTF-8 slicing hazards.
+fn is_ddl_keyword(line: &str, kw: &str) -> bool {
+    let l = line.trim_start().trim_end_matches(';').trim_end();
+    let lb = l.as_bytes();
+    let kb = kw.as_bytes();
+    if lb.len() < kb.len() {
+        return false;
+    }
+    if !lb[..kb.len()].eq_ignore_ascii_case(kb) {
+        return false;
+    }
+    lb.len() == kb.len() || lb[kb.len()] == b' '
+}
+
+/// Parse `CREATE TABLE [IF NOT EXISTS] <name> AS <query>` into
+/// `(name, if_not_exists, query)`. Unquoted names follow DataFusion's rule and
+/// are folded to lowercase; quoted names keep their inner spelling.
+fn parse_create_table(line: &str) -> Option<(String, bool, String)> {
+    let words: Vec<&str> = line.split_whitespace().collect();
+    if words.len() < 4 {
+        return None;
+    }
+    if !words[0].eq_ignore_ascii_case("create") || !words[1].eq_ignore_ascii_case("table") {
+        return None;
+    }
+    let mut i = 2;
+    let mut if_not_exists = false;
+    if words.get(i).is_some_and(|w| w.eq_ignore_ascii_case("if"))
+        && words.get(i + 1).is_some_and(|w| w.eq_ignore_ascii_case("not"))
+        && words.get(i + 2).is_some_and(|w| w.eq_ignore_ascii_case("exists"))
+    {
+        if_not_exists = true;
+        i += 3;
+    }
+    let raw = words.get(i)?;
+    let quoted = raw.starts_with('"') || raw.starts_with('`');
+    let name = if quoted {
+        raw.trim_matches(|c| c == '"' || c == '`' || c == '\'').to_string()
+    } else {
+        raw.to_ascii_lowercase()
+    };
+    i += 1;
+    let rest = &words[i..];
+    let as_pos = rest.iter().position(|w| w.eq_ignore_ascii_case("as"))?;
+    let query = rest[as_pos + 1..].join(" ");
+    if query.is_empty() {
+        return None;
+    }
+    Some((name, if_not_exists, query))
+}
+
+/// `CREATE TABLE … AS SELECT` with a catalog: materialize the result as a
+/// snapshot Parquet file and register it, so it survives a restart.
+async fn create_table_persisted(
+    ctx: &GtvContext,
+    cat: &mut Catalog,
+    line: &str,
+    timing: bool,
+) -> Result<Action> {
+    let Some((name, if_not_exists, query)) = parse_create_table(line) else {
+        // Unsupported CREATE TABLE form (column definitions, …) — let
+        // DataFusion handle it natively (in-memory, not persisted).
+        run_sql(ctx, line, &timing).await?;
+        return Ok(Action::Continue);
+    };
+    if ctx.has_table(&name).await {
+        if if_not_exists {
+            println!("table `{name}` already exists (no-op)");
+            return Ok(Action::Continue);
+        }
+        return Err(anyhow!("table `{name}` already exists — `DROP TABLE {name}` first"));
+    }
+    let t0 = Instant::now();
+    let df = ctx.session().sql(&query).await?;
+    let schema: SchemaRef = df.schema().as_arrow().clone().into();
+    let batches = df.collect().await?;
+    let us = t0.elapsed().as_secs_f64() * 1e6;
+
+    // Materialize first, then register: a failed snapshot leaves nothing behind.
+    if let Err(e) = cat.record_snapshot(&name, &schema, &batches) {
+        return Err(anyhow!("persist `{name}`: {e:#}"));
+    }
+    ctx.register_batches(&name, schema, batches)?;
+    if timing {
+        println!("duration: {us:.3} µs (sql)");
+    }
+    println!("created `{name}` (persisted to catalog)");
+    Ok(Action::Continue)
+}
+
+/// `DROP TABLE [IF EXISTS] <name>` with a catalog active.
+async fn drop_table_sql(ctx: &GtvContext, cat: &mut Catalog, line: &str) -> Result<Action> {
+    let mut words = line.split_whitespace();
+    let _ = words.next(); // DROP
+    let _ = words.next(); // TABLE
+    let mut if_exists = false;
+    let mut name: Option<String> = None;
+    for w in words {
+        if w.eq_ignore_ascii_case("if") {
+            if_exists = true;
+        } else if !w.eq_ignore_ascii_case("exists") {
+            name = Some(w.trim_end_matches(';').to_string());
+            break;
+        }
+    }
+    let name = name.ok_or_else(|| anyhow!("usage: DROP TABLE <name>"))?;
+    drop_named(ctx, Some(cat), &name, if_exists).await
+}
+
+/// Drop a table from the engine and (when a catalog is present) from the
+/// persisted manifest + snapshot file. Shared by the `drop table` command and
+/// the `DROP TABLE` SQL interception.
+async fn drop_named(
+    ctx: &GtvContext,
+    catalog: Option<&mut Catalog>,
+    name: &str,
+    if_exists: bool,
+) -> Result<Action> {
+    let name = name.trim().trim_end_matches(';');
+    let in_catalog = catalog
+        .as_ref()
+        .map(|c| c.get(name).is_some())
+        .unwrap_or(false);
+    if !ctx.has_table(name).await && !in_catalog {
+        if if_exists {
+            println!("table `{name}` does not exist (no-op)");
+            return Ok(Action::Continue);
+        }
+        return Err(anyhow!("table `{name}` does not exist"));
+    }
+    ctx.deregister_table(name);
+    match catalog {
+        Some(cat) => match cat.remove(name)? {
+            Some(e) => {
+                let extra = match e.kind {
+                    crate::catalog::Kind::Snapshot => " and snapshot file",
+                    _ => "",
+                };
+                println!("dropped table `{name}` (catalog entry{extra} removed)");
+            }
+            None => println!("dropped table `{name}`"),
+        },
+        None => println!("dropped table `{name}`"),
     }
     Ok(Action::Continue)
 }
@@ -1295,12 +1553,16 @@ fn print_help() {
          \x20 aj_bench <left> <right> [tol]  full left×right as-of join sweep (1M×1M)\n\
          \x20 wash_from <table>     bind wash/wash_trade to a table (src, dst, valid_from, valid_to)\n\
          \x20 knn_from <name> <t> [d]  register a vector collection from a table (id, v0..v{{d-1}})\n\
+         \x20 catalog               list persisted tables (GTV_HOME catalog)\n\
+         \x20 drop table <name>     drop a table from memory [+ persisted catalog]\n\
          \x20 remote <host:port> <sql>  execute SQL on a remote gtv-server\n\
          \x20 quit | exit\n\
          \n\
          session:\n\
          \x20 ALTER SESSION SET sqlmode = hft | full   (default: hft)\n\
          \x20 SET DURATION = ON | OFF                  time each action (us)\n\
+         \x20 persistence: start with GTV_HOME=<dir> so loadcsv/load/CREATE TABLE\n\
+         \x20              survive restarts (`catalog` lists, `drop table` removes)\n\
          \n\
          SQL (hft mode: thin subset + abbreviated ops + kdb shorthand):\n\
          \x20 ticks / orders / book                   bare table name dumps rows\n\

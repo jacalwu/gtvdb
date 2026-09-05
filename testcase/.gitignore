@@ -9,3 +9,6 @@ tc_duration_last.tsv
 
 # Windows download artifacts (browser ADS sidecars)
 *Zone.Identifier
+
+# gtv catalog home created by run_tc_duration1.sh (reload=Y)
+gtv_home/
