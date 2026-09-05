@@ -18,3 +18,38 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time"]
 tonic = "0.14"
 prost = "0.14"
 rayon = "1"
+
+# ---------------------------------------------------------------------------
+# Build-time tuning.
+#
+# The third-party graph (arrow / parquet / datafusion / tonic / rustls / ...)
+# dominates cold-build time. Cargo's `[profile.*.package."*"]` override applies
+# to *registry* dependencies only — workspace members (the gtv-* crates) are
+# untouched and keep the base `[profile.release]` / `[profile.dev]` settings,
+# so the runtime-critical HFT kernels in gtv-array stay fully optimized while
+# dependency compiles are made as cheap as possible.
+#
+# If a specific dependency is on a hot runtime path (e.g. datafusion SQL
+# throughput matters), restore its optimization with a named override:
+#
+#   [profile.release.package.datafusion]
+#   opt-level = 3
+#
+# Trade-offs:
+#   * opt-level = 1 vs 3 for deps: roughly halves cold codegen time; runtime
+#     impact is confined to code *inside* those crates.
+#   * LTO is intentionally left off (it lengthens link time); add
+#     `lto = "thin"` to [profile.release] only if cross-crate inlining of the
+#     gtv-* kernels ever shows up in profiles.
+# ---------------------------------------------------------------------------
+
+# Release: registry deps at opt-level 1 — clean builds and CI are the pain
+# point, and dep-internal code is not the hot path of the tuned kernels.
+[profile.release.package."*"]
+opt-level = 1
+
+# Dev: drop full debug info for registry deps so any rebuild that touches the
+# dependency tree (feature change, clean, CI) emits far less DWARF. Workspace
+# crates keep their default full-debug dev profile.
+[profile.dev.package."*"]
+debug = false
