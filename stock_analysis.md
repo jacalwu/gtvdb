@@ -216,6 +216,7 @@ SQL 範例(tick → 日 bar,資料需按 ts 升冪):
 | 統一 provider 拉數(`klines('futu',…)` / REPL `md klines`) | market 框架 | ✅ 已实现(`market/` + `main.rs` `md` 命令) |
 | `stock_analysis.sh`(SOURCE=futu 預設) | shell | ✅ 已实现(見 §7;退出碼 0/1/3) |
 | as-of 回归测试:`fwd_regress(name,asof_ns,H,k[,feats])` + `stock_regress.sh` | engine table fn + shell | ✅ 已实现(单/多 as-of 日期,输出方向命中、band 覆盖率、收益偏差) |
+| 诊断:`fwd_walk`(实际收益/分位数/波动列) + `stock_diag.sh` | engine table fn + shell | ✅ 已实现(calibration/quantile coverage/tail error/regime 四份 CSV,见 forcast.md) |
 
 附錄 B:範例輸出(目標格式)
 

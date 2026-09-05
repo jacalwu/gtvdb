@@ -345,6 +345,17 @@ fn walk_output_schema() -> Arc<Schema> {
         Field::new("p_down", DataType::Float64, false),
         Field::new("up", DataType::Int64, false), // realised: close[t+H] > close[t]
         Field::new("n_analogs", DataType::Int64, false),
+        // --- diagnostics columns ---
+        Field::new("actual_ret", DataType::Float64, false), // realised H-bar return
+        Field::new("q05", DataType::Float64, false), // neighbour forward H-ret quantiles
+        Field::new("q10", DataType::Float64, false),
+        Field::new("q25", DataType::Float64, false),
+        Field::new("q50", DataType::Float64, false),
+        Field::new("q75", DataType::Float64, false),
+        Field::new("q90", DataType::Float64, false),
+        Field::new("q95", DataType::Float64, false),
+        Field::new("bar_ret", DataType::Float64, false), // decision-bar daily return
+        Field::new("vol20", DataType::Float64, false),   // trailing-20d vol at decision day
     ]))
 }
 
@@ -391,7 +402,40 @@ fn z_apply(feats: &[Vec<f64>], mean: &[f64], std: &[f64]) -> Vec<Vec<f64>> {
         .collect()
 }
 
-/// Walk-forward prediction rows: `(t, close, p_up, p_down, up, n_analogs)`.
+/// Trailing `win`-day realised volatility (std of daily close-to-close
+/// returns ending at `end`, inclusive), 0.0 when too few samples.
+fn trailing_vol(closes: &[f64], end: usize, win: usize) -> f64 {
+    let lo = end.saturating_sub(win).max(1);
+    if end < 1 || end - lo + 1 < 3 {
+        return 0.0;
+    }
+    let mut sum = 0.0;
+    let mut ss = 0.0;
+    let mut cnt = 0usize;
+    for k in lo..=end {
+        if k >= 1 {
+            let r = closes[k] / closes[k - 1] - 1.0;
+            sum += r;
+            ss += r * r;
+            cnt += 1;
+        }
+    }
+    if cnt < 2 {
+        return 0.0;
+    }
+    let mean = sum / cnt as f64;
+    (ss / cnt as f64 - mean * mean).max(0.0).sqrt()
+}
+
+/// Strictly-causal walk-forward rows: `(t, close, p_up, p_down, up, n_analogs,
+/// actual_ret, q05..q95, bar_ret, vol20)`.
+///
+/// Decision bar `i` is scored using **only** labelled rows `j` with
+/// `j + H <= i` — i.e. neighbours whose outcome was already observable at the
+/// decision close (no look-ahead). Feature z-statistics likewise come from
+/// that same past-only labelled set. `q*` are quantiles of those neighbours'
+/// realised H-bar forward returns; `actual_ret` is the realised H-bar return
+/// of the decision bar itself; `bar_ret`/`vol20` support regime diagnostics.
 fn walk_compute(
     times: Vec<i64>,
     closes: Vec<f64>,
@@ -406,10 +450,16 @@ fn walk_compute(
             "fwd_walk: need > {horizon}+1 bars (got {n})"
         )));
     }
-    let m = n - horizon; // labelled rows [0, m)
-    let labels: Vec<bool> = (0..m).map(|i| closes[i + horizon] > closes[i]).collect();
-    let warm = warmup.clamp(1, m.saturating_sub(1));
+    let m = n - horizon; // decision/outcome rows [0, m): bar i has outcome close[i+H]
     let k = k.max(1);
+
+    // First decision bar with at least `warmup` past-labelled rows.
+    let start = horizon.saturating_add(warmup).saturating_sub(1).max(horizon + 1);
+    if start >= m {
+        return Err(DataFusionError::Execution(format!(
+            "fwd_walk: warmup {warmup} leaves no rows to evaluate (m={m}, start={start})"
+        )));
+    }
 
     let mut t = Vec::new();
     let mut close = Vec::new();
@@ -417,52 +467,79 @@ fn walk_compute(
     let mut p_down = Vec::new();
     let mut up = Vec::new();
     let mut n_analogs = Vec::new();
+    let mut actual_ret = Vec::new();
+    let mut q_cols = vec![Vec::new(); 7];
+    let mut bar_ret = Vec::new();
+    let mut vol20 = Vec::new();
 
-    for p in warm..m {
-        // Training set = labelled rows strictly before p, recomputed each step
-        // so the exercise is fully causal (no future leakage).
-        let (mean, std) = z_stats(&feats[..p]);
-        let scaled = z_apply(&feats[..p], &mean, &std);
+    for i in start..m {
+        let lab_n = i - horizon + 1; // labelled training rows j in [0, lab_n), j+H <= i
+        let (mean, std) = z_stats(&feats[..lab_n]);
+        let scaled = z_apply(&feats[..lab_n], &mean, &std);
         let q = {
-            let mut v = Vec::with_capacity(feats[p].len());
-            for (x, (m_, s)) in feats[p].iter().zip(mean.iter().zip(std.iter())) {
-                v.push((x - m_) / s);
+            let mut v = Vec::with_capacity(feats[i].len());
+            for (x, (mu, s)) in feats[i].iter().zip(mean.iter().zip(std.iter())) {
+                v.push((x - mu) / s);
             }
             v
         };
-        let mut dists: Vec<(f64, usize)> = (0..p)
+        let mut dists: Vec<(f64, usize)> = (0..lab_n)
             .map(|j| (sq_dist(&scaled[j], &q), j))
             .collect();
         dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
         let used = dists.len().min(k);
-        let ups = dists[..used].iter().filter(|(_, j)| labels[*j]).count();
+        let chosen = &dists[..used];
+
+        let mut hrets: Vec<f64> = chosen
+            .iter()
+            .map(|(_, j)| {
+                let base = closes[*j];
+                if base > 0.0 { closes[j + horizon] / base - 1.0 } else { f64::NAN }
+            })
+            .collect();
+        hrets.retain(|x| x.is_finite());
+        hrets.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+        let ups = chosen.iter().filter(|(_, j)| closes[j + horizon] > closes[*j]).count();
         let pu = ups as f64 / used as f64;
         let pd = (used - ups) as f64 / used as f64;
-        t.push(times[p]);
-        close.push(closes[p]);
+        let ps = [0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95];
+
+        let act = closes[i + horizon] / closes[i] - 1.0;
+        t.push(times[i]);
+        close.push(closes[i]);
         p_up.push(pu);
         p_down.push(pd);
-        up.push(labels[p] as i64);
+        up.push(if act > 0.0 { 1 } else { 0 });
         n_analogs.push(used as i64);
+        actual_ret.push(act);
+        for (col, pr) in q_cols.iter_mut().zip(ps.iter()) {
+            col.push(if hrets.is_empty() { f64::NAN } else { pct(&hrets, *pr) });
+        }
+        bar_ret.push(if i >= 1 { closes[i] / closes[i - 1] - 1.0 } else { 0.0 });
+        vol20.push(trailing_vol(&closes, i, 20));
     }
 
-    if t.is_empty() {
-        return Err(DataFusionError::Execution(format!(
-            "fwd_walk: warmup {warm} leaves no rows to evaluate (m={m})"
-        )));
-    }
-    RecordBatch::try_new(
-        walk_output_schema(),
-        vec![
-            Arc::new(Int64Array::from(t)) as ArrayRef,
-            Arc::new(Float64Array::from(close)) as ArrayRef,
-            Arc::new(Float64Array::from(p_up)) as ArrayRef,
-            Arc::new(Float64Array::from(p_down)) as ArrayRef,
-            Arc::new(Int64Array::from(up)) as ArrayRef,
-            Arc::new(Int64Array::from(n_analogs)) as ArrayRef,
-        ],
-    )
-    .map_err(|e| DataFusionError::Execution(format!("fwd_walk output: {e}")))
+    let cols: Vec<ArrayRef> = vec![
+        Arc::new(Int64Array::from(t)),
+        Arc::new(Float64Array::from(close)),
+        Arc::new(Float64Array::from(p_up)),
+        Arc::new(Float64Array::from(p_down)),
+        Arc::new(Int64Array::from(up)),
+        Arc::new(Int64Array::from(n_analogs)),
+        Arc::new(Float64Array::from(actual_ret)),
+        Arc::new(Float64Array::from(std::mem::take(&mut q_cols[0]))),
+        Arc::new(Float64Array::from(std::mem::take(&mut q_cols[1]))),
+        Arc::new(Float64Array::from(std::mem::take(&mut q_cols[2]))),
+        Arc::new(Float64Array::from(std::mem::take(&mut q_cols[3]))),
+        Arc::new(Float64Array::from(std::mem::take(&mut q_cols[4]))),
+        Arc::new(Float64Array::from(std::mem::take(&mut q_cols[5]))),
+        Arc::new(Float64Array::from(std::mem::take(&mut q_cols[6]))),
+        Arc::new(Float64Array::from(bar_ret)),
+        Arc::new(Float64Array::from(vol20)),
+    ];
+    RecordBatch::try_new(walk_output_schema(), cols)
+        .map_err(|e| DataFusionError::Execution(format!("fwd_walk output: {e}")))
 }
 
 /// `fwd_walk(name, horizon, k [, warmup] [, feats])` table function.
@@ -845,10 +922,16 @@ mod tests {
         let cols = batch.columns();
         let pu = as_primitive_array::<Float64Type>(cols[2].as_ref());
         let up = as_primitive_array::<Int64Type>(cols[4].as_ref());
-        assert_eq!(up.len(), 120 - horizon - 30);
+        // rows: m - (H + warm - 1) with m = n - H
+        let expected = 120usize - 2 * horizon - 29; // 120-3-(3+30-1)
+        assert_eq!(up.len(), expected, "eval row count");
         for i in 0..up.len() {
             assert_eq!(pu.value(i), 1.0, "row {i}: p_up must be 1 on pure uptrend");
             assert_eq!(up.value(i), 1);
+            let ar = as_primitive_array::<Float64Type>(cols[6].as_ref()).value(i);
+            assert!(ar > 0.0, "actual_ret positive");
+            let q50 = as_primitive_array::<Float64Type>(cols[10].as_ref()).value(i);
+            assert!(q50 > 0.0, "neighbour median fwd-ret positive");
         }
     }
 
