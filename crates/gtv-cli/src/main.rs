@@ -942,26 +942,49 @@ async fn run(
             );
         }
         "hc_load" => {
-            // hc_load <dst> <src> <from> <to> [root] — hot+cold load: cold
-            // partitions of `src` in [from,to] merged with the currently
-            // registered hot `src` (the open day), sorted by `t`, registered
-            // as `dst`. `dst` must differ from `src` so the live table is
-            // never replaced by its own view.
-            let dst = require_arg(&tokens, 1, "hc_load <dst> <src> <from> <to> [root]")?;
-            let src = require_arg(&tokens, 2, "hc_load <dst> <src> <from> <to> [root]")?;
-            let from = require_arg(&tokens, 3, "hc_load <dst> <src> <from> <to> [root]")?;
-            let to = require_arg(&tokens, 4, "hc_load <dst> <src> <from> <to> [root]")?;
-            let root = optional_arg(&tokens, 5).unwrap_or("hdb");
+            // hc_load <dst> <src> <from> <to> [--sym X] [--root DIR]
+            //   (legacy: positional [sym [root]] also accepted) — hot+cold load:
+            // cold partitions of `src` in [from,to] merged with the currently
+            // registered hot `src` (the open day), optionally filtered to one
+            // `symbol`, sorted by `t`, registered as `dst`. `dst` must differ
+            // from `src` so the live table is never replaced by its own view.
+            let dst = require_arg(&tokens, 1, "hc_load <dst> <src> <from> <to> [--sym X] [--root DIR]")?;
+            let src = require_arg(&tokens, 2, "hc_load <dst> <src> <from> <to> [--sym X] [--root DIR]")?;
+            let from = require_arg(&tokens, 3, "hc_load <dst> <src> <from> <to> [--sym X] [--root DIR]")?;
+            let to = require_arg(&tokens, 4, "hc_load <dst> <src> <from> <to> [--sym X] [--root DIR]")?;
+            let mut sym: Option<&str> = None;
+            let mut root = "hdb".to_string();
+            let mut i = 5;
+            while let Some(tok) = tokens.get(i).copied() {
+                if tok == "--sym" {
+                    sym = tokens.get(i + 1).copied();
+                    i += 2;
+                } else if tok == "--root" {
+                    root = tokens.get(i + 1).copied().unwrap_or("hdb").to_string();
+                    i += 2;
+                } else if sym.is_none() {
+                    sym = Some(tok); // legacy positional sym
+                    i += 1;
+                } else {
+                    root = tok.to_string(); // legacy positional root
+                    i += 1;
+                }
+            }
             if dst == src {
                 return Err(anyhow!("hc_load: dst must differ from src (use a view name)"));
             }
-            let hdb = HdbStore::new(root);
-            let cold = hdb.scan(src, from, to, &[])?;
+            let syms: Vec<String> = sym.map(|s| vec![s.to_string()]).unwrap_or_default();
+            let hdb = HdbStore::new(&root);
+            let cold = hdb.scan(src, from, to, &syms)?;
             let cold_rows: usize = cold.iter().map(|b| b.num_rows()).sum();
             let mut combined = cold;
+            let mut hot_rows = 0usize;
             if ctx.has_table(src).await {
-                let hot = ctx.sql(&format!("SELECT * FROM {src}")).await?;
-                let hot_rows: usize = hot.iter().map(|b| b.num_rows()).sum();
+                let mut hot = ctx.sql(&format!("SELECT * FROM {src}")).await?;
+                if let Some(s) = sym {
+                    hot = filter_symbol(hot, s)?;
+                }
+                hot_rows = hot.iter().map(|b| b.num_rows()).sum();
                 if hot_rows > 0 {
                     println!("hc_load: merging hot `{src}` ({hot_rows} rows)");
                     combined.extend(hot);
@@ -984,52 +1007,109 @@ async fn run(
                 return Err(anyhow!("hc_load: no rows after ordering"));
             };
             ctx.register_batches(dst, ofirst.schema(), ordered)?;
+            let sym_note = sym.map_or(String::new(), |s| format!(" sym={s}"));
+            let hot_note = if hot_rows > 0 { " + hot".to_string() } else { String::new() };
             println!(
-                "hc_load: `{dst}` <- `{src}` {from}..{to} (cold {cold_rows} rows{}\
-                 , sorted by t)",
-                if ctx.has_table(src).await { " + hot" } else { "" }
+                "hc_load: `{dst}` <- `{src}` {from}..{to} (cold {cold_rows} rows{hot_note}{sym_note}, sorted by t)"
             );
         }
         "hdb_flush" => {
             // hdb_flush <table> [root] [interval_secs] — background task that
-            // flushes the memory table to HDB (symbol-enumerated) on an interval.
+            //   (a) auto-rolls-over on a UTC date-key change: snapshot the hot
+            //       table into <root>/<old_date>/<table>/, then clear it so the
+            //       open day moves to the new date; and
+            //   (b) checkpoints within the same date only when the hot table
+            //       grew since the last checkpoint (cheap row-count gate via
+            //       the kernel registry, no full re-scan when unchanged).
             let table = require_arg(&tokens, 1, "hdb_flush <table> [root] [interval_secs]")?.to_string();
             let root = optional_arg(&tokens, 2).unwrap_or("hdb").to_string();
             let interval = optional_arg(&tokens, 3)
-                .map_or(Ok(86400u64), |s| s.parse::<u64>())?;
+                .map_or(Ok(60u64), |s| s.parse::<u64>())?;
             let ctx2 = ctx.clone();
             let table2 = table.clone();
             let root2 = root.clone();
             tokio::spawn(async move {
-                let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval));
-                // first tick fires immediately; skip it and flush at the first interval.
+                let mut date_key = chrono::Utc::now().format("%Y.%m.%d").to_string();
+                let mut last_rows = 0usize;
+                let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval.max(1)));
+                // first tick fires immediately; skip it.
                 ticker.tick().await;
                 loop {
                     ticker.tick().await;
-                    let date = chrono::Local::now().format("%Y.%m.%d").to_string();
+                    let today = chrono::Utc::now().format("%Y.%m.%d").to_string();
+                    if today != date_key {
+                        // (a) date changed: roll the previous open day into cold storage.
+                        match ctx2.sql(&format!("SELECT * FROM {table2}")).await {
+                            Ok(batches) => {
+                                let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+                                if rows > 0 {
+                                    if let Some(first) = batches.first() {
+                                        let all = match concat_batches(&first.schema(), &batches) {
+                                            Ok(b) => b,
+                                            Err(e) => {
+                                                eprintln!("hdb_flush `{table2}`: {e}");
+                                                date_key = today;
+                                                continue;
+                                            }
+                                        };
+                                        let hdb = HdbStore::new(&root2);
+                                        match hdb.write_table(&date_key, &table2, &all) {
+                                            Ok(n) => eprintln!(
+                                                "hdb_flush: auto-rollover {rows} rows of `{table2}` -> {date_key}/ ({n} partition(s))"
+                                            ),
+                                            Err(e) => eprintln!("hdb_flush `{table2}`: {e}"),
+                                        }
+                                        // Clear the hot table for the new open day (same schema).
+                                        let empty = RecordBatch::new_empty(first.schema());
+                                        let _ = ctx2.register_batches(&table2, empty.schema(), vec![empty]);
+                                    }
+                                }
+                            }
+                            Err(e) => eprintln!("hdb_flush `{table2}`: {e}"),
+                        }
+                        date_key = today;
+                        last_rows = 0;
+                        continue;
+                    }
+                    // (b) same-date checkpoint, only when the hot table grew.
+                    let grew = match ctx2.table_rows(&table2) {
+                        Some(r) => r != 0 && r != last_rows,
+                        // not in the kernel registry (e.g. native CTAS): keep
+                        // the legacy per-tick checkpoint behaviour.
+                        None => true,
+                    };
+                    if !grew {
+                        continue;
+                    }
                     match ctx2.sql(&format!("SELECT * FROM {table2}")).await {
                         Ok(batches) => {
-                            let Some(first) = batches.first() else { continue };
-                            let all = match concat_batches(&first.schema(), &batches) {
-                                Ok(b) => b,
-                                Err(e) => {
-                                    eprintln!("hdb_flush `{table2}`: {e}");
-                                    continue;
+                            if let Some(first) = batches.first() {
+                                let all = match concat_batches(&first.schema(), &batches) {
+                                    Ok(b) => b,
+                                    Err(e) => {
+                                        eprintln!("hdb_flush `{table2}`: {e}");
+                                        continue;
+                                    }
+                                };
+                                let hdb = HdbStore::new(&root2);
+                                let rows_now = all.num_rows();
+                                match hdb.write_table(&date_key, &table2, &all) {
+                                    Ok(n) => eprintln!(
+                                        "hdb_flush: checkpoint `{table2}` ({rows_now} rows) -> {date_key}/ ({n} partition(s))"
+                                    ),
+                                    Err(e) => eprintln!("hdb_flush `{table2}`: {e}"),
                                 }
-                            };
-                            let hdb = HdbStore::new(&root2);
-                            match hdb.write_table(&date, &table2, &all) {
-                                Ok(n) => eprintln!(
-                                    "hdb_flush: wrote {n} partition(s) to {date}/{table2}/"
-                                ),
-                                Err(e) => eprintln!("hdb_flush `{table2}`: {e}"),
+                                last_rows = rows_now;
                             }
                         }
                         Err(e) => eprintln!("hdb_flush `{table2}`: {e}"),
                     }
                 }
             });
-            println!("hdb_flush: `{table}` -> {root}/<date>/<table>/ every {interval}s");
+            println!(
+                "hdb_flush: `{table}` -> {root}/<date>/<table>/ every {interval}s \
+                 (auto-rollover on UTC date change; checkpoint only when rows grow)"
+            );
         }
         "fetch" => {
             // fetch <table> <symbol...> [--limit N] — pull historical ticks for
@@ -1621,8 +1701,8 @@ fn print_help() {
          \x20 hdb_load <table> <date> <sym> [root]  read one HDB partition\n\
          \x20 hdb_scan <table> <start> <end> [sym] [root]  scan HDB date range\n\
          \x20 rollover <table> <date> [root]  freeze today's hot table into a cold partition\n\
-         \x20 hc_load <dst> <src> <from> <to> [root]  hot+cold range view (sorted by t)\n\
-         \x20 hdb_flush <table> [root] [secs]  background HDB flush (sym-enumerated)\n\
+         \x20 hc_load <dst> <src> <from> <to> [--sym X] [--root DIR]  hot+cold range view (sorted by t)\n\
+         \x20 hdb_flush <table> [root] [secs]  background flush: auto-rollover on date change + checkpoint\n\
          \x20 tt <table> <T>        time-travel: table snapshot as-of T\n\
          \x20 pattern [T]           temporal pattern matching (ring/path/diamond)\n\
          \x20 delta                 LSM delta buffer insert + compaction demo\n\
@@ -1737,4 +1817,30 @@ fn infer_vec_dim(batches: &[RecordBatch]) -> Result<usize> {
     } else {
         Ok(dim)
     }
+}
+
+/// Keep only rows whose `symbol` column equals `sym` (used to filter the hot
+/// side of `hc_load`; the cold side filters by partition file instead).
+fn filter_symbol(batches: Vec<RecordBatch>, sym: &str) -> Result<Vec<RecordBatch>> {
+    let mut out = Vec::with_capacity(batches.len());
+    for b in batches {
+        let col = b.column_by_name("symbol").ok_or_else(|| {
+            anyhow!("hc_load: `{sym}` filter needs a `symbol` column")
+        })?;
+        let arr = cast(col, &DataType::Utf8).map_err(|e| anyhow!("filter symbol: {e}"))?;
+        let strings = arr
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| anyhow!("filter symbol: `symbol` is not a string column"))?;
+        let mask = BooleanArray::from(
+            (0..b.num_rows())
+                .map(|i| strings.value(i) == sym)
+                .collect::<Vec<bool>>(),
+        );
+        let filtered = filter_record_batch(&b, &mask)?;
+        if filtered.num_rows() > 0 {
+            out.push(filtered);
+        }
+    }
+    Ok(out)
 }

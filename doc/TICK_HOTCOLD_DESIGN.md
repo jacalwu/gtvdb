@@ -52,7 +52,7 @@ tick 資料的生命週期極不均勻:
 2. **換日 rollover**:把當天表整批寫成 immutable 歷史 partition,寫完
    更新 manifest,再開新當天表。觸發見 §10 Q2:偵測到 UTC 日期鍵改變即自動
    flush(以現有 `hdb_flush` 背景 task 為基底),另提供手動 `rollover` 指令
-   立即封存。
+   立即封存。→ M1 已整合:`hdb_flush` 背景自動換日、`rollover` 手動。
    - 現有 `hdb_flush` 背景 task 已做「定時 flush」;只差「換日時清空當天表並
      指到新日期」與「flush 到遠端 root」。
 3. **當天資料易失性**:可接受數秒行情損失 → 不需 WAL;要零損失再引入
@@ -152,7 +152,7 @@ read routing(#15):當天=leader 強一致;歷史 immutable → follower/快取�
 | 里程碑 | 內容 | 關聯 issue | 新寫量 |
 |---|---|---|---|
 | M0 | 已具備:本機 hdb_save/scan/flush + mmap + cache | — | 0 |
-| **M1** | ✅ 單機 hot+cold:`rollover`(熱表封存→冷 partition + 清空)與 `hc_load`(冷 range + 當天 hot 依日期 union,ORDER BY t) | — | 已實作(gtv-cli,debug 驗證) |
+| **M1** | ✅ 單機 hot+cold:`rollover`、`hc_load`(冷 range + 當天 hot union,`--sym/--root`,ORDER BY t);`hdb_flush` 整合 UTC 日期鍵改變自動 rollover + 同日期成長才 checkpoint | — | 已實作(gtv-cli) |
 | M2 | per-table manifest v1 + schema_sha 驗證 | #16 | 小 |
 | M3 | 遠端 root 真正掛 S3/MinIO;mmap 拉檔快取 | #7 | 中 |
 | M4 | 分散:coordinator 跨日 map/reduce、各節點當天/歷史分工 | #14/#15 | 大 |

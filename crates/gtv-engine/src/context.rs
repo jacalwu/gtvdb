@@ -144,6 +144,17 @@ impl GtvContext {
         self.ctx.sql(&format!("SELECT * FROM {name} LIMIT 0")).await.is_ok()
     }
 
+    /// Row count of a registered table without materializing a query, or
+    /// `None` when the table is not in the kernel registry (e.g. created via
+    /// native DataFusion CTAS). Cheap — used by background flush tasks to
+    /// decide whether a hot table changed since the last checkpoint.
+    pub fn table_rows(&self, name: &str) -> Option<usize> {
+        let reg = self.hft_reg.read().ok()?;
+        reg.tables
+            .get(name)
+            .map(|batches| batches.iter().map(|b| b.num_rows()).sum())
+    }
+
     /// Load a CSV file from disk and register it as `name` (method 1:
     /// traditional disk load).
     pub fn register_csv(&self, path: &str, name: &str) -> Result<()> {
