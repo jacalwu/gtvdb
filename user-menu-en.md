@@ -13,7 +13,7 @@ modes:
 ## 1. Build & Launch
 
 ```sh
-cargo build --release -p gtv-cli --bin gtv
+./rebuild.sh                    # build release gtv (rerun after any crates/ change)
 cargo run --release -p gtv-cli --bin gtv
 # or run the prebuilt binary
 ./target/release/gtv
@@ -322,7 +322,7 @@ Quant operators (phase 2):
 ## 6. Shell Commands
 
 ```text
-help | tables | quit
+help | tables | providers | quit
 neighbors <node> [T]       k-hop <node> <k> [T]
 mavg <n> | msum <n> | deltas
 asof [t ...]               knn <node> [k] [--mask ids]
@@ -331,6 +331,8 @@ loadcsv <table> <path>     bgload <table> <path> [ms]
 live <table> <symbol...>   stream LSE live ticks (needs LSE_API_KEY)
 fetch <table> <symbol> [limit]  pull LSE historical ticks (REST API)
 yahoo <table> <symbol...> [--range 1y]  pull daily OHLCV from Yahoo
+md klines <provider> <table> <code...> [--period 1d] [--start] [--end] [--max] [--adjust]
+md ticks  <provider> <table> <code...> [--max N]   market data -> named session table
 hdb_save <table> <date> [root]  persist table to HDB partitions
 hdb_load <table> <date> <sym> [root]  read one HDB partition
 hdb_scan <table> <start> <end> [sym] [root]  scan HDB date range
@@ -339,9 +341,80 @@ tt <table> <T>             pattern [T]        delta
 udf [x ...]                remote <host:port> <sql>
 ```
 
+Market/trend functions (provider is just the first argument, see §7):
+
+```text
+providers                            # list registered providers
+klines('futu','HK.00700','1d','2024-06-03','2024-06-07')   # bare call = hft shorthand
+SELECT * FROM klines('yahoo','0700.HK','1d',...);           # standard SQL (any mode)
+fwd_proba('table',H,K)              # P(up/down) over the next H trading days
+fwd_walk('table',H,K[,warmup])      # strictly-causal walk-forward replay
+fwd_regress('table',asof_ns,H,K)    # as-of regression: direction+band vs realised
+```
+
 ---
 
-## 7. Performance Notes
+## 7. Market-Data Providers & Trend Analysis
+
+### 7.1 Unified provider framework
+
+Any source (Futu OpenD, Yahoo Finance, your own registered provider) implements
+the same `MarketProvider` trait and is looked up by name — the interface is
+identical and the provider is just the first function argument:
+
+```sql
+-- Standard SQL (any mode):
+SELECT * FROM klines('futu', 'HK.00700', '1d', '2024-06-03', '2024-06-30');
+SELECT * FROM ticks('futu', 'HK.00700', 100);       -- session ticks (intraday, LV2)
+-- REPL hft mode also accepts the bare shorthand:
+klines('yahoo', '0700.HK', '1d', '2024-01-01', '2024-03-01')
+```
+
+- Unified schema: `provider, symbol, ts (UTC epoch ns), open/high/low/close, volume, turnover, adjclose` (ticks add direction/sequence)
+- Signature: `klines(provider, code, period[, start][, end][, max][, adjust])`; period `1m..1Y`, dates `YYYY-MM-DD` inclusive
+- `futu`: local OpenD (`127.0.0.1:11111`) + `futu-api`, codes `HK.00700/US.AAPL`; `yahoo`: keyless, codes `0700.HK/AAPL`, no ticks
+- Engine-level **cache-first + incremental fill** (static history fetched once):
+  root `GTV_MARKET_DIR` (default `data/market`), `GTV_MARKET_CACHE=0` disables
+
+The `md` command registers fetched market data as a named session table
+(for `fwd_*` / SQL / HDB):
+
+```text
+gtv> md klines futu hk700 HK.00700 --period 1d --start 2024-01-01 --end 2024-12-31
+```
+
+### 7.2 7–14 trading-day trend signal (historical-analog kNN)
+
+Built-in features (mom5/mom10/vol10/above_sma20 — or custom columns via `feats`)
+are z-scored, then the K most similar past days are found;
+`p_up/p_down` = share of those analog days whose next-H actual move was up/down:
+
+```text
+gtv> md klines futu hk700 HK.00700 --period 1d --start 2020-01-01
+SELECT * FROM fwd_proba('hk700', 10, 20);    -- decision bar = last row: p_up, p_down, hit_rate
+```
+
+- `fwd_walk('table', H, K)` — strictly-causal replay (each bar only uses the
+  past), one forecast/outcome row per evaluated bar; feeds `stock_calib.sh`
+- `fwd_regress('table', asof_ns, H, K)` — treat a past day as “today”, output
+the direction probabilities + predicted price band (`pred_lo/pred_hi`) and
+compare with the realised future path
+
+### 7.3 One-shot scripts
+
+```bash
+./stock_analysis.sh HK.00700          # SOURCE=futu default; exit 0 no signal / 3 alert (THRESHOLD default 0.75, adjustable)
+./stock_calib.sh HK.00700             # walk-forward calibration: p buckets vs realised + threshold suggestion
+./stock_regress.sh HK.00700 2026-08-03 2026-07-01   # as-of regression: hit/coverage/return error
+# Source/params: SOURCE=yahoo|parquet, HORIZON=10, K=20, THRESHOLD=0.8, START/END, FILE=(parquet reuse)
+```
+
+See `doc/market-providers.md` and `stock_analysis.md` for details and known
+boundaries (Futu has no historical tick dumps, Yahoo intraday lookback caps).
+
+---
+
+## 8. Performance Notes
 
 - In `hft` mode, `pit` / `wash` / `aj` / `ofi` / bare table scans are compiled once
   into a **KernelPlan** (cached by query text) and executed directly on the
@@ -353,7 +426,7 @@ udf [x ...]                remote <host:port> <sql>
 
 ---
 
-## 8. Notes
+## 9. Notes
 
 - The `full` mode is the complete DataFusion SQL surface; the `hft` mode is the
   latency-first subset (no JOIN / GROUP BY / CTE / subquery).

@@ -12,7 +12,7 @@ gtvdb 是單引擎記憶體資料庫，融合 **Graph + Temporal + Vector + Colu
 ## 1. 建置與啟動
 
 ```sh
-cargo build --release -p gtv-cli --bin gtv
+./rebuild.sh                    # 编译 release gtv（改 crates/ 后记得重跑）
 cargo run --release -p gtv-cli --bin gtv
 # 或直接執行已編譯的二進位
 ./target/release/gtv
@@ -317,7 +317,7 @@ FROM t;
 ## 6. Shell 命令
 
 ```text
-help | tables | quit
+help | tables | providers | quit
 neighbors <node> [T]       k-hop <node> <k> [T]
 mavg <n> | msum <n> | deltas
 asof [t ...]               knn <node> [k] [--mask ids]
@@ -326,6 +326,8 @@ loadcsv <table> <path>     bgload <table> <path> [ms]
 live <table> <symbol...>   串流 LSE 即時 tick（需 LSE_API_KEY）
 fetch <table> <symbol> [limit]  抓取 LSE 歷史 tick（REST API）
 yahoo <table> <symbol...> [--range 1y]  抓 Yahoo 日線 OHLCV
+md klines <provider> <table> <code...> [--period 1d] [--start] [--end] [--max] [--adjust]
+md ticks  <provider> <table> <code...> [--max N]   行情 → 直接注册 session 表
 hdb_save <table> <date> [root]  把表持久化到 HDB 分區
 hdb_load <table> <date> <sym> [root]  讀取單個 HDB 分區
 hdb_scan <table> <start> <end> [sym] [root]  掃描 HDB 日期區間
@@ -334,9 +336,74 @@ tt <table> <T>             pattern [T]        delta
 udf [x ...]                remote <host:port> <sql>
 ```
 
+行情/趨勢分析函數（provider 只是第一個參數，見 §7）：
+
+```text
+providers                            # 列出已注册的 provider
+klines('futu','HK.00700','1d','2024-06-03','2024-06-07')   # 裸调=hft 简写
+SELECT * FROM klines('yahoo','0700.HK','1d',...);           # 标准 SQL（任何模式）
+fwd_proba('表',H,K)                 # 下一 H 交易日上涨/下跌概率
+fwd_walk('表',H,K[,warmup])         # 严格因果 walk-forward 回放
+fwd_regress('表',asof_ns,H,K)       # as-of 回归：方向+区间 vs 真实
+```
+
 ---
 
-## 7. 效能說明
+## 7. 行情資料提供者與趨勢分析
+
+### 7.1 統一 provider 框架
+
+任何數據源（Futu OpenD、Yahoo Finance、自行註冊的 provider）實作同一個
+`MarketProvider` trait 後按名字注册，**接口完全一致**——provider 只是函數的第一個參數：
+
+```sql
+-- 标准 SQL（任何模式）：
+SELECT * FROM klines('futu', 'HK.00700', '1d', '2024-06-03', '2024-06-30');
+SELECT * FROM ticks('futu', 'HK.00700', 100);       -- 当日逐笔（需盘中 + LV2）
+-- REPL hft 模式可裸写：
+klines('yahoo', '0700.HK', '1d', '2024-01-01', '2024-03-01')
+```
+
+- 統一 schema：`provider, symbol, ts(UTC 纳秒), open/high/low/close, volume, turnover, adjclose`（tick 另有 direction/sequence）
+- 参数：`klines(provider, code, period[, start][, end][, max][, adjust])`；period `1m..1Y`，日期 `YYYY-MM-DD` 闭区间
+- `futu`：本机 OpenD（`127.0.0.1:11111`）+ `futu-api`，代码 `HK.00700/US.AAPL`；`yahoo`：免 key，代码 `0700.HK/AAPL`，无 tick
+- 引擎内置**缓存优先 + 增量补齐**（历史数据只拉一次）：目录 `GTV_MARKET_DIR`（默认 `data/market`），`GTV_MARKET_CACHE=0` 关闭
+
+`md` 命令把行情注册成命名 session 表（供 `fwd_*`/SQL/HDB 使用）：
+
+```text
+gtv> md klines futu hk700 HK.00700 --period 1d --start 2024-01-01 --end 2024-12-31
+```
+
+### 7.2 未来 7–14 个交易日趋势信号（历史类比 kNN）
+
+特征（内置 mom5/mom10/vol10/above_sma20，也可用 `feats` 自定列）→ z-score →
+历史中找 K 个最相似交易日，`p_up/p_down` = 类比日未来 H 根实际涨/跌占比：
+
+```text
+gtv> md klines futu hk700 HK.00700 --period 1d --start 2020-01-01
+SELECT * FROM fwd_proba('hk700', 10, 20);    -- 决策日=最后一根：p_up, p_down, hit_rate
+```
+
+- `fwd_walk('表', H, K)`：**严格因果**回放（每个历史点只用其之前的数据），逐条
+  输出预测与真实结果，供校准（`stock_calib.sh`）
+- `fwd_regress('表', asof_ns, H, K)`：把过去某日当“决策日”，输出方向概率 +
+  预测价格区间（`pred_lo/pred_hi`）并与真实未来路径对比偏差
+
+### 7.3 一键脚本
+
+```bash
+./stock_analysis.sh HK.00700          # SOURCE=futu 默认；exit 0 无信号 / 3 触发提醒（THRESHOLD 默认 0.75 可调）
+./stock_calib.sh HK.00700             # walk-forward 校准：分桶 p vs 实际涨率 + 阈值建议
+./stock_regress.sh HK.00700 2026-08-03 2026-07-01   # as-of 回归：方向命中/区间覆盖/收益偏差
+# 数据源/参数：SOURCE=yahoo|parquet，HORIZON=10, K=20, THRESHOLD=0.8, START/END, FILE=（parquet 复用）
+```
+
+详细文档：`doc/market-providers.md`、`stock_analysis.md`（含校准/回测结论与边界：Futu 无历史逐笔、Yahoo 分钟回溯窗口限制等）。
+
+---
+
+## 8. 效能說明
 
 - `hft` 模式下，`pit` / `wash` / `aj` / `ofi` / 裸表掃描會先編譯成 **KernelPlan**
   （依查詢文字快取），之後直接呼叫 compiled kernel——熱路徑零 DataFusion 規劃。
@@ -347,7 +414,7 @@ udf [x ...]                remote <host:port> <sql>
 
 ---
 
-## 8. 備註
+## 9. 備註
 
 - `full` 模式是完整 DataFusion SQL；`hft` 模式是低延遲子集（不支援 JOIN / GROUP BY
   / CTE / 子查詢）。
