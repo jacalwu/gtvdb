@@ -1,1 +1,14 @@
 /target
+# heavy installers / runtimes
+/Futu_OpenD*/
+/Futu_OpenD_ubuntu.tar.gz
+# generated data & outputs
+/analytics_out/
+/data/
+# personal runtime config (git add -f if you want to version them)
+/HOLDING.txt
+/HOLDING.cfg
+# editor / python artifacts
+**/__pycache__/
+*.pyc
+*.swp

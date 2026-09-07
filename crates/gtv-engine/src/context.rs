@@ -48,6 +48,9 @@ impl GtvContext {
         for udwf in crate::quant::quant_window_udfs() {
             ctx.register_udwf(udwf);
         }
+        for udwf in crate::indicator::indicator_window_udfs() {
+            ctx.register_udwf(udwf);
+        }
         for udf in crate::micro::micro_scalar_udfs() {
             ctx.register_udf(udf);
         }
@@ -82,6 +85,42 @@ impl GtvContext {
             ctx.register_udtf("l2", l2);
             let ohlc = Arc::new(crate::quant::OhlcTableFunction::new(hft_reg.clone()));
             ctx.register_udtf("ohlc", ohlc);
+            ctx.register_udtf(
+                "align",
+                Arc::new(crate::quant::AlignTableFunction::new(hft_reg.clone())),
+            );
+            ctx.register_udtf(
+                "backtest",
+                Arc::new(crate::bt::BacktestTableFunction::new(hft_reg.clone())),
+            );
+            ctx.register_udtf(
+                "bt_report",
+                Arc::new(crate::bt::BtReportTableFunction::new(hft_reg.clone())),
+            );
+            ctx.register_udtf(
+                "pf_backtest",
+                Arc::new(crate::bt::PfBacktestTableFunction::new(hft_reg.clone())),
+            );
+            ctx.register_udtf(
+                "pf_report",
+                Arc::new(crate::bt::PfReportTableFunction::new(hft_reg.clone())),
+            );
+            ctx.register_udtf(
+                "dq_report",
+                Arc::new(crate::monitor::DqReportTableFunction::new(hft_reg.clone())),
+            );
+            ctx.register_udtf(
+                "dq_check",
+                Arc::new(crate::monitor::DqCheckTableFunction::new(hft_reg.clone())),
+            );
+            ctx.register_udtf(
+                "health_check",
+                Arc::new(crate::monitor::HealthCheckTableFunction::new(hft_reg.clone())),
+            );
+            ctx.register_udtf(
+                "strategy_stats",
+                Arc::new(crate::monitor::StrategyStatsTableFunction::new(hft_reg.clone())),
+            );
             ctx.register_udtf(
                 "fwd_proba",
                 Arc::new(crate::analytics::FwdProbaTableFunction::new(hft_reg.clone())),

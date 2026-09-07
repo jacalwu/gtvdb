@@ -1459,6 +1459,9 @@ async fn run(
             return drop_named(ctx, catalog.as_mut(), name, if_exists).await;
         }
         "quit" | "exit" => return Ok(Action::Quit),
+        "metrics" => {
+            print!("{}", gtv_engine::monitor::prometheus_text());
+        }
         "sql" => {
             let q = line.get(3..).unwrap_or("").trim();
             run_sql(ctx, q, timing).await?;
@@ -1716,6 +1719,15 @@ const DF_TABLE_FNS: &[&str] = &[
     "fwd_proba",
     "fwd_walk",
     "fwd_regress",
+    "align",
+    "backtest",
+    "bt_report",
+    "pf_backtest",
+    "pf_report",
+    "dq_report",
+    "dq_check",
+    "health_check",
+    "strategy_stats",
 ];
 
 /// Read a data file, auto-detecting CSV vs Parquet by extension.
@@ -1770,6 +1782,7 @@ async fn run_sql(ctx: &GtvContext, query: &str, timing: &bool) -> Result<()> {
     let t0 = Instant::now();
     let batches = ctx.sql(query).await?;
     let us = t0.elapsed().as_secs_f64() * 1e6;
+    gtv_engine::monitor::record_query(t0.elapsed().as_secs_f64());
     if *timing {
         println!("duration: {us:.3} µs (sql)");
     }
@@ -1818,7 +1831,8 @@ fn print_help() {
          \x20                       [--max N] [--adjust qfq]  fetch K-lines -> session table\n\
          \x20 md ticks  <provider> <table> <code...> [--max N]  fetch ticks -> session table\n\
          \x20 fwd_proba('<table>',H,K[,feats])  P(up/down) over next H bars (historical analog)\n\
-         \x20 fwd_walk('<table>',H,K[,warmup][,feats])  strict walk-forward rows (calibration)\n\
+         \x20 fwd_walk('<table>',H,K[,warmup][,feats][,'analog'|'gbdt'])  walk-forward rows\n\
+         \x20                       (trailing 'model' selects scorer; gbdt reserved for design.md M2)\n\
          \x20 klines('provider','code',...) / ticks('provider','code')  direct fetch (see providers)\n\
          \x20 neighbors <node> [T]  temporal neighbors at time T (default 0)\n\
          \x20 khop <node> <k> [T]   k-hop traversal at time T\n\

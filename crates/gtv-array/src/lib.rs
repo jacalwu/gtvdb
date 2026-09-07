@@ -5,6 +5,7 @@
 //! Phase 2.
 
 pub mod asof;
+pub mod backtest;
 pub mod hft_ops;
 pub mod micro;
 pub mod quant;

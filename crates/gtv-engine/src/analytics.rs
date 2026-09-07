@@ -25,7 +25,7 @@
 
 use std::sync::{Arc, RwLock};
 
-use arrow::array::{as_primitive_array, ArrayRef, Float64Array, Int64Array};
+use arrow::array::{as_primitive_array, ArrayRef, Float64Array, Int64Array, StringArray};
 use arrow::compute::cast;
 use arrow::datatypes::{DataType, Field, Float64Type, Int64Type, Schema};
 use arrow::record_batch::RecordBatch;
@@ -37,6 +37,108 @@ use datafusion::scalar::ScalarValue;
 
 use crate::expr_util::{expr_to_i64, expr_to_string};
 use crate::hft_exec::HftRegistry;
+
+// ---------------------------------------------------------------------------
+// Label & model-selection seams (design.md D1 / D2).
+// ---------------------------------------------------------------------------
+
+/// Binary label semantics for "up over the next `horizon` bars" (design.md D1).
+///
+/// Up = strictly positive H-bar move: `close[t+H] > close[t]`. A *flat*
+/// outcome (equal closes) is NOT up and folds into the down bucket — matching
+/// the historical-analog pipeline and doc/stock_analysis.md (「平盤計入非漲」).
+/// This is the single source of truth used by `compute`, `walk_compute` and
+/// `regress_compute`.
+///
+/// The three-class extension (sideways band ±ε) is **deferred to Phase B**
+/// (design.md §11 D1). When it lands, the flat-band half-width should scale
+/// with the horizon (ε(H=5)≈0.5% , ε(H=10)≈1%) and its definition lives here.
+#[inline]
+fn is_up(close_now: f64, close_fwd: f64) -> bool {
+    close_fwd > close_now
+}
+
+/// Which prediction backend scores the decision rows (design.md D2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScorerKind {
+    /// Historical-analog kNN — the production scorer today.
+    Analog,
+    /// In-engine gradient-boosted trees — reserved for design.md M2 (not built).
+    Gbdt,
+}
+
+impl ScorerKind {
+    fn parse(tok: &str) -> Option<ScorerKind> {
+        match tok.trim() {
+            "analog" => Some(ScorerKind::Analog),
+            "gbdt" => Some(ScorerKind::Gbdt),
+            _ => None,
+        }
+    }
+
+    /// Stable tag emitted in the additive output `model` column so every row
+    /// stays attributable to its scoring backend.
+    fn tag(self) -> &'static str {
+        match self {
+            ScorerKind::Analog => "analog",
+            ScorerKind::Gbdt => "gbdt",
+        }
+    }
+}
+
+fn expr_is_string_literal(e: &Expr) -> bool {
+    matches!(
+        e,
+        Expr::Literal(ScalarValue::Utf8(Some(_)) | ScalarValue::LargeUtf8(Some(_)), _)
+    )
+}
+
+/// Split an optional trailing `model` token (`'analog'` / `'gbdt'`) off the
+/// table-function arguments. The token must be the **last** positional arg and
+/// a bare string from the known set; anything else (a feats CSV, a number, …)
+/// leaves the list untouched, so trailing features keep their meaning.
+/// Returns `(model, args_to_keep)`.
+fn split_model_token(exprs: &[Expr]) -> (ScorerKind, usize) {
+    if let Some(last) = exprs.last() {
+        if expr_is_string_literal(last) {
+            if let Ok(s) = expr_to_string(last) {
+                if let Some(k) = ScorerKind::parse(&s) {
+                    return (k, exprs.len() - 1);
+                }
+            }
+        }
+    }
+    (ScorerKind::Analog, exprs.len())
+}
+
+/// Scorer availability gate: only backends that exist today may be selected.
+fn ensure_available(model: ScorerKind) -> Result<()> {
+    match model {
+        ScorerKind::Analog => Ok(()),
+        ScorerKind::Gbdt => Err(DataFusionError::Execution(
+            "model='gbdt' is reserved for design.md M2 (in-engine GBDT not built yet); \
+             use model='analog'"
+                .into(),
+        )),
+    }
+}
+
+/// Append the additive `model` tag column (Utf8) to an engine output batch.
+/// Schema extension is backwards-compatible: consumers address columns by name.
+fn append_model_col(batch: RecordBatch, model: ScorerKind) -> Result<RecordBatch> {
+    let rows = batch.num_rows();
+    let mut fields: Vec<Field> = batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.as_ref().clone())
+        .collect();
+    fields.push(Field::new("model", DataType::Utf8, false));
+    let mut cols: Vec<ArrayRef> = batch.columns().to_vec();
+    cols.push(Arc::new(StringArray::from(vec![model.tag(); rows])) as ArrayRef);
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), cols)
+        .map_err(|e| DataFusionError::Execution(format!("append model column: {e}")))
+}
 
 /// The `fwd_proba` table function over the compiled-kernel table registry.
 #[derive(Debug)]
@@ -237,7 +339,7 @@ fn compute(
         )));
     }
     let m = n - horizon; // labelled rows [0, m)
-    let labels: Vec<bool> = (0..m).map(|i| closes[i + horizon] > closes[i]).collect();
+    let labels: Vec<bool> = (0..m).map(|i| is_up(closes[i], closes[i + horizon])).collect();
     let (scaled, query) = zscore_with(&feats, m);
     let (p_up, p_down, n_used, hit_rate) = analog(&scaled, &labels, &query, k.max(1));
     let batch = RecordBatch::try_new(
@@ -626,7 +728,10 @@ fn walk_compute(
         hrets.retain(|x| x.is_finite());
         hrets.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
-        let ups = chosen.iter().filter(|(_, j)| closes[j + horizon] > closes[*j]).count();
+        let ups = chosen
+            .iter()
+            .filter(|(_, j)| is_up(closes[*j], closes[j + horizon]))
+            .count();
         let pu = ups as f64 / used as f64;
         let pd = (used - ups) as f64 / used as f64;
         let ps = [0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95];
@@ -636,7 +741,7 @@ fn walk_compute(
         close.push(closes[i]);
         p_up.push(pu);
         p_down.push(pd);
-        up.push(if act > 0.0 { 1 } else { 0 });
+        up.push(if is_up(closes[i], closes[i + horizon]) { 1 } else { 0 });
         n_analogs.push(used as i64);
         actual_ret.push(act);
         for (col, pr) in q_cols.iter_mut().zip(ps.iter()) {
@@ -694,7 +799,11 @@ fn walk_compute(
         .map_err(|e| DataFusionError::Execution(format!("fwd_walk output: {e}")))
 }
 
-/// `fwd_walk(name, horizon, k [, warmup] [, feats])` table function.
+/// `fwd_walk(name, horizon, k [, warmup] [, cal_frac] [, feats] [, 'model'])` table function.
+///
+/// Optional trailing `model` token (design.md D2): `'analog'` (default) or
+/// `'gbdt'` (reserved — in-engine GBDT lands in design.md M2; selecting it
+/// today is a clear error). The token must be the last positional argument.
 #[derive(Debug)]
 pub struct FwdWalkTableFunction {
     registry: Arc<RwLock<HftRegistry>>,
@@ -712,6 +821,9 @@ impl TableFunctionImpl for FwdWalkTableFunction {
         args: TableFunctionArgs,
     ) -> Result<Arc<dyn datafusion::datasource::TableProvider>> {
         let exprs = args.exprs();
+        let (model, keep) = split_model_token(exprs);
+        ensure_available(model)?;
+        let exprs = &exprs[..keep];
         let name = expr_to_string(exprs.first().ok_or_else(|| {
             DataFusionError::Execution("fwd_walk(name, horizon, k [, warmup] [, feats]): missing name".into())
         })?)?;
@@ -746,6 +858,8 @@ impl TableFunctionImpl for FwdWalkTableFunction {
         //   arg4: numeric in (0,1) -> calibration fraction (overrides arg3)
         //         string (if arg3 was numeric) -> feats CSV
         //   arg5: feats CSV when arg4 was the calibration fraction
+        //   trailing: bare string token in {analog, gbdt} -> model (default
+        //     analog; stripped before the parsing above — see split_model_token)
         let warm_default = (k.max(2) * 10).max(20);
         let mut warmup = warm_default;
         let mut cal_frac = 0.0f64;
@@ -806,7 +920,10 @@ impl TableFunctionImpl for FwdWalkTableFunction {
             None => auto_features(&closes),
         };
 
-        let out = walk_compute(times, closes, feats, horizon, k, warmup, cal_frac)?;
+        let out = append_model_col(
+            walk_compute(times, closes, feats, horizon, k, warmup, cal_frac)?,
+            model,
+        )?;
         Ok(Arc::new(MemTable::try_new(out.schema(), vec![vec![out]])?))
     }
 }
@@ -883,7 +1000,7 @@ fn regress_compute(
         )));
     }
     let m = p - horizon; // labelled rows within prefix
-    let labels: Vec<bool> = (0..m).map(|i| closes[i + horizon] > closes[i]).collect();
+    let labels: Vec<bool> = (0..m).map(|i| is_up(closes[i], closes[i + horizon])).collect();
     let k = k.max(1);
 
     // z-normalise over the labelled prefix and score the decision bar (= last
@@ -950,7 +1067,7 @@ fn regress_compute(
         let full = n_future as usize == horizon;
         let ret = closes[e + n_future as usize] / base - 1.0;
         let up = if full {
-            if ret > 0.0 { 1 } else { 0 }
+            if is_up(base, closes[e + n_future as usize]) { 1 } else { 0 }
         } else {
             -1
         };
@@ -980,9 +1097,10 @@ fn regress_compute(
     .map_err(|e| DataFusionError::Execution(format!("fwd_regress output: {e}")))
 }
 
-/// `fwd_regress(name, asof_ns, horizon, k [, feats])` table function — as-of
+/// `fwd_regress(name, asof_ns, horizon, k [, feats] [, 'model'])` table function — as-of
 /// regression test (one decision bar per call). `asof_ns` is an epoch-ns
 /// calendar-day anchor; bars on/before that day are the training prefix.
+/// Optional trailing `model` token as in `fwd_walk` (design.md D2).
 #[derive(Debug)]
 pub struct FwdRegressTableFunction {
     registry: Arc<RwLock<HftRegistry>>,
@@ -1000,6 +1118,9 @@ impl TableFunctionImpl for FwdRegressTableFunction {
         args: TableFunctionArgs,
     ) -> Result<Arc<dyn datafusion::datasource::TableProvider>> {
         let exprs = args.exprs();
+        let (model, keep) = split_model_token(exprs);
+        ensure_available(model)?;
+        let exprs = &exprs[..keep];
         let name = expr_to_string(exprs.first().ok_or_else(|| {
             DataFusionError::Execution(
                 "fwd_regress(name, asof_ns, horizon, k [, feats]): missing name".into(),
@@ -1064,7 +1185,7 @@ impl TableFunctionImpl for FwdRegressTableFunction {
             None => auto_features(&closes),
         };
 
-        let out = regress_compute(times, closes, feats, asof_ns, horizon, k)?;
+        let out = append_model_col(regress_compute(times, closes, feats, asof_ns, horizon, k)?, model)?;
         Ok(Arc::new(MemTable::try_new(out.schema(), vec![vec![out]])?))
     }
 }
@@ -1227,5 +1348,74 @@ mod tests {
         }
         assert!(finite > 0, "calibrated region must be populated");
         assert!(finite < iso.len() as usize, "fitting window must stay NaN");
+    }
+
+    #[test]
+    fn flat_close_counts_as_not_up() {
+        // D1: label semantics — a flat H-bar move (equal closes) is *not* up,
+        // so an all-flat series has p_up == 0 (flat folds into the down
+        // bucket, matching stock_analysis.md 「平盤計入非漲」).
+        let n = 40usize;
+        let horizon = 3usize;
+        let times: Vec<i64> = (0..n as i64).collect();
+        let closes: Vec<f64> = vec![100.0; n];
+        let feats = vec![vec![0.0f64]; n]; // constant feature -> no NaN warm-up
+        let batch = compute(times, closes, feats, horizon, 5).unwrap();
+        let cols = batch.columns();
+        let pu = as_primitive_array::<Float64Type>(cols[2].as_ref()).value(0);
+        let pd = as_primitive_array::<Float64Type>(cols[3].as_ref()).value(0);
+        assert_eq!(pu, 0.0, "flat labels must never count as up");
+        assert_eq!(pd, 1.0);
+        assert!(!is_up(100.0, 100.0), "flat == not up");
+        assert!(is_up(100.0, 100.0001));
+    }
+
+    #[test]
+    fn trailing_model_token_and_availability() {
+        // D2: optional trailing 'model' token on fwd_walk / fwd_regress.
+        use datafusion::logical_expr::Expr as E;
+        use datafusion::scalar::ScalarValue as SV;
+        let strl = |s: &str| E::Literal(SV::Utf8(Some(s.to_string())), None);
+        let intl = |i: i64| E::Literal(SV::Int64(Some(i)), None);
+        // explicit 'analog' -> trimmed, default model
+        let e = vec![strl("tbl"), intl(10), intl(20), strl("analog")];
+        let (m, keep) = split_model_token(&e);
+        assert_eq!(m, ScorerKind::Analog);
+        assert_eq!(keep, 3);
+        // no token -> default analog, nothing trimmed
+        let (m2, keep2) = split_model_token(&[strl("tbl"), intl(10), intl(20)]);
+        assert_eq!((m2, keep2), (ScorerKind::Analog, 3));
+        // warmup + trailing 'gbdt' -> token consumed, warmup kept
+        let e3 = vec![strl("tbl"), intl(10), intl(20), intl(1), strl("gbdt")];
+        let (m3, keep3) = split_model_token(&e3);
+        assert_eq!((m3, keep3), (ScorerKind::Gbdt, 4));
+        // unknown bare string stays a feats CSV, not a model token
+        let e4 = vec![strl("tbl"), intl(10), intl(20), strl("mom5,mom10")];
+        let (m4, keep4) = split_model_token(&e4);
+        assert_eq!((m4, keep4), (ScorerKind::Analog, 4));
+        // gbdt is reserved until design.md M2
+        assert!(ensure_available(ScorerKind::Analog).is_ok());
+        let err = ensure_available(ScorerKind::Gbdt).unwrap_err().to_string();
+        assert!(err.contains("M2"), "{err}");
+    }
+
+    #[test]
+    fn walk_output_is_tagged_with_model() {
+        // D2: engine output carries an additive `model` column (analog tag).
+        let n = 120usize;
+        let horizon = 3usize;
+        let times: Vec<i64> = (0..n as i64).collect();
+        let closes: Vec<f64> = (0..n).map(|i| 100.0 + i as f64).collect();
+        let feats = auto_features(&closes);
+        let batch = walk_compute(times, closes, feats, horizon, 5, 30, 0.0).unwrap();
+        let tagged = append_model_col(batch, ScorerKind::Analog).unwrap();
+        assert_eq!(tagged.num_columns(), 19, "18 walk cols + model tag");
+        let any = arrow::array::Array::as_any(tagged.column(18).as_ref());
+        let model_col = any
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("model column is Utf8");
+        for i in 0..tagged.num_rows() {
+            assert_eq!(model_col.value(i), "analog");
+        }
     }
 }

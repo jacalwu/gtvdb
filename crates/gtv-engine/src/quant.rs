@@ -47,6 +47,7 @@ enum Greek {
     Gamma,
     Vega,
     Theta,
+    Rho,
 }
 
 impl Greek {
@@ -57,6 +58,7 @@ impl Greek {
             Greek::Gamma => gtv_array::quant::bs_gamma(opt, s, k, t, r, v),
             Greek::Vega => gtv_array::quant::bs_vega(opt, s, k, t, r, v),
             Greek::Theta => gtv_array::quant::bs_theta(opt, s, k, t, r, v),
+            Greek::Rho => gtv_array::quant::bs_rho(opt, s, k, t, r, v),
         }
     }
 }
@@ -123,6 +125,7 @@ pub fn bs_udfs() -> Vec<ScalarUDF> {
         ScalarUDF::from(BsUdf::new("bs_gamma", Greek::Gamma)),
         ScalarUDF::from(BsUdf::new("bs_vega", Greek::Vega)),
         ScalarUDF::from(BsUdf::new("bs_theta", Greek::Theta)),
+        ScalarUDF::from(BsUdf::new("bs_rho", Greek::Rho)),
     ]
 }
 
@@ -636,6 +639,227 @@ impl TableFunctionImpl for OhlcTableFunction {
 }
 
 // ---------------------------------------------------------------------------
+// align(name, freq_sec, fill) — multi-symbol time alignment onto a regular grid
+// ---------------------------------------------------------------------------
+
+/// One symbol's aligned output rows (grid ts, close, volume, obs-count).
+fn align_series(
+    ts: &[i64],
+    close: &[f64],
+    volume: &[f64],
+    freq: i64,
+    ffill: bool,
+) -> Vec<(i64, f64, f64, i64)> {
+    let mut out = Vec::new();
+    if ts.is_empty() {
+        return out;
+    }
+    let first_b = ts[0] / freq * freq;
+    let last_b = ts[ts.len() - 1] / freq * freq;
+    let mut i = 0usize;
+    let mut carry: Option<(f64, f64)> = None; // last (close, volume) seen
+    let mut b = first_b;
+    while b <= last_b {
+        let next = b + freq;
+        let mut lc: f64 = f64::NAN;
+        let mut lv: f64 = f64::NAN;
+        let mut n = 0i64;
+        while i < ts.len() && ts[i] < next {
+            lc = close[i];
+            lv = volume[i];
+            n += 1;
+            i += 1;
+        }
+        if n > 0 {
+            carry = Some((lc, lv));
+            out.push((b, lc, lv, n));
+        } else if ffill {
+            if let Some((c, v)) = carry {
+                out.push((b, c, v, 0));
+            }
+        }
+        b = next;
+    }
+    out
+}
+
+#[derive(Debug)]
+pub struct AlignTableFunction {
+    registry: Arc<RwLock<HftRegistry>>,
+}
+
+impl AlignTableFunction {
+    pub fn new(registry: Arc<RwLock<HftRegistry>>) -> Self {
+        Self { registry }
+    }
+}
+
+impl TableFunctionImpl for AlignTableFunction {
+    fn call_with_args(&self, args: TableFunctionArgs) -> DfResult<Arc<dyn TableProvider>> {
+        let exprs = args.exprs();
+        let name = expr_to_string(
+            exprs.first()
+                .ok_or_else(|| DataFusionError::Execution("align(name, freq_sec, fill): missing name".into()))?,
+        )?;
+        let freq = expr_to_i64(
+            exprs.get(1)
+                .ok_or_else(|| DataFusionError::Execution("align: missing freq_sec (60/3600/86400…)".into()))?,
+        )?
+        .max(1);
+        let fill = exprs
+            .get(2)
+            .map(expr_to_string)
+            .transpose()?
+            .unwrap_or_else(|| "ffill".to_string());
+        let ffill = match fill.as_str() {
+            "ffill" | "fill" | "forward" => true,
+            "drop" | "none" => false,
+            other => {
+                return Err(DataFusionError::Execution(format!(
+                    "align: fill must be 'ffill' or 'drop', got '{other}'"
+                )))
+            }
+        };
+
+        let reg = self.registry.read().map_err(|_| {
+            DataFusionError::Execution("hft registry poisoned".into())
+        })?;
+        let batches = reg.tables.get(&name).ok_or_else(|| {
+            DataFusionError::Execution(format!("unknown table `{name}`"))
+        })?;
+        let batches = batches.clone();
+        drop(reg);
+
+        let ts = extract_i64_col(&batches, "ts")
+            .or_else(|_| extract_i64_col(&batches, "ts_us"))
+            .or_else(|_| extract_i64_col(&batches, "t"))
+            .or_else(|_| extract_i64_col(&batches, "time"))
+            .map_err(|_| {
+                DataFusionError::Execution(format!("table `{name}` has no Int64 ts column"))
+            })?;
+        let close = extract_f64_col_any(&batches, &["close", "price", "adjclose"], &name)?;
+        let volume = if batches.first().and_then(|b| b.column_by_name("volume")).is_some() {
+            let mut v = Vec::new();
+            for b in batches.iter() {
+                v.extend(f64_col_values(b.column_by_name("volume").unwrap())?);
+            }
+            v
+        } else {
+            vec![1.0; close.len()]
+        };
+        let syms = if batches
+            .first()
+            .and_then(|b| b.column_by_name("symbol").map(|c| matches!(c.data_type(), DataType::Utf8)))
+            .unwrap_or(false)
+        {
+            extract_string_col(&batches, "symbol")?
+        } else {
+            vec![String::new(); ts.len()]
+        };
+        if ts.len() != close.len() || ts.len() != syms.len() {
+            return Err(DataFusionError::Execution(format!(
+                "align: ragged columns in `{name}`"
+            )));
+        }
+
+        // group rows by symbol, sort by ts, align each onto the freq grid
+        let mut groups: std::collections::BTreeMap<String, Vec<usize>> =
+            std::collections::BTreeMap::new();
+        for i in 0..ts.len() {
+            groups.entry(syms[i].clone()).or_default().push(i);
+        }
+        let mut rows: Vec<(i64, String, f64, f64, i64)> = Vec::new();
+        for (sym, idxs) in groups {
+            let mut sub: Vec<(i64, f64, f64)> = idxs
+                .iter()
+                .map(|&i| (ts[i], close[i], volume[i]))
+                .collect();
+            sub.sort_by_key(|r| r.0);
+            let (st, sc, sv): (Vec<i64>, Vec<f64>, Vec<f64>) =
+                sub.into_iter().map(|(a, b, c)| (a, b, c)).fold(
+                    (vec![], vec![], vec![]),
+                    |(mut a, mut b, mut c), (t, p, v)| {
+                        a.push(t);
+                        b.push(p);
+                        c.push(v);
+                        (a, b, c)
+                    },
+                );
+            for (b, c, v, n) in align_series(&st, &sc, &sv, freq, ffill) {
+                rows.push((b, sym.clone(), c, v, n));
+            }
+        }
+        rows.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("ts", DataType::Int64, false),
+            Field::new("symbol", DataType::Utf8, false),
+            Field::new("close", DataType::Float64, false),
+            Field::new("volume", DataType::Float64, false),
+            Field::new("n_obs", DataType::Int64, false),
+        ]));
+        let mut ts_out = Vec::with_capacity(rows.len());
+        let mut sym_out = Vec::with_capacity(rows.len());
+        let mut c_out = Vec::with_capacity(rows.len());
+        let mut v_out = Vec::with_capacity(rows.len());
+        let mut n_out = Vec::with_capacity(rows.len());
+        for (b, s, c, v, n) in rows {
+            ts_out.push(b);
+            sym_out.push(s);
+            c_out.push(c);
+            v_out.push(v);
+            n_out.push(n);
+        }
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(ts_out)) as ArrayRef,
+                Arc::new(arrow::array::StringArray::from(sym_out)) as ArrayRef,
+                Arc::new(Float64Array::from(c_out)) as ArrayRef,
+                Arc::new(Float64Array::from(v_out)) as ArrayRef,
+                Arc::new(Int64Array::from(n_out)) as ArrayRef,
+            ],
+        )?;
+        Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
+    }
+}
+
+fn extract_f64_col_any(batches: &[RecordBatch], cands: &[&str], name: &str) -> DfResult<Vec<f64>> {
+    for cand in cands {
+        if batches.first().and_then(|b| b.column_by_name(cand)).is_some() {
+            let mut v = Vec::new();
+            for b in batches {
+                v.extend(f64_col_values(b.column_by_name(cand).unwrap())?);
+            }
+            return Ok(v);
+        }
+    }
+    Err(DataFusionError::Execution(format!(
+        "table `{name}` has no close/price/adjclose Float64 column"
+    )))
+}
+
+/// Read a numeric column as f64 (casts Int32/Int64/Float32 -> Float64).
+fn f64_col_values(array: &arrow::array::ArrayRef) -> DfResult<Vec<f64>> {
+    if matches!(array.data_type(), DataType::Float64) {
+        return Ok(f64_values(array).to_vec());
+    }
+    if !matches!(
+        array.data_type(),
+        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+            | DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64
+            | DataType::Float32
+    ) {
+        return Err(DataFusionError::Execution(format!(
+            "column `{}` is not numeric",
+            array.data_type()
+        )));
+    }
+    let casted = arrow::compute::cast(array.as_ref(), &DataType::Float64)?;
+    Ok(as_primitive_array::<Float64Type>(casted.as_ref()).values().to_vec())
+}
+
+// ---------------------------------------------------------------------------
 // zscore / momentum — cross-sectional & technical window UDFs
 // ---------------------------------------------------------------------------
 
@@ -1131,5 +1355,50 @@ impl TableFunctionImpl for RelativeStrengthTableFunction {
             ],
         )?;
         Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn align_ffill_fills_gaps_and_drop_skips() {
+        const D: i64 = 86_400_000_000_000; // 1 day in ns
+        // contiguous series A
+        let ts = [0i64, D, 2 * D, 3 * D];
+        let close = [10.0, 11.0, 12.0, 13.0];
+        let vol = [100.0, 110.0, 120.0, 130.0];
+        let ff = align_series(&ts, &close, &vol, D, true);
+        assert_eq!(ff.len(), 4, "ffill keeps every grid step");
+        assert!((ff[3].1 - 13.0).abs() < 1e-12);
+        // B: trades day0 and day2 only (missing day1)
+        let tsb = [0i64, 2 * D];
+        let cb = [5.0, 7.0];
+        let vb = [50.0, 70.0];
+        let ff_b = align_series(&tsb, &cb, &vb, D, true);
+        assert_eq!(ff_b.len(), 3, "gap on the daily grid is filled");
+        assert_eq!(ff_b[0].0, 0);
+        assert!((ff_b[1].1 - 5.0).abs() < 1e-12, "carried close 5.0");
+        assert_eq!(ff_b[1].3, 0, "filled row n_obs = 0");
+        assert!((ff_b[2].1 - 7.0).abs() < 1e-12);
+        let drop_b = align_series(&tsb, &cb, &vb, D, false);
+        assert_eq!(drop_b.len(), 2, "drop: no synthetic rows");
+        assert_eq!(drop_b[0].0, 0);
+        assert_eq!(drop_b[1].0, 2 * D);
+    }
+
+    #[test]
+    fn align_multi_bucket_takes_last_obs() {
+        const S: i64 = 1_000_000_000; // 1s in ns
+        let ts = [0i64, 2 * S, 5 * S]; // two obs in bucket [0,1s) if freq=1s? 5s lands elsewhere
+        let close = [1.0, 2.0, 3.0];
+        let vol = [10.0, 20.0, 30.0];
+        // freq = 5s -> buckets: 0 and 5
+        let out = align_series(&ts, &close, &vol, 5 * S, false);
+        assert_eq!(out.len(), 2);
+        assert!((out[0].1 - 2.0).abs() < 1e-12, "bucket [0,5s) takes last obs 2.0");
+        assert_eq!(out[0].3, 2, "two obs in bucket");
+        assert!((out[1].1 - 3.0).abs() < 1e-12);
     }
 }

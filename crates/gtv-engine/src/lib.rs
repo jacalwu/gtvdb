@@ -5,6 +5,7 @@
 
 pub mod asof;
 pub mod analytics;
+pub mod bt;
 pub mod context;
 pub mod csv;
 pub mod datetime;
@@ -12,7 +13,9 @@ pub mod graph;
 pub mod hft;
 pub mod hft_exec;
 pub mod hft_tf;
+pub mod indicator;
 pub mod knn;
+pub mod monitor;
 pub mod micro;
 pub mod market;
 pub mod quant;
