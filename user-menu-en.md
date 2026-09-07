@@ -339,6 +339,7 @@ hdb_scan <table> <start> <end> [sym] [root]  scan HDB date range
 hdb_flush <table> [root] [secs]  background HDB flush (sym-enumerated)
 tt <table> <T>             pattern [T]        delta
 udf [x ...]                remote <host:port> <sql>
+metrics                                  # engine counters + SQL latency histogram (Prometheus text)
 ```
 
 Market/trend functions (provider is just the first argument, see §7):
@@ -350,6 +351,12 @@ SELECT * FROM klines('yahoo','0700.HK','1d',...);           # standard SQL (any 
 fwd_proba('table',H,K)              # P(up/down) over the next H trading days
 fwd_walk('table',H,K[,warmup])      # strictly-causal walk-forward replay
 fwd_regress('table',asof_ns,H,K)    # as-of regression: direction+band vs realised
+align('table',freq_sec,'ffill'|'drop')      # multi-symbol alignment on a regular grid
+backtest('table',cost_bps,stop,tp[,'SYM']) | bt_report(...)    # single-asset state-machine backtest
+pf_backtest('table',cost_bps) | pf_report(...)                # equal-weight portfolio + rebalance
+dq_report('table') | dq_check('table') | health_check('table')   # data quality & freshness
+strategy_stats('table')              # hit / Brier / ECE / PSI over decision rows (up + p_up)
+metrics                              # engine counters (see above)
 ```
 
 ---
@@ -408,6 +415,39 @@ compare with the realised future path
 ./stock_regress.sh HK.00700 2026-08-03 2026-07-01   # as-of regression: hit/coverage/return error
 # Source/params: SOURCE=yahoo|parquet, HORIZON=10, K=20, THRESHOLD=0.8, START/END, FILE=(parquet reuse)
 ```
+
+### 7.4 Quant research toolkit & portfolio monitoring (function2.md — Phase A + C)
+
+New engine functions (window functions need `ALTER SESSION SET sqlmode = full`):
+
+```sql
+-- technical indicators (causal trailing-window, NaN warm-up), PARTITION BY symbol allowed:
+-- ema(n), rsi(n), macd_dif/dea/hist(f,s,g), atr(n), boll_mid/up/lo(n,k), vwap(n)
+SELECT t, rsi(close,14) OVER (PARTITION BY symbol ORDER BY t) FROM bars;
+-- multi-symbol alignment + cross-sectional factors
+SELECT ts, symbol, close, zscore(close) OVER (PARTITION BY ts)
+FROM align('multi', 86400000000000, 'ffill');        -- freq in ns, fill = ffill | drop
+-- backtests: single-asset (position/cost/stop/tp) and equal-weight portfolio + rebalance
+SELECT * FROM bt_report('sig', 20, 0.06, 0.10);     -- cost_bps, stop_loss, take_profit
+SELECT * FROM pf_report('multisig', 20);
+-- data quality / freshness / strategy drift
+SELECT * FROM health_check('hk03668', 7, 200);      -- freshness vs market calendar
+SELECT * FROM strategy_stats('decisions');          -- needs up + p_up/cal_p_up_* columns
+-- engine metrics: REPL command `metrics`
+```
+
+Holdings daily-deck scripts (ZH=1 prints Chinese stock names/headers):
+
+```bash
+./holdings_forecast.sh                  # direction(up/flat/down) + action(BUY/HOLD/SELL) + sim evidence + HSI context
+ZH=1 ./holdings_forecast.sh             # 中文版（HOLDING.txt 第二欄為中文股名）
+EVENT_MODE=1 ./holdings_forecast.sh     # event risk overlay (threshold -> 0.80, gap appendix)
+./stock_sim.sh HK.00857                 # paper-trade sim: THR×cost grid, SIZING, long/short side means
+./holdings_sim.sh                       # per-stock action summary (--run refreshes sims)
+```
+
+Per-holding horizon/threshold via `HOLDING.cfg` (e.g. `HK.00857 20 0.85`).
+Specs/status: `function2.md` (Phase A+C), `forecast-function.md` (implemented / not-done + reasons), `design.md`.
 
 See `doc/market-providers.md` and `stock_analysis.md` for details and known
 boundaries (Futu has no historical tick dumps, Yahoo intraday lookback caps).

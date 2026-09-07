@@ -334,6 +334,7 @@ hdb_scan <table> <start> <end> [sym] [root]  掃描 HDB 日期區間
 hdb_flush <table> [root] [secs]  背景 HDB 落盤（symbol 枚舉）
 tt <table> <T>             pattern [T]        delta
 udf [x ...]                remote <host:port> <sql>
+metrics                                  # 引擎計數器 + SQL 延遲直方圖（Prometheus 文字）
 ```
 
 行情/趨勢分析函數（provider 只是第一個參數，見 §7）：
@@ -345,6 +346,11 @@ SELECT * FROM klines('yahoo','0700.HK','1d',...);           # 标准 SQL（任�
 fwd_proba('表',H,K)                 # 下一 H 交易日上涨/下跌概率
 fwd_walk('表',H,K[,warmup])         # 严格因果 walk-forward 回放
 fwd_regress('表',asof_ns,H,K)       # as-of 回归：方向+区间 vs 真实
+align('表',freq_sec,'ffill'|'drop')            # 多標的對齊到規則網格
+dq_report('表') | dq_check('表')                # 資料品質：NaN/重複/時間倒退/標的覆蓋
+health_check('表'[,max_age_days[,min_rows]])    # 健康度：freshness vs 恆指交易日曆 等
+strategy_stats('表')                            # 訊號診斷：hit/Brier/ECE/PSI（需 up + p_up 欄）
+metrics                                        # 引擎計數器
 ```
 
 ---
@@ -398,6 +404,39 @@ SELECT * FROM fwd_proba('hk700', 10, 20);    -- 决策日=最后一根：p_up, p
 ./stock_regress.sh HK.00700 2026-08-03 2026-07-01   # as-of 回归：方向命中/区间覆盖/收益偏差
 # 数据源/参数：SOURCE=yahoo|parquet，HORIZON=10, K=20, THRESHOLD=0.8, START/END, FILE=（parquet 复用）
 ```
+
+### 7.4 量化研究工具箱 & 持倉監控（function2.md — Phase A + C）
+
+新增引擎函數（視窗函數需 `ALTER SESSION SET sqlmode = full`）：
+
+```sql
+-- 技術指標（因果 trailing-window，NaN 暖機），支援 PARTITION BY symbol：
+--   ema(n), rsi(n), macd_dif/dea/hist(f,s,g), atr(n), boll_mid/up/lo(n,k), vwap(n)
+SELECT t, rsi(close,14) OVER (PARTITION BY symbol ORDER BY t) FROM bars;
+-- 多標對齊 + 截面因子
+SELECT ts, symbol, close, zscore(close) OVER (PARTITION BY ts)
+FROM align('multi', 86400000000000, 'ffill');    -- freq 單位 ns，fill = ffill | drop
+-- 回測：單標（持倉狀態機 + 成本 + 停損/停利）與等權組合 + 再平衡
+SELECT * FROM bt_report('sig', 20, 0.06, 0.10);  -- cost_bps, stop_loss, take_profit
+SELECT * FROM pf_report('multisig', 20);
+-- 資料品質 / 健康度 / 策略漂移
+SELECT * FROM health_check('hk03668', 7, 200);
+SELECT * FROM strategy_stats('decisions');       -- 需 up 與 p_up/cal_p_up_* 欄
+-- 引擎指標：REPL 指令 `metrics`
+```
+
+持倉每日報告 scripts（`ZH=1` 印中文股名與表頭）：
+
+```bash
+./holdings_forecast.sh                  # direction(升/橫行/跌) + action(買/持/賣) + 模擬佐證 + 恆指情境
+ZH=1 ./holdings_forecast.sh             # 中文版（HOLDING.txt 第二欄為中文股名）
+EVENT_MODE=1 ./holdings_forecast.sh     # 事件風險層（門檻建議 0.80、跳空附錄）
+./stock_sim.sh HK.00857                 # 紙上模擬：THR×成本網格、SIZING、多/空側平均
+./holdings_sim.sh                       # 每股動作彙總（--run 補跑模擬）
+```
+
+每股 HORIZON/THRESHOLD 由 `HOLDING.cfg` 設定（例 `HK.00857 20 0.85`）。
+規範/狀態：`function2.md`（Phase A+C）、`forecast-function.md`（已實現 / 不做清單+原因）、`design.md`。
 
 详细文档：`doc/market-providers.md`、`stock_analysis.md`（含校准/回测结论与边界：Futu 无历史逐笔、Yahoo 分钟回溯窗口限制等）。
 
