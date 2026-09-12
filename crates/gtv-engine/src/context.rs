@@ -250,6 +250,10 @@ impl GtvContext {
             "neighbors",
             Arc::new(crate::graph::NeighborsTableFunction::new(csr)),
         );
+        self.ctx.register_udtf(
+            "khop",
+            Arc::new(crate::graph::KhopTableFunction::new(csr)),
+        );
     }
 
     /// Register the `asof_join(t0, t1, ...)` table function against a
@@ -327,7 +331,19 @@ impl GtvContext {
         vectors: Vec<Vec<f32>>,
         labels: Option<Vec<String>>,
     ) -> Result<()> {
-        let collection = KnnCollection::new(ids, vectors, labels)
+        self.register_knn_metric(name, ids, vectors, labels, gtv_core::Metric::L2)
+    }
+
+    /// Register a named vector collection with an explicit distance metric.
+    pub fn register_knn_metric(
+        &self,
+        name: &str,
+        ids: Vec<u64>,
+        vectors: Vec<Vec<f32>>,
+        labels: Option<Vec<String>>,
+        metric: gtv_core::Metric,
+    ) -> Result<()> {
+        let collection = KnnCollection::with_metric(ids, vectors, labels, metric)
             .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
         self.knn_collections
             .write()

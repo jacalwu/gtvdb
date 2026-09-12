@@ -6,19 +6,23 @@
 //! quantization, no reduced-precision encoding). Vectors are **reordered so each
 //! cell is a contiguous run**, which turns a query into: (1) rank the centroids,
 //! (2) read the `nprobe` nearest cells as fully-sequential streams, and (3) an
-//! exact `f32` squared-L2 scan over those candidates. The sublinearity comes
-//! from pruning cells, never from lowering precision: every returned neighbor
-//! carries zero quantization error.
+//! exact `f32` scan over those candidates. The sublinearity comes from pruning
+//! cells, never from lowering precision: every returned neighbor carries zero
+//! quantization error.
 //!
 //! At 1M × 512-dim the exact flat scan must stream 2 GB; the IVF probe at
 //! `nlist=1024, nprobe=32` reads only ~64 MB of contiguous data.
+//!
+//! Supports [`Metric::L2`], [`Metric::Cosine`] and [`Metric::Ip`]; Cosine rows
+//! (and the query) are unit-normalized before assignment and search.
 
+use std::borrow::Cow;
 use std::cmp::Ordering;
 
-use arrow::array::{BooleanArray, UInt64Array};
-use gtv_core::{GtvError, Result, VectorIndex};
+use arrow::array::BooleanArray;
+use gtv_core::{GtvError, Metric, Result, VectorHit, VectorIndex};
 
-use crate::flat::{par_topk_over, squared_l2, squared_l2_scalar};
+use crate::flat::{metric_distance, par_topk_over};
 
 /// Inverted-file index with an exact `f32` scan over the probed cells.
 #[derive(Debug, Clone)]
@@ -32,6 +36,7 @@ pub struct IvfIndex {
     /// filter-mask domain, kept consistent with [`crate::FlatIndex`]).
     orig_pos: Vec<u32>,
     dim: usize,
+    metric: Metric,
     nlist: usize,
     nprobe: usize,
     /// Coarse quantizer: `nlist × dim` centroids, row-major.
@@ -41,18 +46,30 @@ pub struct IvfIndex {
 }
 
 impl IvfIndex {
-    /// Build from a contiguous row-major `f32` corpus (takes ownership).
-    ///
-    /// `nlist` is clamped to `n`; `nprobe` is clamped to `nlist`. Centroids are
-    /// sampled evenly across the corpus (deterministic, reproducible), then every
-    /// vector is assigned to its nearest centroid and the corpus is reordered by
-    /// cell for sequential probe reads.
+    /// Build an L2 index from a contiguous row-major `f32` corpus.
     pub fn new(
         ids: Vec<u64>,
         data: Vec<f32>,
         dim: usize,
         nlist: usize,
         nprobe: usize,
+    ) -> Result<Self> {
+        Self::with_metric(ids, data, dim, nlist, nprobe, Metric::L2)
+    }
+
+    /// Build an index with an explicit metric.
+    ///
+    /// `nlist` is clamped to `n`; `nprobe` is clamped to `nlist`. Centroids are
+    /// sampled evenly across the corpus (deterministic, reproducible), then every
+    /// vector is assigned to its nearest centroid and the corpus is reordered by
+    /// cell for sequential probe reads.
+    pub fn with_metric(
+        ids: Vec<u64>,
+        mut data: Vec<f32>,
+        dim: usize,
+        nlist: usize,
+        nprobe: usize,
+        metric: Metric,
     ) -> Result<Self> {
         if dim == 0 {
             return Err(GtvError::InvalidArgument("zero-dimension vectors".into()));
@@ -69,11 +86,23 @@ impl IvfIndex {
         let nlist = nlist.max(1).min(n);
         let nprobe = nprobe.max(1).min(nlist);
 
+        // Cosine needs unit rows so `1 - dot` is the cosine distance.
+        if metric.requires_normalization() {
+            for row in data.chunks_mut(dim) {
+                metric.normalize_in_place(row);
+            }
+        }
+
         // Coarse quantizer: evenly-spaced deterministic centroid sampling.
         let mut centroids = Vec::with_capacity(nlist * dim);
         for c in 0..nlist {
             let src = c * n / nlist;
             centroids.extend_from_slice(&data[src * dim..(src + 1) * dim]);
+        }
+        if metric.requires_normalization() {
+            for row in centroids.chunks_mut(dim) {
+                metric.normalize_in_place(row);
+            }
         }
 
         #[cfg(target_arch = "x86_64")]
@@ -88,7 +117,7 @@ impl IvfIndex {
             .into_par_iter()
             .map(|i| {
                 let v = &data[i * dim..(i + 1) * dim];
-                nearest_centroid(v, &centroids, nlist, dim, use_simd)
+                nearest_centroid(v, &centroids, nlist, dim, use_simd, metric)
             })
             .collect();
 
@@ -121,6 +150,7 @@ impl IvfIndex {
             ids: reordered_ids,
             orig_pos,
             dim,
+            metric,
             nlist,
             nprobe,
             centroids,
@@ -140,6 +170,10 @@ impl IvfIndex {
         self.dim
     }
 
+    pub fn metric(&self) -> Metric {
+        self.metric
+    }
+
     pub fn nlist(&self) -> usize {
         self.nlist
     }
@@ -148,20 +182,37 @@ impl IvfIndex {
         self.nprobe
     }
 
+    /// Normalize the query when the metric requires it.
+    fn prepare_query<'a>(&self, query: &'a [f32]) -> Cow<'a, [f32]> {
+        if self.metric.requires_normalization() {
+            let mut q = query.to_vec();
+            self.metric.normalize_in_place(&mut q);
+            Cow::Owned(q)
+        } else {
+            Cow::Borrowed(query)
+        }
+    }
+
     /// Exact `f32` top-K over the `nprobe` nearest cells.
-    fn search(&self, query: &[f32], k: usize, mask: Option<&BooleanArray>) -> Vec<(f32, u64)> {
+    fn search_scored(&self, query: &[f32], k: usize, mask: Option<&BooleanArray>) -> Vec<(f32, u64)> {
         #[cfg(target_arch = "x86_64")]
         let use_simd =
             std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma");
         #[cfg(not(target_arch = "x86_64"))]
         let use_simd = false;
 
+        let query = self.prepare_query(query);
+        let metric = self.metric;
+
         // 1. Distance to every centroid, then keep the `nprobe` nearest.
         let nprobe = self.nprobe.min(self.nlist);
         let mut cd: Vec<(f32, u32)> = (0..self.nlist)
             .map(|c| {
                 let row = &self.centroids[c * self.dim..(c + 1) * self.dim];
-                (squared_l2(query, row, use_simd), c as u32)
+                (
+                    metric_distance(&query, row, metric, use_simd),
+                    c as u32,
+                )
             })
             .collect();
         cd.sort_by(|a, b| {
@@ -207,13 +258,14 @@ impl IvfIndex {
                 }
             }
             let row = &data[i * dim..(i + 1) * dim];
-            (squared_l2(query, row, use_simd), ids[i])
+            (metric_distance(&query, row, metric, use_simd), ids[i])
         })
     }
 }
 
-/// Find the nearest centroid to `v` (index only), exact `f32`. Branches on
-/// `use_simd` once per vector so the per-centroid kernel stays a tight loop.
+/// Find the nearest centroid to `v` (index only). Branches on `metric` once per
+/// vector so the L2 path keeps its inlined AVX2 kernel and the other metrics
+/// use the (SIMD-accelerated) generic distance.
 #[inline]
 fn nearest_centroid(
     v: &[f32],
@@ -221,25 +273,36 @@ fn nearest_centroid(
     nlist: usize,
     dim: usize,
     use_simd: bool,
+    metric: Metric,
 ) -> u32 {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if use_simd {
-            // SAFETY: AVX2+FMA were detected by the caller.
-            return unsafe { nearest_centroid_avx2(v, centroids, nlist, dim) };
+    if metric == Metric::L2 {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if use_simd {
+                // SAFETY: AVX2+FMA were detected by the caller.
+                return unsafe { nearest_centroid_avx2(v, centroids, nlist, dim) };
+            }
         }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = use_simd;
     }
-    #[cfg(not(target_arch = "x86_64"))]
-    let _ = use_simd;
-    nearest_centroid_scalar(v, centroids, nlist, dim)
+    nearest_centroid_metric(v, centroids, nlist, dim, metric, use_simd)
 }
 
 #[inline]
-fn nearest_centroid_scalar(v: &[f32], centroids: &[f32], nlist: usize, dim: usize) -> u32 {
+fn nearest_centroid_metric(
+    v: &[f32],
+    centroids: &[f32],
+    nlist: usize,
+    dim: usize,
+    metric: Metric,
+    use_simd: bool,
+) -> u32 {
     let mut best_i = 0u32;
     let mut best_d = f32::INFINITY;
     for c in 0..nlist {
-        let d = squared_l2_scalar(v, &centroids[c * dim..(c + 1) * dim]);
+        let row = &centroids[c * dim..(c + 1) * dim];
+        let d = metric_distance(v, row, metric, use_simd);
         if d < best_d {
             best_d = d;
             best_i = c as u32;
@@ -315,18 +378,25 @@ unsafe fn nearest_centroid_avx2(v: &[f32], centroids: &[f32], nlist: usize, dim:
 }
 
 impl VectorIndex for IvfIndex {
-    fn search_knn(
+    fn metric(&self) -> Metric {
+        self.metric
+    }
+
+    fn dim(&self) -> usize {
+        self.dim
+    }
+
+    fn search(
         &self,
         query: &[f32],
         k: usize,
         filter_mask: Option<&BooleanArray>,
-    ) -> Result<UInt64Array> {
+    ) -> Result<Vec<VectorHit>> {
         if query.len() != self.dim {
-            return Err(GtvError::InvalidArgument(format!(
-                "query dim {} != index dim {}",
-                query.len(),
-                self.dim
-            )));
+            return Err(GtvError::DimensionMismatch {
+                index: self.dim,
+                query: query.len(),
+            });
         }
         if let Some(mask) = filter_mask {
             if mask.len() != self.ids.len() {
@@ -336,13 +406,14 @@ impl VectorIndex for IvfIndex {
             }
         }
         if k == 0 {
-            return Ok(UInt64Array::from(Vec::<u64>::new()));
+            return Ok(Vec::new());
         }
 
-        let results = self.search(query, k, filter_mask);
-        Ok(UInt64Array::from(
-            results.into_iter().map(|(_, id)| id).collect::<Vec<u64>>(),
-        ))
+        Ok(self
+            .search_scored(query, k, filter_mask)
+            .into_iter()
+            .map(|(distance, id)| VectorHit { id, distance })
+            .collect())
     }
 }
 
@@ -371,5 +442,34 @@ mod tests {
         let flat = FlatIndex::from_flat(ids, data, 2).unwrap();
         let exact = flat.search_knn(&[5.0, 5.0], 3, None).unwrap();
         assert_eq!(got.values().as_ref(), exact.values().as_ref());
+    }
+
+    #[test]
+    fn ivf_cosine_matches_flat() {
+        let data = vec![
+            3.0, 4.0, // 0 -> (0.6, 0.8)
+            1.0, 0.0, // 1
+            0.0, 1.0, // 2
+            3.0, 4.0, // 3 (same direction as 0)
+        ];
+        let ids: Vec<u64> = (0..4).collect();
+        let ivf =
+            IvfIndex::with_metric(ids.clone(), data.clone(), 2, 4, 4, Metric::Cosine).unwrap();
+        assert_eq!(ivf.metric(), Metric::Cosine);
+        let flat =
+            FlatIndex::from_flat_metric(ids, data, 2, Metric::Cosine).unwrap();
+        let q = [1.0f32, 0.0];
+        let got: Vec<u64> = ivf.search(&q, 4, None).unwrap().iter().map(|h| h.id).collect();
+        let exact: Vec<u64> = flat.search(&q, 4, None).unwrap().iter().map(|h| h.id).collect();
+        assert_eq!(got, exact);
+    }
+
+    #[test]
+    fn ivf_dimension_mismatch_is_typed() {
+        let ivf = IvfIndex::new(vec![0, 1], vec![0.0, 0.0, 1.0, 1.0], 2, 2, 2).unwrap();
+        assert!(matches!(
+            ivf.search(&[1.0], 1, None),
+            Err(GtvError::DimensionMismatch { .. })
+        ));
     }
 }

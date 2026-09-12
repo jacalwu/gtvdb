@@ -12,3 +12,5 @@
 **/__pycache__/
 *.pyc
 *.swp
+# Windows download artifacts (browser ADS sidecars)
+*:Zone.Identifier

@@ -26,7 +26,7 @@ use arrow::util::pretty::print_batches;
 use rustyline::DefaultEditor;
 
 use gtv_array::{asof, window};
-use gtv_core::{EdgeTable, NodeTable, TemporalCSR, TemporalGraph, VectorIndex};
+use gtv_core::{EdgeTable, Metric, NodeTable, TemporalCSR, TemporalGraph, TraversalBudget, VectorIndex};
 use gtv_delta::{DeltaEdge, LsmStore};
 use gtv_engine::hft_exec::KernelPlan;
 use gtv_engine::GtvContext;
@@ -595,6 +595,36 @@ fn parse_mask(tokens: &[&str]) -> Result<Option<Vec<u64>>> {
         .map(Some)
 }
 
+/// Parse optional `--max-edges N` / `--max-frontier N` / `--max-degree N` /
+/// `--max-rows N` flags into a traversal budget.
+fn parse_budget(tokens: &[&str]) -> Result<TraversalBudget> {
+    let mut budget = TraversalBudget::unlimited();
+    let value = |flag: &str| -> Result<u64> {
+        let pos = tokens
+            .iter()
+            .position(|&t| t == flag)
+            .ok_or_else(|| anyhow!("missing {flag}"))?;
+        tokens
+            .get(pos + 1)
+            .ok_or_else(|| anyhow!("{flag} needs a value"))?
+            .parse::<u64>()
+            .map_err(|_| anyhow!("{flag} expects an integer"))
+    };
+    if tokens.contains(&"--max-edges") {
+        budget.max_edges = value("--max-edges")?;
+    }
+    if tokens.contains(&"--max-frontier") {
+        budget.max_frontier = value("--max-frontier")? as usize;
+    }
+    if tokens.contains(&"--max-rows") {
+        budget.max_rows = value("--max-rows")?;
+    }
+    if tokens.contains(&"--max-degree") {
+        budget.max_degree = Some(value("--max-degree")? as u32);
+    }
+    Ok(budget)
+}
+
 async fn run(
     demo: &Demo,
     ctx: &GtvContext,
@@ -674,13 +704,30 @@ async fn run(
             let _ = print_batches(&[batch]);
         }
         "khop" => {
-            let node = require_arg(&tokens, 1, "khop <node> <k> [T]")?.parse::<u64>()?;
-            let k = require_arg(&tokens, 2, "khop <node> <k> [T]")?.parse::<usize>()?;
-            let t = optional_arg(&tokens, 3).map_or(Ok(DEFAULT_T), |s| s.parse::<i64>())?;
-            let frontiers = demo.graph.khop(&UInt64Array::from(vec![node]), k, t)?;
-            for (i, f) in frontiers.iter().enumerate() {
+            let node = require_arg(&tokens, 1, "khop <node> <k> [T] [--max-edges N]")?.parse::<u64>()?;
+            let k = require_arg(&tokens, 2, "khop <node> <k> [T] [--max-edges N]")?.parse::<usize>()?;
+            let t = optional_arg(&tokens, 3)
+                .filter(|s| s.parse::<i64>().is_ok())
+                .map_or(Ok(DEFAULT_T), |s| s.parse::<i64>())?;
+            let budget = parse_budget(&tokens)?;
+            let result = demo.graph.csr().khop_bounded(
+                &UInt64Array::from(vec![node]),
+                k,
+                t,
+                &budget,
+                None,
+                None,
+            )?;
+            for (i, f) in result.frontiers.iter().enumerate() {
                 println!("hop {} = {:?}", i + 1, f.values().as_ref());
             }
+            println!(
+                "(hops={} edges={} rows={} peak_frontier={})",
+                result.stats.hops,
+                result.stats.edges_scanned,
+                result.stats.rows,
+                result.stats.peak_frontier
+            );
         }
         "mavg" => {
             let n = require_arg(&tokens, 1, "mavg <n>")?.parse::<usize>()?;
@@ -873,15 +920,24 @@ async fn run(
             println!("registered wash/wash_trade from `{table}` ({n} edges, {node_count} nodes)");
         }
         "knn_from" | "register_knn" => {
-            // knn_from <name> <table> [dim] — register a vector collection from a
-            // table (columns id, v0..v{dim-1}).
-            let name = require_arg(&tokens, 1, "knn_from <name> <table> [dim]")?;
-            let table = require_arg(&tokens, 2, "knn_from <name> <table> [dim]")?;
+            // knn_from <name> <table> [dim] [metric] — register a vector
+            // collection from a table (columns id, v0..v{dim-1}).
+            let name = require_arg(&tokens, 1, "knn_from <name> <table> [dim] [metric]")?;
+            let table = require_arg(&tokens, 2, "knn_from <name> <table> [dim] [metric]")?;
             let batches = ctx.sql(&format!("SELECT * FROM {table}")).await?;
             let ids = extract_u64(&batches, "id")?;
             let dim = match optional_arg(&tokens, 3) {
-                Some(s) => s.parse::<usize>()?,
-                None => infer_vec_dim(&batches)?,
+                Some(s) if s.parse::<usize>().is_ok() => s.parse::<usize>()?,
+                _ => infer_vec_dim(&batches)?,
+            };
+            let metric_arg = match optional_arg(&tokens, 3) {
+                Some(s) if s.parse::<usize>().is_err() => Some(s),
+                _ => optional_arg(&tokens, 4),
+            };
+            let metric = match metric_arg {
+                Some(m) => Metric::parse(m)
+                    .ok_or_else(|| anyhow!("unknown metric `{m}` (expected l2|cosine|dot)"))?,
+                None => Metric::L2,
             };
             let n = ids.len();
             let mut vectors = vec![vec![0.0f32; dim]; n];
@@ -891,8 +947,10 @@ async fn run(
                     vectors[i][d] = *v as f32;
                 }
             }
-            ctx.register_knn(name, ids, vectors, None)?;
-            println!("registered knn collection `{name}` from `{table}` ({n} × {dim})");
+            ctx.register_knn_metric(name, ids, vectors, None, metric)?;
+            println!(
+                "registered knn collection `{name}` from `{table}` ({n} × {dim}, metric={metric})"
+            );
         }
         "hdb_save" => {
             // hdb_save <table> <date> [root] — persist a table to the HDB layout
@@ -1726,6 +1784,7 @@ const DF_TABLE_FNS: &[&str] = &[
     "knn",
     "vector_search",
     "neighbors",
+    "khop",
     "tick_to_trade",
     "ttrade",
     "match_orders",
@@ -1857,7 +1916,7 @@ fn print_help() {
          \x20                       (trailing 'model' selects scorer; gbdt reserved for design.md M2)\n\
          \x20 klines('provider','code',...) / ticks('provider','code')  direct fetch (see providers)\n\
          \x20 neighbors <node> [T]  temporal neighbors at time T (default 0)\n\
-         \x20 khop <node> <k> [T]   k-hop traversal at time T\n\
+         \x20 khop <node> <k> [T] [--max-edges N] [--max-frontier N] [--max-degree N]   bounded k-hop traversal\n\
          \x20 mavg <n> / msum <n>   rolling average/sum over the price series\n\
          \x20 deltas                successive differences\n\
          \x20 asof [t ...]          as-of join against the price series\n\
@@ -1885,7 +1944,7 @@ fn print_help() {
          \x20 aj_from <table> [tol] bind aj/asof_join right side to a table (t, bid, ask)\n\
          \x20 aj_bench <left> <right> [tol]  full left×right as-of join sweep (1M×1M)\n\
          \x20 wash_from <table>     bind wash/wash_trade to a table (src, dst, valid_from, valid_to)\n\
-         \x20 knn_from <name> <t> [d]  register a vector collection from a table (id, v0..v{{d-1}})\n\
+         \x20 knn_from <name> <t> [d] [metric]  register a vector collection (id, v0..v{{d-1}}); metric=l2|cosine|dot\n\
          \x20 catalog               list persisted tables (GTV_HOME catalog)\n\
          \x20 drop table <name>     drop a table from memory [+ persisted catalog]\n\
          \x20 remote <host:port> <sql>  execute SQL on a remote gtv-server\n\

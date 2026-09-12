@@ -7,7 +7,7 @@
 //! the reference time `valid_at`, and enforces the event-time (edge
 //! `valid_from`) ordering constraints.
 
-use gtv_core::{Result, TemporalCSR};
+use gtv_core::{BudgetTracker, CancelToken, Result, TemporalCSR, TraversalBudget};
 
 /// A pattern edge from variable `from` to variable `to`.
 ///
@@ -138,7 +138,7 @@ pub fn find_from(
     let mut state = DfsState::new(pattern);
     state.nodes[0] = start;
     let mut matches = Vec::new();
-    dfs(csr, pattern, valid_at, 0, &mut state, &mut matches, limit)?;
+    dfs(csr, pattern, valid_at, 0, &mut state, &mut matches, limit, None)?;
     Ok(matches)
 }
 
@@ -308,7 +308,50 @@ pub fn find(
             break;
         }
         state.nodes[0] = start;
-        dfs(csr, pattern, valid_at, 0, &mut state, &mut out, limit)?;
+        dfs(csr, pattern, valid_at, 0, &mut state, &mut out, limit, None)?;
+    }
+    Ok(out)
+}
+
+/// Resource-bounded variant of [`find`] (B1-3).
+///
+/// Enforces the traversal [`TraversalBudget`] (edges / rows / deadline) and
+/// cooperatively honours a [`CancelToken`]. The optimized parallel 3-cycle
+/// matcher is intentionally bypassed here so that every scanned edge is
+/// accounted for; use [`find`] when no budget is needed.
+///
+/// Results are produced in the same order as [`find`] for the generic path.
+pub fn find_bounded(
+    csr: &TemporalCSR,
+    pattern: &Pattern,
+    valid_at: i64,
+    limit: usize,
+    budget: &TraversalBudget,
+    cancel: Option<&CancelToken>,
+) -> Result<Vec<Match>> {
+    if limit == 0 || pattern.num_vars == 0 {
+        return Ok(Vec::new());
+    }
+    let tracker = BudgetTracker::new(budget.clone(), cancel.cloned());
+    let mut out = Vec::new();
+    let mut state = DfsState::new(pattern);
+    for start in 0..csr.node_count() as u64 {
+        tracker.check_time()?;
+        if out.len() >= limit {
+            break;
+        }
+        state.nodes[0] = start;
+        dfs(
+            csr,
+            pattern,
+            valid_at,
+            0,
+            &mut state,
+            &mut out,
+            limit,
+            Some(&tracker),
+        )?;
+        tracker.add_rows(out.len() as u64)?;
     }
     Ok(out)
 }
@@ -365,6 +408,7 @@ fn dfs(
     state: &mut DfsState,
     matches: &mut Vec<Match>,
     limit: usize,
+    tracker: Option<&BudgetTracker>,
 ) -> Result<()> {
     if matches.len() >= limit {
         return Ok(());
@@ -388,6 +432,12 @@ fn dfs(
     // struct and closure overhead, which dominates a multi-million-node scan.
     let (dst, vf, vt, et) = csr.edge_slices(from_node)?;
     for idx in 0..dst.len() {
+        if let Some(t) = tracker {
+            t.add_edges(1)?;
+            if idx & 0x3ff == 0 {
+                t.check_time()?;
+            }
+        }
         // Active at `valid_at`: `valid_from <= valid_at < valid_to`.
         let vf_i = vf[idx];
         if vf_i > valid_at || valid_at >= vt[idx] {
@@ -407,7 +457,7 @@ fn dfs(
             state.valid_from[ei] = vf_i;
             state.valid_to[ei] = vt[idx];
             state.edge_type[ei] = et[idx];
-            dfs(csr, pattern, valid_at, ei + 1, state, matches, limit)?;
+            dfs(csr, pattern, valid_at, ei + 1, state, matches, limit, tracker)?;
         } else {
             // Bind a fresh variable: keep node assignments distinct.
             let mut dup = false;
@@ -424,7 +474,7 @@ fn dfs(
             state.valid_from[ei] = vf_i;
             state.valid_to[ei] = vt[idx];
             state.edge_type[ei] = et[idx];
-            dfs(csr, pattern, valid_at, ei + 1, state, matches, limit)?;
+            dfs(csr, pattern, valid_at, ei + 1, state, matches, limit, tracker)?;
             state.nodes[e.to] = u64::MAX;
         }
     }
@@ -526,5 +576,45 @@ mod tests {
         // so the temporal path (which requires increasing times) must not match.
         let m = find_from(g.csr(), &pat, 0, 1500, 10).unwrap();
         assert!(m.is_empty());
+    }
+
+    #[test]
+    fn find_bounded_matches_find_and_enforces_budget() {
+        let g = transfer_graph();
+        let pat = Pattern::temporal_path(3);
+        let unbounded = find(g.csr(), &pat, 500, 10).unwrap();
+        let bounded =
+            find_bounded(g.csr(), &pat, 500, 10, &TraversalBudget::unlimited(), None).unwrap();
+        assert_eq!(unbounded.len(), bounded.len());
+
+        let err = find_bounded(
+            g.csr(),
+            &pat,
+            500,
+            10,
+            &TraversalBudget::unlimited().with_max_edges(1),
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            gtv_core::GtvError::BudgetExceeded { stage: "edges", .. }
+        ));
+    }
+
+    #[test]
+    fn find_bounded_honours_cancel() {
+        let g = transfer_graph();
+        let pat = Pattern::temporal_path(3);
+        let token: CancelToken = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let got = find_bounded(
+            g.csr(),
+            &pat,
+            500,
+            10,
+            &TraversalBudget::unlimited(),
+            Some(&token),
+        );
+        assert!(matches!(got, Err(gtv_core::GtvError::Cancelled)));
     }
 }

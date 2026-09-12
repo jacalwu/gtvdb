@@ -1,11 +1,20 @@
 //! Approximate nearest-neighbor search via a Hierarchical Navigable Small
 //! World (HNSW) graph, built from scratch with a deterministic PRNG so builds
 //! are reproducible (and testable without external randomness).
+//!
+//! Supports [`Metric::L2`], [`Metric::Cosine`] and [`Metric::Ip`]. Cosine rows
+//! (and the query) are unit-normalized, after which the score is `1 - dot`.
+//!
+//! > **Memory layout note**: this version still stores each node as a
+//! > `Vec<f32>` + `Vec<Vec<usize>>` (pointer-chasing). The contiguous-layout
+//! > refactor is tracked as B1-4 in `prod_p1.md`; the metric contract added here
+//! > is a prerequisite for it.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 
-use arrow::array::{BooleanArray, UInt64Array};
-use gtv_core::{GtvError, Result, VectorIndex};
+use arrow::array::BooleanArray;
+use gtv_core::{GtvError, Metric, Result, VectorHit, VectorIndex};
 
 /// Deterministic 64-bit splitmix PRNG (seeded) — keeps HNSW builds reproducible.
 #[derive(Debug, Clone)]
@@ -37,7 +46,7 @@ struct Node {
     layers: Vec<Vec<usize>>,
 }
 
-/// Approximate K-NN over an HNSW graph. Distances are squared L2.
+/// Approximate K-NN over an HNSW graph.
 ///
 /// The bitmask is indexed by node *position* (0..n), identical to
 /// [`FlatIndex`](crate::FlatIndex).
@@ -45,6 +54,7 @@ pub struct HnswIndex {
     nodes: Vec<Node>,
     entry: usize,
     dim: usize,
+    metric: Metric,
     /// Max neighbors per node at layer >= 1.
     m: usize,
     /// Max neighbors per node at layer 0 (usually 2 * `m`).
@@ -56,11 +66,23 @@ pub struct HnswIndex {
 }
 
 impl HnswIndex {
+    /// New L2 index.
     pub fn new(m: usize, ef_construction: usize, ef_search: usize) -> Self {
+        Self::with_metric(m, ef_construction, ef_search, Metric::L2)
+    }
+
+    /// New index with an explicit metric.
+    pub fn with_metric(
+        m: usize,
+        ef_construction: usize,
+        ef_search: usize,
+        metric: Metric,
+    ) -> Self {
         HnswIndex {
             nodes: Vec::new(),
             entry: 0,
             dim: 0,
+            metric,
             m: m.max(1),
             m0: (m * 2).max(1),
             ef_construction: ef_construction.max(1),
@@ -70,7 +92,7 @@ impl HnswIndex {
         }
     }
 
-    /// Convenience: build an index from scratch, inserting each vector in order.
+    /// Convenience: build an L2 index from scratch, inserting each vector in order.
     pub fn build(
         ids: Vec<u64>,
         vectors: Vec<Vec<f32>>,
@@ -78,12 +100,24 @@ impl HnswIndex {
         ef_construction: usize,
         ef_search: usize,
     ) -> Result<Self> {
+        Self::build_with_metric(ids, vectors, m, ef_construction, ef_search, Metric::L2)
+    }
+
+    /// Build an index with an explicit metric.
+    pub fn build_with_metric(
+        ids: Vec<u64>,
+        vectors: Vec<Vec<f32>>,
+        m: usize,
+        ef_construction: usize,
+        ef_search: usize,
+        metric: Metric,
+    ) -> Result<Self> {
         if ids.len() != vectors.len() {
             return Err(GtvError::InvalidArgument(
                 "ids and vectors length mismatch".into(),
             ));
         }
-        let mut index = Self::new(m, ef_construction, ef_search);
+        let mut index = Self::with_metric(m, ef_construction, ef_search, metric);
         for (id, v) in ids.into_iter().zip(vectors) {
             index.insert(id, v)?;
         }
@@ -102,8 +136,26 @@ impl HnswIndex {
         self.dim
     }
 
-    fn squared_l2(a: &[f32], b: &[f32]) -> f32 {
-        a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum()
+    pub fn metric(&self) -> Metric {
+        self.metric
+    }
+
+    /// Metric-aware distance; rows and query are normalized for Cosine, so the
+    /// full `Metric::distance` formula stays cheap.
+    #[inline]
+    fn dist(&self, a: &[f32], b: &[f32]) -> f32 {
+        self.metric.distance(a, b)
+    }
+
+    /// Normalize the query when the metric requires it.
+    fn prepare_query<'a>(&self, query: &'a [f32]) -> Cow<'a, [f32]> {
+        if self.metric.requires_normalization() {
+            let mut q = query.to_vec();
+            self.metric.normalize_in_place(&mut q);
+            Cow::Owned(q)
+        } else {
+            Cow::Borrowed(query)
+        }
     }
 
     /// Sample a level from the geometric-ish distribution `floor(-ln(u) * mL)`.
@@ -115,11 +167,11 @@ impl HnswIndex {
 
     /// Greedy (ef = 1) descent to the nearest node at `layer` from `start`.
     fn greedy_descend(&self, query: &[f32], mut cur: usize, layer: usize) -> (f32, usize) {
-        let mut cur_d = Self::squared_l2(query, &self.nodes[cur].vector);
+        let mut cur_d = self.dist(query, &self.nodes[cur].vector);
         loop {
             let mut best = (cur_d, cur);
             for &nb in &self.nodes[cur].layers[layer] {
-                let d = Self::squared_l2(query, &self.nodes[nb].vector);
+                let d = self.dist(query, &self.nodes[nb].vector);
                 if d < best.0 {
                     best = (d, nb);
                 }
@@ -166,7 +218,7 @@ impl HnswIndex {
                 if !visited.insert(nb) {
                     continue;
                 }
-                let d = Self::squared_l2(query, &self.nodes[nb].vector);
+                let d = self.dist(query, &self.nodes[nb].vector);
                 candidates.push((d, nb));
                 if mask.map_or(true, |m| m.value(nb)) {
                     results.push((d, nb));
@@ -182,16 +234,16 @@ impl HnswIndex {
     }
 
     /// Insert a single node, wiring it into the graph bidirectionally.
-    pub fn insert(&mut self, id: u64, vector: Vec<f32>) -> Result<()> {
+    pub fn insert(&mut self, id: u64, mut vector: Vec<f32>) -> Result<()> {
         if self.dim == 0 {
             self.dim = vector.len();
         } else if vector.len() != self.dim {
-            return Err(GtvError::InvalidArgument(format!(
-                "vector dim {} != index dim {}",
-                vector.len(),
-                self.dim
-            )));
+            return Err(GtvError::DimensionMismatch {
+                index: self.dim,
+                query: vector.len(),
+            });
         }
+        self.metric.normalize_in_place(&mut vector);
 
         let level = self.random_level();
         let new_idx = self.nodes.len();
@@ -209,7 +261,7 @@ impl HnswIndex {
 
         // Greedy descent from the top entry down to `level + 1`.
         let mut cur = self.entry;
-        let mut cur_d = Self::squared_l2(&self.nodes[new_idx].vector, &self.nodes[cur].vector);
+        let mut cur_d = self.dist(&self.nodes[new_idx].vector, &self.nodes[cur].vector);
         for l in ((level + 1)..=self.max_level).rev() {
             let (d, n) = self.greedy_descend(&self.nodes[new_idx].vector, cur, l);
             cur = n;
@@ -259,9 +311,10 @@ impl HnswIndex {
             return;
         }
         let target = self.nodes[node].vector.clone();
+        let metric = self.metric;
         let mut scored: Vec<(f32, usize)> = neighbors
             .into_iter()
-            .map(|nb| (Self::squared_l2(&target, &self.nodes[nb].vector), nb))
+            .map(|nb| (metric.distance(&target, &self.nodes[nb].vector), nb))
             .collect();
         sort_asc(&mut scored);
         scored.truncate(max_deg);
@@ -269,19 +322,20 @@ impl HnswIndex {
     }
 
     /// Search returning `(distance, external id)` pairs, sorted ascending.
-    fn search(&self, query: &[f32], k: usize, mask: Option<&BooleanArray>) -> Vec<(f32, u64)> {
+    fn search_scored(&self, query: &[f32], k: usize, mask: Option<&BooleanArray>) -> Vec<(f32, u64)> {
         if self.nodes.is_empty() {
             return Vec::new();
         }
+        let query = self.prepare_query(query);
         let ef = self.ef_search.max(k);
         let mut cur = self.entry;
-        let mut cur_d = Self::squared_l2(query, &self.nodes[cur].vector);
+        let mut cur_d = self.dist(&query, &self.nodes[cur].vector);
         for l in (1..=self.max_level).rev() {
-            let (d, n) = self.greedy_descend(query, cur, l);
+            let (d, n) = self.greedy_descend(&query, cur, l);
             cur = n;
             cur_d = d;
         }
-        let mut results = self.search_layer(query, &[(cur_d, cur)], ef, 0, mask);
+        let mut results = self.search_layer(&query, &[(cur_d, cur)], ef, 0, mask);
         sort_asc(&mut results);
         results.truncate(k);
         results
@@ -304,18 +358,25 @@ fn take_nearest(candidates: &[(f32, usize)], n: usize) -> Vec<usize> {
 }
 
 impl VectorIndex for HnswIndex {
-    fn search_knn(
+    fn metric(&self) -> Metric {
+        self.metric
+    }
+
+    fn dim(&self) -> usize {
+        self.dim
+    }
+
+    fn search(
         &self,
         query: &[f32],
         k: usize,
         filter_mask: Option<&BooleanArray>,
-    ) -> Result<UInt64Array> {
+    ) -> Result<Vec<VectorHit>> {
         if query.len() != self.dim {
-            return Err(GtvError::InvalidArgument(format!(
-                "query dim {} != index dim {}",
-                query.len(),
-                self.dim
-            )));
+            return Err(GtvError::DimensionMismatch {
+                index: self.dim,
+                query: query.len(),
+            });
         }
         if let Some(mask) = filter_mask {
             if mask.len() != self.nodes.len() {
@@ -325,12 +386,13 @@ impl VectorIndex for HnswIndex {
             }
         }
         if k == 0 {
-            return Ok(UInt64Array::from(Vec::<u64>::new()));
+            return Ok(Vec::new());
         }
-        let results = self.search(query, k, filter_mask);
-        Ok(UInt64Array::from(
-            results.into_iter().map(|(_, id)| id).collect::<Vec<u64>>(),
-        ))
+        Ok(self
+            .search_scored(query, k, filter_mask)
+            .into_iter()
+            .map(|(distance, id)| VectorHit { id, distance })
+            .collect())
     }
 }
 
@@ -385,5 +447,31 @@ mod tests {
         let approx: Vec<u64> = approx.values().to_vec();
         // HNSW must return the exact nearest neighbor as its top-1 on this size.
         assert_eq!(exact[0], approx[0]);
+    }
+
+    #[test]
+    fn cosine_reports_and_orders() {
+        let ids = vec![0u64, 1, 2];
+        let vectors = vec![
+            vec![1.0f32, 0.0],
+            vec![0.9, 0.1],
+            vec![0.0, 1.0],
+        ];
+        let index =
+            HnswIndex::build_with_metric(ids, vectors, 4, 20, 20, Metric::Cosine).unwrap();
+        assert_eq!(index.metric(), Metric::Cosine);
+        let hits = index.search(&[1.0, 0.0], 3, None).unwrap();
+        let got: Vec<u64> = hits.iter().map(|h| h.id).collect();
+        assert_eq!(got[0], 0);
+    }
+
+    #[test]
+    fn dimension_mismatch_is_typed() {
+        let mut index = HnswIndex::new(4, 20, 20);
+        index.insert(0, vec![0.0, 0.0]).unwrap();
+        assert!(matches!(
+            index.search(&[1.0], 1, None),
+            Err(GtvError::DimensionMismatch { .. })
+        ));
     }
 }

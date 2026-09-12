@@ -18,6 +18,7 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::catalog::{TableFunctionArgs, TableFunctionImpl};
 use datafusion::datasource::{MemTable, TableProvider};
 use datafusion::error::{DataFusionError, Result};
+use gtv_core::{GtvError, Metric};
 
 use crate::expr_util::{expr_to_i64, expr_to_string};
 
@@ -28,13 +29,26 @@ pub struct KnnCollection {
     vectors: Vec<Vec<f32>>,
     /// Per-vector metadata label (e.g. genre), aligned with `vectors`.
     labels: Option<Vec<String>>,
+    /// Distance metric for every query against this collection.
+    metric: Metric,
 }
 
 impl KnnCollection {
+    /// New L2 collection.
     pub fn new(
         ids: Vec<u64>,
         vectors: Vec<Vec<f32>>,
         labels: Option<Vec<String>>,
+    ) -> Result<Self> {
+        Self::with_metric(ids, vectors, labels, Metric::L2)
+    }
+
+    /// New collection with an explicit metric.
+    pub fn with_metric(
+        ids: Vec<u64>,
+        vectors: Vec<Vec<f32>>,
+        labels: Option<Vec<String>>,
+        metric: Metric,
     ) -> Result<Self> {
         if ids.len() != vectors.len() {
             return Err(DataFusionError::Execution(
@@ -67,6 +81,7 @@ impl KnnCollection {
             ids,
             vectors,
             labels,
+            metric,
         })
     }
 
@@ -74,8 +89,26 @@ impl KnnCollection {
         self.vectors.first().map(Vec::len).unwrap_or(0)
     }
 
-    /// Exact L2 K-NN, optionally restricted to vectors whose label equals
-    /// `label`. Returns `(id, distance)` pairs nearest-first.
+    /// The metric every query against this collection uses.
+    pub fn metric(&self) -> Metric {
+        self.metric
+    }
+
+    /// Reject a caller-supplied metric that differs from the index metric.
+    pub fn check_metric(&self, requested: Metric) -> std::result::Result<(), GtvError> {
+        if requested != self.metric {
+            return Err(GtvError::MetricMismatch {
+                index: self.metric,
+                query: requested,
+            });
+        }
+        Ok(())
+    }
+
+    /// Exact K-NN under this collection's metric, optionally restricted to
+    /// vectors whose label equals `label`. Returns `(id, distance)` pairs
+    /// nearest-first (L2 reports the Euclidean distance, others the metric
+    /// distance).
     fn search(&self, query: &[f32], k: usize, label: Option<&str>) -> Vec<(u64, f64)> {
         let mut scored: Vec<(f32, u64)> = self
             .vectors
@@ -85,7 +118,7 @@ impl KnnCollection {
                 (Some(labels), Some(want)) => labels[*i] == want,
                 _ => true,
             })
-            .map(|(i, v)| (squared_l2(query, v), self.ids[i]))
+            .map(|(i, v)| (self.metric.distance(query, v), self.ids[i]))
             .collect();
         scored.sort_by(|a, b| {
             a.0.partial_cmp(&b.0)
@@ -95,13 +128,19 @@ impl KnnCollection {
         scored.truncate(k);
         scored
             .into_iter()
-            .map(|(d2, id)| (id, (d2 as f64).sqrt()))
+            .map(|(d2, id)| (id, report_distance(self.metric, d2)))
             .collect()
     }
 }
 
-fn squared_l2(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum()
+/// Convert the canonical metric distance to the value surfaced to SQL/CLI.
+/// L2 keeps its historical Euclidean (sqrt) report; cosine/IP report as-is.
+#[inline]
+fn report_distance(metric: Metric, raw: f32) -> f64 {
+    match metric {
+        Metric::L2 => (raw.max(0.0) as f64).sqrt(),
+        _ => raw as f64,
+    }
 }
 
 /// The `knn` table function over a shared, mutable set of collections.
@@ -142,6 +181,7 @@ impl TableFunctionImpl for KnnTableFunction {
                 .ok_or_else(|| DataFusionError::Execution("knn(name, query, k [, label]): missing `k`".into()))?,
         )? as usize;
         let label = exprs.get(3).map(expr_to_string).transpose()?;
+        let requested_metric = exprs.get(4).map(expr_to_string).transpose()?;
 
         let query: Vec<f32> = query
             .split(',')
@@ -158,6 +198,17 @@ impl TableFunctionImpl for KnnTableFunction {
         let collection = collections.get(&name).ok_or_else(|| {
             DataFusionError::Execution(format!("knn: unknown collection `{name}`"))
         })?;
+
+        if let Some(m) = requested_metric.as_deref() {
+            let metric = Metric::parse(m).ok_or_else(|| {
+                DataFusionError::Execution(format!(
+                    "knn: unknown metric `{m}` (expected l2|cosine|dot)"
+                ))
+            })?;
+            collection
+                .check_metric(metric)
+                .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+        }
 
         if query.len() != collection.dim() {
             return Err(DataFusionError::Execution(format!(
@@ -254,5 +305,37 @@ mod tests {
         assert_eq!(got.iter().map(|(id, _)| *id).collect::<Vec<_>>(), vec![0, 2, 1, 3]);
         let top1 = c.search(&q, 1, None);
         assert_eq!(top1.iter().map(|(id, _)| *id).collect::<Vec<_>>(), vec![0]);
+    }
+
+    #[test]
+    fn metric_defaults_to_l2_and_is_reported() {
+        let c = songs();
+        assert_eq!(c.metric(), Metric::L2);
+    }
+
+    #[test]
+    fn check_metric_rejects_mismatch() {
+        let c = songs();
+        assert!(c.check_metric(Metric::L2).is_ok());
+        assert!(matches!(
+            c.check_metric(Metric::Cosine),
+            Err(GtvError::MetricMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn cosine_collection_orders_by_direction() {
+        // Same directions as vectors 0/1/2 but wildly different magnitudes:
+        // L2 would rank by magnitude, cosine must rank by direction.
+        let vectors = vec![
+            vec![100.0f32, 0.0],
+            vec![0.9, 0.1],
+            vec![0.0, 1.0],
+        ];
+        let c = KnnCollection::with_metric((0..3).collect(), vectors, None, Metric::Cosine)
+            .unwrap();
+        assert_eq!(c.metric(), Metric::Cosine);
+        let got = c.search(&[1.0, 0.0], 3, None);
+        assert_eq!(got.iter().map(|(id, _)| *id).collect::<Vec<_>>(), vec![0, 1, 2]);
     }
 }

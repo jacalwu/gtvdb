@@ -7,11 +7,16 @@
 //! is a bounded top-K *per-thread* selection — the full `N × (f32, u64)` score
 //! vector is never materialized, so the only `O(N)` allocation is the input
 //! read itself (memory0copy.md: no intermediate score array written to DRAM).
+//!
+//! Supports [`Metric::L2`], [`Metric::Cosine`] and [`Metric::Ip`]. Cosine rows
+//! (and the query) are unit-normalized at build time, after which the cosine
+//! distance reduces to `1 - dot(a,b)` and reuses the SIMD dot kernel.
 
+use std::borrow::Cow;
 use std::cmp::Ordering;
 
-use arrow::array::{BooleanArray, UInt64Array};
-use gtv_core::{GtvError, Result, VectorIndex};
+use arrow::array::BooleanArray;
+use gtv_core::{GtvError, Metric, Result, VectorHit, VectorIndex};
 
 /// Exact K-NN via a linear scan over every vector, optionally restricted to
 /// the nodes allowed by a [`BooleanArray`] bitmask.
@@ -24,10 +29,19 @@ pub struct FlatIndex {
     /// Row-major: vector `i` occupies `data[i * dim .. (i + 1) * dim]`.
     data: Vec<f32>,
     dim: usize,
+    metric: Metric,
+    /// True when rows were unit-normalized at construction (Cosine).
+    normalized: bool,
 }
 
 impl FlatIndex {
+    /// Build with the default [`Metric::L2`].
     pub fn new(ids: Vec<u64>, vectors: Vec<Vec<f32>>) -> Result<Self> {
+        Self::with_metric(ids, vectors, Metric::L2)
+    }
+
+    /// Build with an explicit metric.
+    pub fn with_metric(ids: Vec<u64>, vectors: Vec<Vec<f32>>, metric: Metric) -> Result<Self> {
         if ids.len() != vectors.len() {
             return Err(GtvError::InvalidArgument(
                 "ids and vectors length mismatch".into(),
@@ -52,13 +66,24 @@ impl FlatIndex {
         for v in &vectors {
             data.extend_from_slice(v);
         }
-        Ok(Self { ids, data, dim })
+        Self::from_flat_metric(ids, data, dim, metric)
     }
 
-    /// Build from an already-contiguous row-major buffer (vector `i` occupies
-    /// `data[i * dim .. (i + 1) * dim]`), avoiding the re-copy that [`new`] pays
-    /// when handed a `Vec<Vec<f32>>`.
+    /// Build from an already-contiguous row-major buffer with [`Metric::L2`].
     pub fn from_flat(ids: Vec<u64>, data: Vec<f32>, dim: usize) -> Result<Self> {
+        Self::from_flat_metric(ids, data, dim, Metric::L2)
+    }
+
+    /// Build from an already-contiguous row-major buffer with an explicit metric.
+    ///
+    /// When the metric requires normalization the buffer is normalized in place
+    /// so `data()` stays the canonical (normalized) corpus.
+    pub fn from_flat_metric(
+        ids: Vec<u64>,
+        mut data: Vec<f32>,
+        dim: usize,
+        metric: Metric,
+    ) -> Result<Self> {
         if dim == 0 {
             return Err(GtvError::InvalidArgument("zero-dimension vectors".into()));
         }
@@ -67,7 +92,18 @@ impl FlatIndex {
                 "data length != ids.len() * dim".into(),
             ));
         }
-        Ok(Self { ids, data, dim })
+        if metric.requires_normalization() {
+            for row in data.chunks_mut(dim) {
+                metric.normalize_in_place(row);
+            }
+        }
+        Ok(Self {
+            ids,
+            data,
+            dim,
+            metric,
+            normalized: metric.requires_normalization(),
+        })
     }
 
     pub fn len(&self) -> usize {
@@ -82,6 +118,15 @@ impl FlatIndex {
         self.dim
     }
 
+    pub fn metric(&self) -> Metric {
+        self.metric
+    }
+
+    /// Whether the stored rows are unit-normalized (Cosine).
+    pub fn is_normalized(&self) -> bool {
+        self.normalized
+    }
+
     /// Zero-copy access to the contiguous row-major vector buffer (vector `i`
     /// occupies `data[i * dim .. (i + 1) * dim]`). Used by the CUDA K-NN path to
     /// upload the corpus without materializing a second host copy.
@@ -93,10 +138,21 @@ impl FlatIndex {
     pub fn ids(&self) -> &[u64] {
         &self.ids
     }
+
+    /// Normalize the query when the metric requires it.
+    fn prepare_query<'a>(&self, query: &'a [f32]) -> Cow<'a, [f32]> {
+        if self.normalized {
+            let mut q = query.to_vec();
+            self.metric.normalize_in_place(&mut q);
+            Cow::Owned(q)
+        } else {
+            Cow::Borrowed(query)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
-// Squared-L2 kernels
+// Distance kernels
 // ---------------------------------------------------------------------------
 
 #[inline]
@@ -105,6 +161,15 @@ pub(crate) fn squared_l2_scalar(query: &[f32], row: &[f32]) -> f32 {
     for (x, y) in query.iter().zip(row) {
         let d = x - y;
         sum += d * d;
+    }
+    sum
+}
+
+#[inline]
+pub(crate) fn dot_scalar(a: &[f32], b: &[f32]) -> f32 {
+    let mut sum = 0.0f32;
+    for (x, y) in a.iter().zip(b) {
+        sum += x * y;
     }
     sum
 }
@@ -170,6 +235,61 @@ pub(crate) unsafe fn squared_l2_avx2(query: &[f32], row: &[f32]) -> f32 {
     sum
 }
 
+/// AVX2 + FMA dot product with four independent accumulators.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+#[inline]
+pub(crate) unsafe fn dot_avx2(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+    let n = a.len();
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
+    let mut acc2 = _mm256_setzero_ps();
+    let mut acc3 = _mm256_setzero_ps();
+    let mut i = 0usize;
+
+    while i + 32 <= n {
+        acc0 = _mm256_fmadd_ps(
+            _mm256_loadu_ps(a.as_ptr().add(i)),
+            _mm256_loadu_ps(b.as_ptr().add(i)),
+            acc0,
+        );
+        acc1 = _mm256_fmadd_ps(
+            _mm256_loadu_ps(a.as_ptr().add(i + 8)),
+            _mm256_loadu_ps(b.as_ptr().add(i + 8)),
+            acc1,
+        );
+        acc2 = _mm256_fmadd_ps(
+            _mm256_loadu_ps(a.as_ptr().add(i + 16)),
+            _mm256_loadu_ps(b.as_ptr().add(i + 16)),
+            acc2,
+        );
+        acc3 = _mm256_fmadd_ps(
+            _mm256_loadu_ps(a.as_ptr().add(i + 24)),
+            _mm256_loadu_ps(b.as_ptr().add(i + 24)),
+            acc3,
+        );
+        i += 32;
+    }
+    while i + 8 <= n {
+        acc0 = _mm256_fmadd_ps(
+            _mm256_loadu_ps(a.as_ptr().add(i)),
+            _mm256_loadu_ps(b.as_ptr().add(i)),
+            acc0,
+        );
+        i += 8;
+    }
+
+    let acc = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
+    let mut buf = [0.0f32; 8];
+    _mm256_storeu_ps(buf.as_mut_ptr(), acc);
+    let mut sum = buf.iter().sum::<f32>();
+    for j in i..n {
+        sum += a[j] * b[j];
+    }
+    sum
+}
+
 /// Dispatch to the fastest available squared-L2 kernel for this host.
 #[inline]
 pub(crate) fn squared_l2(query: &[f32], row: &[f32], use_simd: bool) -> f32 {
@@ -183,6 +303,49 @@ pub(crate) fn squared_l2(query: &[f32], row: &[f32], use_simd: bool) -> f32 {
     #[cfg(not(target_arch = "x86_64"))]
     let _ = use_simd;
     squared_l2_scalar(query, row)
+}
+
+/// Dispatch to the fastest available dot-product kernel for this host.
+#[inline]
+pub(crate) fn dot(a: &[f32], b: &[f32], use_simd: bool) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if use_simd {
+            // SAFETY: guarded by the runtime AVX2+FMA detection performed by the caller.
+            return unsafe { dot_avx2(a, b) };
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = use_simd;
+    dot_scalar(a, b)
+}
+
+/// Distance under `metric`, given that Cosine inputs are already normalized.
+#[inline]
+pub(crate) fn metric_distance(
+    query: &[f32],
+    row: &[f32],
+    metric: Metric,
+    use_simd: bool,
+) -> f32 {
+    match metric {
+        Metric::L2 => squared_l2(query, row, use_simd),
+        // Rows and query are normalized, so cos = dot and distance = 1 - dot.
+        Metric::Cosine => 1.0 - dot(query, row, use_simd),
+        Metric::Ip => -dot(query, row, use_simd),
+    }
+}
+
+#[inline]
+fn simd_available() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -285,18 +448,25 @@ pub(crate) fn par_topk_over(
 }
 
 impl VectorIndex for FlatIndex {
-    fn search_knn(
+    fn metric(&self) -> Metric {
+        self.metric
+    }
+
+    fn dim(&self) -> usize {
+        self.dim
+    }
+
+    fn search(
         &self,
         query: &[f32],
         k: usize,
         filter_mask: Option<&BooleanArray>,
-    ) -> Result<UInt64Array> {
+    ) -> Result<Vec<VectorHit>> {
         if query.len() != self.dim {
-            return Err(GtvError::InvalidArgument(format!(
-                "query dim {} != index dim {}",
-                query.len(),
-                self.dim
-            )));
+            return Err(GtvError::DimensionMismatch {
+                index: self.dim,
+                query: query.len(),
+            });
         }
         if let Some(mask) = filter_mask {
             if mask.len() != self.ids.len() {
@@ -306,19 +476,16 @@ impl VectorIndex for FlatIndex {
             }
         }
         if k == 0 {
-            return Ok(UInt64Array::from(Vec::<u64>::new()));
+            return Ok(Vec::new());
         }
 
+        let query = self.prepare_query(query);
         let n = self.ids.len();
         let dim = self.dim;
         let data = &self.data;
         let ids = &self.ids;
-
-        #[cfg(target_arch = "x86_64")]
-        let use_simd =
-            std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma");
-        #[cfg(not(target_arch = "x86_64"))]
-        let use_simd = false;
+        let metric = self.metric;
+        let use_simd = simd_available();
 
         let scored = par_topk(n, k, filter_mask, |i| {
             // Manual prefetch of the row `PREFETCH_DIST` ahead: the exact KNN scan
@@ -337,12 +504,13 @@ impl VectorIndex for FlatIndex {
                 }
             }
             let row = &data[i * dim..(i + 1) * dim];
-            (squared_l2(query, row, use_simd), ids[i])
+            (metric_distance(&query, row, metric, use_simd), ids[i])
         });
 
-        Ok(UInt64Array::from(
-            scored.into_iter().map(|(_, id)| id).collect::<Vec<u64>>(),
-        ))
+        Ok(scored
+            .into_iter()
+            .map(|(distance, id)| VectorHit { id, distance })
+            .collect())
     }
 }
 
@@ -390,6 +558,67 @@ mod tests {
     #[test]
     fn rejects_dimension_mismatch() {
         let index = idx();
-        assert!(index.search_knn(&[1.0], 2, None).is_err());
+        assert!(matches!(
+            index.search(&[1.0], 2, None),
+            Err(GtvError::DimensionMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn metric_is_reported_and_default_is_l2() {
+        assert_eq!(idx().metric(), Metric::L2);
+    }
+
+    #[test]
+    fn cosine_matches_scalar_reference() {
+        let ids = vec![0u64, 1, 2];
+        let vectors = vec![
+            vec![1.0f32, 0.0, 0.0],
+            vec![0.9, 0.1, 0.0],
+            vec![0.0, 1.0, 0.0],
+        ];
+        let index = FlatIndex::with_metric(ids.clone(), vectors.clone(), Metric::Cosine).unwrap();
+        let q = [1.0f32, 0.0, 0.0];
+        let hits = index.search(&q, 3, None).unwrap();
+
+        // Reference: rank by 1 - cosine similarity with the raw vectors.
+        let mut expected: Vec<u64> = ids.clone();
+        let mut rq = q;
+        Metric::Cosine.normalize_in_place(&mut rq);
+        expected.sort_by(|&a, &b| {
+            let da = Metric::Cosine.distance(&rq, &vectors[a as usize]);
+            let db = Metric::Cosine.distance(&rq, &vectors[b as usize]);
+            da.partial_cmp(&db).unwrap().then(a.cmp(&b))
+        });
+        let got: Vec<u64> = hits.iter().map(|h| h.id).collect();
+        assert_eq!(got, expected);
+        assert_eq!(got[0], 0);
+    }
+
+    #[test]
+    fn ip_prefers_larger_inner_product() {
+        let ids = vec![0u64, 1, 2];
+        let vectors = vec![
+            vec![1.0f32, 1.0],
+            vec![2.0, 2.0],
+            vec![0.1, 0.0],
+        ];
+        let index = FlatIndex::with_metric(ids, vectors, Metric::Ip).unwrap();
+        let hits = index.search(&[1.0, 1.0], 3, None).unwrap();
+        let got: Vec<u64> = hits.iter().map(|h| h.id).collect();
+        assert_eq!(got, vec![1, 0, 2]);
+    }
+
+    #[test]
+    fn normalized_flag_set_for_cosine() {
+        let index = FlatIndex::with_metric(
+            vec![0u64],
+            vec![vec![3.0f32, 4.0]],
+            Metric::Cosine,
+        )
+        .unwrap();
+        assert!(index.is_normalized());
+        let row = &index.data()[0..2];
+        assert!((gtv_core::metric::norm(row) - 1.0).abs() < 1e-6);
     }
 }

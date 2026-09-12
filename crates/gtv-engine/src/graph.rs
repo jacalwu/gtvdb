@@ -11,7 +11,7 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::catalog::{TableFunctionArgs, TableFunctionImpl};
 use datafusion::datasource::{MemTable, TableProvider};
 use datafusion::error::{DataFusionError, Result};
-use gtv_core::TemporalCSR;
+use gtv_core::{TemporalCSR, TraversalBudget};
 
 use crate::expr_util::{expr_to_i64, expr_to_u64};
 
@@ -81,6 +81,80 @@ impl TableFunctionImpl for NeighborsTableFunction {
             ],
         )?;
 
+        Ok(Arc::new(MemTable::try_new(Self::schema(), vec![vec![batch]])?))
+    }
+}
+
+/// `khop(src, k, valid_at [, max_hops, max_edges])` — resource-bounded k-hop
+/// BFS over the temporal CSR (B1-3). Emits one row per reached node with the
+/// hop at which it was first reached.
+#[derive(Debug)]
+pub struct KhopTableFunction {
+    csr: Arc<TemporalCSR>,
+}
+
+impl KhopTableFunction {
+    pub fn new(csr: &TemporalCSR) -> Self {
+        Self {
+            csr: Arc::new(csr.clone()),
+        }
+    }
+
+    fn schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("hop", DataType::UInt64, false),
+            Field::new("dst", DataType::UInt64, false),
+        ]))
+    }
+}
+
+impl TableFunctionImpl for KhopTableFunction {
+    fn call_with_args(&self, args: TableFunctionArgs) -> Result<Arc<dyn TableProvider>> {
+        let exprs = args.exprs();
+        let src = expr_to_u64(
+            exprs.first().ok_or_else(|| {
+                DataFusionError::Execution("khop(src, k, valid_at): missing `src`".into())
+            })?,
+        )?;
+        let k = expr_to_i64(
+            exprs.get(1).ok_or_else(|| {
+                DataFusionError::Execution("khop(src, k, valid_at): missing `k`".into())
+            })?,
+        )? as usize;
+        let valid_at = expr_to_i64(
+            exprs.get(2).ok_or_else(|| {
+                DataFusionError::Execution("khop(src, k, valid_at): missing `valid_at`".into())
+            })?,
+        )?;
+
+        let mut budget = TraversalBudget::unlimited();
+        if let Some(e) = exprs.get(3) {
+            budget.max_hops = expr_to_i64(e)?.max(0) as usize;
+        }
+        if let Some(e) = exprs.get(4) {
+            budget.max_edges = expr_to_i64(e)?.max(0) as u64;
+        }
+
+        let result = self
+            .csr
+            .khop_bounded(&UInt64Array::from(vec![src]), k, valid_at, &budget, None, None)
+            .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+
+        let mut hops: Vec<u64> = Vec::new();
+        let mut dst: Vec<u64> = Vec::new();
+        for (i, f) in result.frontiers.iter().enumerate() {
+            for &d in f.values().as_ref() {
+                hops.push((i + 1) as u64);
+                dst.push(d);
+            }
+        }
+        let batch = RecordBatch::try_new(
+            Self::schema(),
+            vec![
+                Arc::new(UInt64Array::from(hops)) as ArrayRef,
+                Arc::new(UInt64Array::from(dst)) as ArrayRef,
+            ],
+        )?;
         Ok(Arc::new(MemTable::try_new(Self::schema(), vec![vec![batch]])?))
     }
 }
