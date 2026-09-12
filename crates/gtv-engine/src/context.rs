@@ -5,14 +5,42 @@ use std::sync::{Arc, RwLock};
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
+use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::datasource::MemTable;
 use datafusion::error::Result;
+use datafusion::logical_expr::LogicalPlan;
 use datafusion::prelude::SessionContext;
+use gtv_catalog::{ExecutionRecord, IndexRef, ModelRef, TableRef};
 use gtv_core::TemporalCSR;
 use gtv_index::AnyIndex;
 
 use crate::hft_exec::{compile_hft, AsofResource, HftRegistry, KernelPlan, PitResource};
 use crate::knn::{KnnCollection, KnnTableFunction};
+
+/// Options attached to a lineage-enabled execution.
+#[derive(Debug, Clone, Default)]
+pub struct ExecutionOptions {
+    pub model_versions: Vec<ModelRef>,
+    pub index_snapshots: Vec<IndexRef>,
+    pub scenario_version: Option<String>,
+    pub business_cutoff: Option<i64>,
+    pub runtime_params: serde_json::Value,
+}
+
+/// blake3 (hex) of the Arrow IPC encoding of the output batches.
+pub(crate) fn batches_checksum(batches: &[RecordBatch]) -> String {
+    let Some(first) = batches.first() else {
+        return blake3::hash(b"").to_hex().to_string();
+    };
+    let mut buf = Vec::new();
+    if let Ok(mut w) = arrow::ipc::writer::StreamWriter::try_new(&mut buf, &first.schema()) {
+        for b in batches {
+            let _ = w.write(b);
+        }
+        let _ = w.finish();
+    }
+    blake3::hash(&buf).to_hex().to_string()
+}
 
 /// A DataFusion `SessionContext` that gtv tables and UDFs are registered into.
 #[derive(Clone)]
@@ -20,6 +48,8 @@ pub struct GtvContext {
     ctx: SessionContext,
     knn_collections: Arc<RwLock<HashMap<String, KnnCollection>>>,
     any_indexes: crate::ann::IndexRegistry,
+    /// Registered tables mapped to the catalog snapshot they were loaded from.
+    table_sources: Arc<RwLock<HashMap<String, TableRef>>>,
     hft_reg: Arc<RwLock<HftRegistry>>,
 }
 
@@ -148,6 +178,7 @@ impl GtvContext {
             ctx,
             knn_collections,
             any_indexes,
+            table_sources: Arc::new(RwLock::new(HashMap::new())),
             hft_reg,
         }
     }
@@ -366,6 +397,61 @@ impl GtvContext {
         if let Ok(mut map) = self.any_indexes.write() {
             map.insert(name.to_string(), index);
         }
+    }
+
+    /// Record which catalog snapshot a registered table was loaded from, so a
+    /// lineage record can pin it.
+    pub fn set_table_source(&self, name: &str, source: TableRef) {
+        if let Ok(mut map) = self.table_sources.write() {
+            map.insert(name.to_string(), source);
+        }
+    }
+
+    /// The catalog snapshot a registered table came from, if known.
+    pub fn table_source(&self, name: &str) -> Option<TableRef> {
+        self.table_sources.read().ok()?.get(name).cloned()
+    }
+
+    /// Execute `sql`, returning the output batches and a complete
+    /// [`ExecutionRecord`] (source snapshots, model/index versions, output
+    /// checksum). The caller persists the record (e.g. via the catalog).
+    pub async fn execute_with_lineage(
+        &self,
+        sql: &str,
+        opts: ExecutionOptions,
+    ) -> Result<(Vec<RecordBatch>, ExecutionRecord)> {
+        let mut record = ExecutionRecord::begin(sql, env!("CARGO_PKG_VERSION"));
+
+        let df = self.ctx.sql(sql).await?;
+        let plan = df.logical_plan().clone();
+        let mut names: Vec<String> = Vec::new();
+        let _ = plan.apply(&mut |node: &LogicalPlan| {
+            if let LogicalPlan::TableScan(scan) = node {
+                names.push(scan.table_name.table().to_string());
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+
+        let batches = df.collect().await?;
+        let rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
+        let checksum = batches_checksum(&batches);
+
+        names.sort();
+        names.dedup();
+        if let Ok(sources) = self.table_sources.read() {
+            record.source_tables = names
+                .iter()
+                .filter_map(|n| sources.get(n).cloned())
+                .collect();
+        }
+        record.model_versions = opts.model_versions;
+        record.index_snapshots = opts.index_snapshots;
+        record.udf_versions = crate::lineage::extract_udfs(&plan);
+        record.scenario_version = opts.scenario_version;
+        record.business_cutoff = opts.business_cutoff;
+        record.runtime_params = opts.runtime_params;
+        record.finish(checksum, rows);
+        Ok((batches, record))
     }
 }
 

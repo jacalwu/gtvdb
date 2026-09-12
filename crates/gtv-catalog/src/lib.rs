@@ -8,6 +8,7 @@
 
 pub mod error;
 pub mod id;
+pub mod lineage;
 pub mod manifest;
 pub mod partition;
 pub mod schema;
@@ -16,6 +17,9 @@ pub mod store;
 
 pub use error::{CatalogError, Result};
 pub use id::{CommitId, DataFileId, IndexId, SnapshotId, TableId};
+pub use lineage::{
+    query_hash, ExecutionId, ExecutionRecord, IndexRef, ModelRef, TableRef, UdfRef,
+};
 pub use manifest::{
     ColumnStat, CommitOp, DataFile, FileFormat, Scalar, Snapshot, SourceOffset,
 };

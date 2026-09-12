@@ -26,7 +26,7 @@ use arrow::compute::concat_batches;
 use arrow::datatypes::SchemaRef;
 use chrono::Local;
 use gtv_catalog::{
-    CommitOp, CommitOptions, FileFormat, FsCatalog, NewFile, PartitionSpec, TableMeta,
+    CommitOp, CommitOptions, FileFormat, FsCatalog, NewFile, PartitionSpec, TableMeta, TableRef,
 };
 use gtv_engine::GtvContext;
 
@@ -94,6 +94,45 @@ impl Catalog {
 
     pub fn home(&self) -> &Path {
         &self.home
+    }
+
+    /// The underlying filesystem catalog (lineage, pinned snapshot reads).
+    pub fn fs(&self) -> &FsCatalog {
+        &self.fs
+    }
+
+    /// Append one execution record to the catalog's lineage log.
+    pub fn append_lineage(&self, record: &gtv_catalog::ExecutionRecord) -> Result<()> {
+        self.fs.append_lineage(record).map_err(|e| anyhow!("{e}"))
+    }
+
+    /// Fetch one execution record by id.
+    pub fn lineage(&self, id: gtv_catalog::ExecutionId) -> Result<Option<gtv_catalog::ExecutionRecord>> {
+        self.fs.lineage(id).map_err(|e| anyhow!("{e}"))
+    }
+
+    /// Every recorded execution, oldest first.
+    pub fn lineage_records(&self) -> Result<Vec<gtv_catalog::ExecutionRecord>> {
+        self.fs.lineage_records().map_err(|e| anyhow!("{e}"))
+    }
+
+    /// The pinned catalog reference for a table's latest snapshot, if any.
+    /// Used to stamp lineage records with the exact version a query read.
+    pub fn table_ref(&self, name: &str) -> Result<Option<TableRef>> {
+        let meta = match self.fs.table(name) {
+            Ok(m) => m,
+            Err(gtv_catalog::CatalogError::TableNotFound(_)) => return Ok(None),
+            Err(e) => return Err(anyhow!("{e}")),
+        };
+        let Some(snapshot_id) = self.fs.latest(meta.table_id).map_err(|e| anyhow!("{e}"))? else {
+            return Ok(None);
+        };
+        Ok(Some(TableRef {
+            table_id: meta.table_id,
+            snapshot_id,
+            schema_version: meta.schema_version,
+            table_name: meta.name,
+        }))
     }
 
     pub fn is_empty(&self) -> bool {
@@ -210,11 +249,23 @@ impl Catalog {
             return Ok(false);
         };
 
+        // Pin the snapshot this table was restored from so lineage records can
+        // reference the exact version replay should use.
+        let source = TableRef {
+            table_id: meta.table_id,
+            snapshot_id: snap,
+            schema_version: meta.schema_version,
+            table_name: meta.name.clone(),
+        };
+
         if !first.managed {
             let res = match first.format {
                 FileFormat::Csv => ctx.register_csv(&first.path, &meta.name),
                 FileFormat::Parquet => ctx.register_parquet(&first.path, &meta.name),
             };
+            if res.is_ok() {
+                ctx.set_table_source(&meta.name, source);
+            }
             return Ok(res.is_ok());
         }
 
@@ -232,7 +283,11 @@ impl Catalog {
         let Some(schema) = schema else {
             return Ok(false);
         };
-        Ok(ctx.register_batches(&meta.name, schema, batches).is_ok())
+        let ok = ctx.register_batches(&meta.name, schema, batches).is_ok();
+        if ok {
+            ctx.set_table_source(&meta.name, source);
+        }
+        Ok(ok)
     }
 
     /// Import a legacy `catalog.tsv` manifest once (only when the new catalog is

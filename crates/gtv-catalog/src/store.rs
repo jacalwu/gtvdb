@@ -36,6 +36,7 @@ use gtv_storage::{write_atomic, write_batch_atomic};
 
 use crate::error::{CatalogError, Result};
 use crate::id::{CommitId, DataFileId, SnapshotId, TableId};
+use crate::lineage::{ExecutionId, ExecutionRecord};
 use crate::manifest::{CommitOp, DataFile, FileFormat, Snapshot};
 use crate::partition::{partition_dir, PartitionSpec, PartitionValue};
 use crate::schema::{
@@ -151,6 +152,9 @@ impl FsCatalog {
     }
     fn latest_path(&self, table: TableId) -> PathBuf {
         self.table_dir(table).join("latest")
+    }
+    fn lineage_path(&self) -> PathBuf {
+        self.root.join("metadata/lineage.jsonl")
     }
 
     // -- generic io ---------------------------------------------------------
@@ -342,6 +346,26 @@ impl FsCatalog {
         self.save_tables(&tables)?;
         let _ = fs::remove_dir_all(self.table_dir(meta.table_id));
         Ok(Some(meta))
+    }
+
+    // -- lineage ------------------------------------------------------------
+
+    /// Append an execution record to the append-only lineage log.
+    pub fn append_lineage(&self, record: &ExecutionRecord) -> Result<()> {
+        self.append_jsonl(&self.lineage_path(), record)
+    }
+
+    /// Look up one execution record by id.
+    pub fn lineage(&self, id: ExecutionId) -> Result<Option<ExecutionRecord>> {
+        Ok(self
+            .read_jsonl::<ExecutionRecord>(&self.lineage_path())?
+            .into_iter()
+            .find(|r| r.execution_id == id))
+    }
+
+    /// Every recorded execution, oldest first.
+    pub fn lineage_records(&self) -> Result<Vec<ExecutionRecord>> {
+        self.read_jsonl(&self.lineage_path())
     }
 
     // -- schemas ------------------------------------------------------------

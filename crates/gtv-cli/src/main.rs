@@ -26,10 +26,11 @@ use arrow::util::pretty::print_batches;
 use rustyline::DefaultEditor;
 
 use gtv_array::{asof, window};
+use gtv_catalog::ExecutionId;
 use gtv_core::{EdgeTable, Metric, NodeTable, TemporalCSR, TemporalGraph, TraversalBudget, VectorIndex};
 use gtv_delta::{DeltaEdge, LsmStore};
 use gtv_engine::hft_exec::KernelPlan;
-use gtv_engine::GtvContext;
+use gtv_engine::{ExecutionOptions, GtvContext};
 use gtv_index::{AnyIndex, BuildOptions, HnswIndex};
 use gtv_pattern::Pattern;
 use gtv_storage::{parquet, HdbStore, SnapshotStore};
@@ -794,6 +795,9 @@ async fn run(
                 println!("loaded `{table}` from {path}");
                 if let Some(cat) = catalog.as_mut() {
                     cat.record_csv(table, &path)?;
+                    if let Some(tr) = cat.table_ref(table)? {
+                        ctx.set_table_source(table, tr);
+                    }
                     println!("catalog: persisted `{table}` (reloads {path})");
                 }
                 return Ok(Action::Continue);
@@ -808,6 +812,9 @@ async fn run(
             println!("loaded `{table}` from {path}");
             if let Some(cat) = catalog.as_mut() {
                 cat.record_parquet(table, path)?;
+                if let Some(tr) = cat.table_ref(table)? {
+                    ctx.set_table_source(table, tr);
+                }
                 println!("catalog: persisted `{table}` (reloads {path})");
             }
         }
@@ -819,6 +826,9 @@ async fn run(
             println!("loaded `{table}` from {path}");
             if let Some(cat) = catalog.as_mut() {
                 cat.record_csv(table, path)?;
+                if let Some(tr) = cat.table_ref(table)? {
+                    ctx.set_table_source(table, tr);
+                }
                 println!("catalog: persisted `{table}` (reloads {path})");
             }
         }
@@ -1578,6 +1588,104 @@ async fn run(
                 ),
             }
         }
+        "lineage" | "lineage_list" => {
+            match catalog.as_ref() {
+                Some(cat) => {
+                    let recs = cat.lineage_records()?;
+                    if recs.is_empty() {
+                        println!("lineage: no recorded executions");
+                    } else {
+                        println!("execution_id                          rows  checksum      query");
+                        for r in recs {
+                            let q: String = r.query_text.chars().take(48).collect();
+                            println!(
+                                "{:<36} {:>5}  {:<12} {}",
+                                r.execution_id,
+                                r.output_rows,
+                                &r.output_checksum[..r.output_checksum.len().min(12)],
+                                q
+                            );
+                        }
+                    }
+                }
+                None => println!("lineage: disabled — export GTV_HOME=<dir> to record executions"),
+            }
+        }
+        "lineage_show" => {
+            let id = require_arg(&tokens, 1, "lineage_show <execution_id>")?
+                .parse::<ExecutionId>()?;
+            let cat = catalog
+                .as_ref()
+                .ok_or_else(|| anyhow!("lineage requires GTV_HOME"))?;
+            match cat.lineage(id)? {
+                Some(r) => println!("{}", serde_json::to_string_pretty(&r)?),
+                None => return Err(anyhow!("no lineage record for {id}")),
+            }
+        }
+        "lineage_run" => {
+            let sql = line
+                .get("lineage_run".len()..)
+                .unwrap_or("")
+                .trim()
+                .trim_end_matches(';')
+                .trim();
+            if sql.is_empty() {
+                return Err(anyhow!("usage: lineage_run <sql>"));
+            }
+            let (batches, rec) = ctx
+                .execute_with_lineage(sql, ExecutionOptions::default())
+                .await?;
+            if let Some(cat) = catalog.as_mut() {
+                cat.append_lineage(&rec)?;
+                let _ = ctx.register_lineage(&cat.lineage_records()?);
+            } else {
+                eprintln!("lineage: GTV_HOME unset — record not persisted");
+            }
+            println!("execution_id: {}", rec.execution_id);
+            println!("output_rows:  {}", rec.output_rows);
+            println!("checksum:     {}", rec.output_checksum);
+            let udfs: Vec<String> = rec
+                .udf_versions
+                .iter()
+                .map(|u| {
+                    format!(
+                        "{}{}",
+                        u.name,
+                        if u.nondeterministic {
+                            " (nondeterministic)"
+                        } else {
+                            ""
+                        }
+                    )
+                })
+                .collect();
+            if !udfs.is_empty() {
+                println!("udfs:         {}", udfs.join(", "));
+            }
+            if !batches.is_empty() {
+                let _ = print_batches(&batches);
+            }
+        }
+        "replay" => {
+            let id = require_arg(&tokens, 1, "replay <execution_id> [--force]")?
+                .parse::<ExecutionId>()?;
+            let force = tokens[2..].iter().any(|t| {
+                t.eq_ignore_ascii_case("--force")
+                    || t.eq_ignore_ascii_case("--allow-nondeterministic")
+            });
+            let cat = catalog
+                .as_ref()
+                .ok_or_else(|| anyhow!("replay requires GTV_HOME"))?;
+            match ctx.replay(cat.fs(), id, force).await {
+                Ok(batches) => {
+                    println!("replay ok: execution {id} reproduced (checksum verified)");
+                    if !batches.is_empty() {
+                        let _ = print_batches(&batches);
+                    }
+                }
+                Err(e) => return Err(anyhow!("{e}")),
+            }
+        }
         "drop" => {
             // drop table [if exists] <name> — the SQL `DROP TABLE <name>` is
             // intercepted too when persistence is on (see drop_table_sql).
@@ -1738,6 +1846,9 @@ async fn create_table_persisted(
         return Err(anyhow!("persist `{name}`: {e:#}"));
     }
     ctx.register_batches(&name, schema, batches)?;
+    if let Some(tr) = cat.table_ref(&name)? {
+        ctx.set_table_source(&name, tr);
+    }
     if timing {
         println!("duration: {us:.3} µs (sql)");
     }
@@ -2015,6 +2126,10 @@ fn print_help() {
          \x20 index_save <name> <root> <t> [type] [metric]  build+persist an index (flat|ivf|hnsw)\n\
          \x20 index_load <name> <root> [version]  load a persisted index for SQL `ann(...)`\n\
          \x20 catalog               list persisted tables (GTV_HOME catalog)\n\
+         \x20 lineage               list recorded executions (GTV_HOME)\n\
+         \x20 lineage_run <sql>     execute + record lineage (execution_id, checksum)\n\
+         \x20 lineage_show <id>     print one execution record as JSON\n\
+         \x20 replay <id> [--force]  re-run a recorded query on pinned snapshots\n\
          \x20 drop table <name>     drop a table from memory [+ persisted catalog]\n\
          \x20 remote <host:port> <sql>  execute SQL on a remote gtv-server\n\
          \x20 quit | exit\n\

@@ -242,3 +242,17 @@ fn tmp_files_are_not_visible() {
     assert_eq!(cat.files(table, s).unwrap().len(), 1);
     let _ = std::fs::remove_file(&stray);
 }
+
+#[test]
+fn lineage_append_and_lookup() {
+    let cat = FsCatalog::open(root("lineage")).unwrap();
+    let mut rec = gtv_catalog::ExecutionRecord::begin("SELECT 1", "0.1.0");
+    rec.finish("deadbeef".into(), 1);
+    let id = rec.execution_id;
+    cat.append_lineage(&rec).unwrap();
+
+    let got = cat.lineage(id).unwrap().expect("record found");
+    assert_eq!(got.output_checksum, "deadbeef");
+    assert_eq!(got.output_rows, 1);
+    assert_eq!(cat.lineage_records().unwrap().len(), 1);
+}

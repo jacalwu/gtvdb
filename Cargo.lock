@@ -2014,9 +2014,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arrow",
+ "blake3",
  "chrono",
  "datafusion",
  "gtv-array",
+ "gtv-catalog",
  "gtv-core",
  "gtv-index",
  "gtv-pattern",
@@ -2024,6 +2026,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.20",
+ "tokio",
  "ureq",
 ]
 

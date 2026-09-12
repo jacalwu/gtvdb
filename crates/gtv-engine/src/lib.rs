@@ -17,6 +17,7 @@ pub mod hft_exec;
 pub mod hft_tf;
 pub mod indicator;
 pub mod knn;
+pub mod lineage;
 pub mod monitor;
 pub mod micro;
 pub mod market;
@@ -27,4 +28,5 @@ pub mod yahoo;
 
 mod expr_util;
 
-pub use context::GtvContext;
+pub use context::{ExecutionOptions, GtvContext};
+pub use lineage::{extract_udfs, ReplayError, ENGINE_VERSION, LINEAGE_TABLE};

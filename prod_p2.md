@@ -168,10 +168,10 @@ Risk/AML/ALM/FTP 結果無法重演或解釋。
 
 **驗收條件**
 
-- [ ] 按 `execution_id` 可完整重演結果，output checksum 一致。
-- [ ] 可回答「呢個結果用咗邊批資料、邊個 model、邊個 scenario、邊個 index」。
-- [ ] 涉及 nondeterministic UDF 時，replay 明確拒絕或標旗。
-- [ ] lineage 記錄本身可經 SQL 查詢。
+- [x] 按 `execution_id` 可完整重演結果，output checksum 一致。
+- [x] 可回答「呢個結果用咗邊批資料、邊個 model、邊個 scenario、邊個 index」。
+- [x] 涉及 nondeterministic UDF 時，replay 明確拒絕或標旗。
+- [x] lineage 記錄本身可經 SQL 查詢。
 
 **風險**
 
