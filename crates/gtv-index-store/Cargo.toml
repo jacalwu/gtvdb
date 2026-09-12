@@ -1,0 +1,15 @@
+[package]
+name = "gtv-index-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+gtv-core = { path = "../gtv-core" }
+gtv-index = { path = "../gtv-index" }
+gtv-catalog = { path = "../gtv-catalog" }
+gtv-storage = { path = "../gtv-storage" }
+blake3.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

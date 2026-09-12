@@ -605,3 +605,9 @@ JOIN loan_exposure l USING (loan_id);
 - **TemporalCSR 自適應索引**：每個 source 嘅連續 edge run 做 binary search
   （`valid_from`）+ 每 64 條 edge 一個 zone map（`valid_to`），高 degree 節點
   查詢實測較線性掃描快 ~17×；低 degree 保持線性快路。
+- **索引生命週期（`gtv-index-store`）**：`index_save <name> <root> <table> [type] [metric]`
+  由表建立 `flat` / `ivf` / `hnsw` 索引並持久化為
+  `<root>/<index_id>/v<n>/index.gtvidx`（manifest + payload + blake3 checksum）；
+  `index_load <name> <root> [version]` 載入後可用 SQL
+  `ann(name, query, k [, metric])` 查詢。版本以 `CURRENT` 原子切換，支援
+  shadow build、atomic swap 同 rollback；container 或 payload checksum 不符會拒絕載入。

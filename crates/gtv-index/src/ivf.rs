@@ -22,7 +22,10 @@ use std::cmp::Ordering;
 use arrow::array::BooleanArray;
 use gtv_core::{GtvError, Metric, Result, VectorHit, VectorIndex};
 
+use crate::bytes::{metric_code, metric_from_code, Reader, Writer};
 use crate::flat::{metric_distance, par_topk_over};
+
+const IVF_MAGIC: &[u8; 8] = b"GIVFv1\0\0";
 
 /// Inverted-file index with an exact `f32` scan over the probed cells.
 #[derive(Debug, Clone)]
@@ -180,6 +183,122 @@ impl IvfIndex {
 
     pub fn nprobe(&self) -> usize {
         self.nprobe
+    }
+
+    /// Reconstruct from raw (already-normalized) components, e.g. after loading
+    /// a persisted index. No retraining is performed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_raw(
+        data: Vec<f32>,
+        ids: Vec<u64>,
+        orig_pos: Vec<u32>,
+        dim: usize,
+        metric: Metric,
+        nlist: usize,
+        nprobe: usize,
+        centroids: Vec<f32>,
+        list_offsets: Vec<u32>,
+    ) -> Result<Self> {
+        let n = ids.len();
+        if dim == 0 || data.len() != n * dim {
+            return Err(GtvError::InvalidArgument("ivf: bad data length".into()));
+        }
+        if orig_pos.len() != n {
+            return Err(GtvError::InvalidArgument("ivf: bad orig_pos length".into()));
+        }
+        if centroids.len() != nlist * dim {
+            return Err(GtvError::InvalidArgument("ivf: bad centroid length".into()));
+        }
+        if list_offsets.len() != nlist + 1
+            || list_offsets.last().copied().unwrap_or(0) as usize != n
+        {
+            return Err(GtvError::InvalidArgument("ivf: bad list offsets".into()));
+        }
+        Ok(Self {
+            data,
+            ids,
+            orig_pos,
+            dim,
+            metric,
+            nlist,
+            nprobe,
+            centroids,
+            list_offsets,
+        })
+    }
+
+    /// Serialize to the versioned `GIVFv1` format.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let n = self.ids.len();
+        let mut w = Writer::with_capacity(
+            32 + n * 12 + self.data.len() * 4 + self.centroids.len() * 4 + self.list_offsets.len() * 4,
+        );
+        w.bytes(IVF_MAGIC)
+            .u32(self.dim as u32)
+            .u8(metric_code(self.metric))
+            .u32(self.nlist as u32)
+            .u32(self.nprobe as u32)
+            .u64(n as u64);
+        for id in &self.ids {
+            w.u64(*id);
+        }
+        for p in &self.orig_pos {
+            w.u32(*p);
+        }
+        for v in &self.data {
+            w.f32(*v);
+        }
+        for c in &self.centroids {
+            w.f32(*c);
+        }
+        for o in &self.list_offsets {
+            w.u32(*o);
+        }
+        w.into_vec()
+    }
+
+    /// Deserialize a [`IvfIndex::to_bytes`] payload.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let mut r = Reader::new(bytes);
+        if r.take(8)? != &IVF_MAGIC[..] {
+            return Err(GtvError::InvalidArgument("ivf: bad magic".into()));
+        }
+        let dim = r.u32()? as usize;
+        let metric = metric_from_code(r.u8()?)?;
+        let nlist = r.u32()? as usize;
+        let nprobe = r.u32()? as usize;
+        let n = r.u64()? as usize;
+        let mut ids = Vec::with_capacity(n);
+        for _ in 0..n {
+            ids.push(r.u64()?);
+        }
+        let mut orig_pos = Vec::with_capacity(n);
+        for _ in 0..n {
+            orig_pos.push(r.u32()?);
+        }
+        let mut data = Vec::with_capacity(n * dim);
+        for _ in 0..n * dim {
+            data.push(r.f32()?);
+        }
+        let mut centroids = Vec::with_capacity(nlist * dim);
+        for _ in 0..nlist * dim {
+            centroids.push(r.f32()?);
+        }
+        let mut list_offsets = Vec::with_capacity(nlist + 1);
+        for _ in 0..nlist + 1 {
+            list_offsets.push(r.u32()?);
+        }
+        Self::from_raw(
+            data,
+            ids,
+            orig_pos,
+            dim,
+            metric,
+            nlist,
+            nprobe,
+            centroids,
+            list_offsets,
+        )
     }
 
     /// Normalize the query when the metric requires it.
@@ -471,5 +590,31 @@ mod tests {
             ivf.search(&[1.0], 1, None),
             Err(GtvError::DimensionMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn bytes_round_trip() {
+        let data = vec![
+            0.0f32, 0.0, 1.0, 1.0, 5.0, 5.0, 5.2, 5.1, 9.0, 9.0, 9.1, 9.0,
+        ];
+        let ids: Vec<u64> = (0..6).collect();
+        let ivf = IvfIndex::new(ids, data, 2, 3, 3).unwrap();
+        let bytes = ivf.to_bytes();
+        let back = IvfIndex::from_bytes(&bytes).unwrap();
+        assert_eq!(back.nlist(), 3);
+        assert_eq!(back.nprobe(), 3);
+        let a: Vec<u64> = ivf
+            .search(&[5.0, 5.0], 3, None)
+            .unwrap()
+            .iter()
+            .map(|h| h.id)
+            .collect();
+        let b: Vec<u64> = back
+            .search(&[5.0, 5.0], 3, None)
+            .unwrap()
+            .iter()
+            .map(|h| h.id)
+            .collect();
+        assert_eq!(a, b);
     }
 }

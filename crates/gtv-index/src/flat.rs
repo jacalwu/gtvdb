@@ -18,6 +18,10 @@ use std::cmp::Ordering;
 use arrow::array::BooleanArray;
 use gtv_core::{GtvError, Metric, Result, VectorHit, VectorIndex};
 
+use crate::bytes::{metric_code, metric_from_code, Reader, Writer};
+
+const FLAT_MAGIC: &[u8; 8] = b"GFLATv1\0";
+
 /// Exact K-NN via a linear scan over every vector, optionally restricted to
 /// the nodes allowed by a [`BooleanArray`] bitmask.
 ///
@@ -137,6 +141,42 @@ impl FlatIndex {
     /// Zero-copy access to the vector ids, aligned with [`FlatIndex::data`].
     pub fn ids(&self) -> &[u64] {
         &self.ids
+    }
+
+    /// Serialize to the versioned `GFLATv1` format.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut w = Writer::with_capacity(16 + self.ids.len() * 8 + self.data.len() * 4);
+        w.bytes(FLAT_MAGIC)
+            .u32(self.dim as u32)
+            .u8(metric_code(self.metric))
+            .u64(self.ids.len() as u64);
+        for id in &self.ids {
+            w.u64(*id);
+        }
+        for v in &self.data {
+            w.f32(*v);
+        }
+        w.into_vec()
+    }
+
+    /// Deserialize a [`FlatIndex::to_bytes`] payload.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let mut r = Reader::new(bytes);
+        if r.take(8)? != &FLAT_MAGIC[..] {
+            return Err(GtvError::InvalidArgument("flat: bad magic".into()));
+        }
+        let dim = r.u32()? as usize;
+        let metric = metric_from_code(r.u8()?)?;
+        let n = r.u64()? as usize;
+        let mut ids = Vec::with_capacity(n);
+        for _ in 0..n {
+            ids.push(r.u64()?);
+        }
+        let mut data = Vec::with_capacity(n * dim);
+        for _ in 0..n * dim {
+            data.push(r.f32()?);
+        }
+        Self::from_flat_metric(ids, data, dim, metric)
     }
 
     /// Normalize the query when the metric requires it.
@@ -620,5 +660,32 @@ mod tests {
         assert!(index.is_normalized());
         let row = &index.data()[0..2];
         assert!((gtv_core::metric::norm(row) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn bytes_round_trip() {
+        let index = FlatIndex::with_metric(
+            vec![0u64, 1, 2],
+            vec![vec![1.0f32, 0.0], vec![0.0, 1.0], vec![1.0, 1.0]],
+            Metric::Cosine,
+        )
+        .unwrap();
+        let bytes = index.to_bytes();
+        let back = FlatIndex::from_bytes(&bytes).unwrap();
+        assert_eq!(back.metric(), Metric::Cosine);
+        let a: Vec<u64> = index
+            .search(&[1.0, 0.0], 3, None)
+            .unwrap()
+            .iter()
+            .map(|h| h.id)
+            .collect();
+        let b: Vec<u64> = back
+            .search(&[1.0, 0.0], 3, None)
+            .unwrap()
+            .iter()
+            .map(|h| h.id)
+            .collect();
+        assert_eq!(a, b);
+        assert!(FlatIndex::from_bytes(&bytes[..bytes.len() - 1]).is_err());
     }
 }

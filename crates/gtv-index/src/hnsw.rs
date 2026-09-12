@@ -29,6 +29,8 @@ use std::collections::{BinaryHeap, HashMap};
 use arrow::array::BooleanArray;
 use gtv_core::{GtvError, Metric, Result, VectorHit, VectorIndex};
 
+use crate::bytes::{metric_code, metric_from_code, Reader};
+
 /// Deterministic 64-bit splitmix PRNG (seeded) — keeps HNSW builds reproducible.
 #[derive(Debug, Clone)]
 struct SplitMix64(u64);
@@ -121,6 +123,7 @@ const FORMAT_VERSION: u16 = 1;
 ///
 /// The bitmask is indexed by node *position* (0..n), identical to
 /// [`FlatIndex`](crate::FlatIndex).
+#[derive(Debug, Clone)]
 pub struct HnswIndex {
     ids: Vec<u64>,
     /// Row-major: vector `i` occupies `vectors[i * dim .. (i + 1) * dim]`.
@@ -882,66 +885,6 @@ impl VectorIndex for HnswIndex {
     ) -> Result<Vec<VectorHit>> {
         self.search_with_report(query, k, self.ef_search, filter_mask)
             .map(|(h, _)| h)
-    }
-}
-
-fn metric_code(metric: Metric) -> u8 {
-    match metric {
-        Metric::L2 => 0,
-        Metric::Cosine => 1,
-        Metric::Ip => 2,
-    }
-}
-
-fn metric_from_code(code: u8) -> Result<Metric> {
-    match code {
-        0 => Ok(Metric::L2),
-        1 => Ok(Metric::Cosine),
-        2 => Ok(Metric::Ip),
-        other => Err(GtvError::InvalidArgument(format!(
-            "hnsw: unknown metric code {other}"
-        ))),
-    }
-}
-
-/// Minimal little-endian reader for [`HnswIndex::from_bytes`].
-struct Reader<'a> {
-    bytes: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> Reader<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, pos: 0 }
-    }
-
-    fn take(&mut self, n: usize) -> Result<&'a [u8]> {
-        let end = self
-            .pos
-            .checked_add(n)
-            .ok_or_else(|| GtvError::InvalidArgument("hnsw: length overflow".into()))?;
-        if end > self.bytes.len() {
-            return Err(GtvError::InvalidArgument("hnsw: truncated payload".into()));
-        }
-        let s = &self.bytes[self.pos..end];
-        self.pos = end;
-        Ok(s)
-    }
-
-    fn u8(&mut self) -> Result<u8> {
-        Ok(self.take(1)?[0])
-    }
-    fn u16(&mut self) -> Result<u16> {
-        Ok(u16::from_le_bytes(self.take(2)?.try_into().unwrap()))
-    }
-    fn u32(&mut self) -> Result<u32> {
-        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
-    }
-    fn u64(&mut self) -> Result<u64> {
-        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
-    }
-    fn f32(&mut self) -> Result<f32> {
-        Ok(f32::from_le_bytes(self.take(4)?.try_into().unwrap()))
     }
 }
 

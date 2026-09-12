@@ -9,6 +9,7 @@ use datafusion::datasource::MemTable;
 use datafusion::error::Result;
 use datafusion::prelude::SessionContext;
 use gtv_core::TemporalCSR;
+use gtv_index::AnyIndex;
 
 use crate::hft_exec::{compile_hft, AsofResource, HftRegistry, KernelPlan, PitResource};
 use crate::knn::{KnnCollection, KnnTableFunction};
@@ -18,6 +19,7 @@ use crate::knn::{KnnCollection, KnnTableFunction};
 pub struct GtvContext {
     ctx: SessionContext,
     knn_collections: Arc<RwLock<HashMap<String, KnnCollection>>>,
+    any_indexes: crate::ann::IndexRegistry,
     hft_reg: Arc<RwLock<HftRegistry>>,
 }
 
@@ -57,6 +59,9 @@ impl GtvContext {
         let knn_collections = Arc::new(RwLock::new(HashMap::new()));
         ctx.register_udtf("knn", Arc::new(KnnTableFunction::new(knn_collections.clone())));
         ctx.register_udtf("vector_search", Arc::new(KnnTableFunction::new(knn_collections.clone())));
+        let any_indexes: crate::ann::IndexRegistry = Arc::new(RwLock::new(HashMap::new()));
+        ctx.register_udtf("ann", Arc::new(crate::ann::AnnTableFunction::new(any_indexes.clone())));
+        ctx.register_udtf("ann_search", Arc::new(crate::ann::AnnTableFunction::new(any_indexes.clone())));
         ctx.register_udtf("read_csv", Arc::new(crate::csv::ReadCsvTableFunction::new()));
         ctx.register_udtf("read_parquet", Arc::new(crate::csv::ReadParquetTableFunction::new()));
         ctx.register_udtf("read_yahoo", Arc::new(crate::yahoo::ReadYahooTableFunction::new()));
@@ -64,8 +69,7 @@ impl GtvContext {
         ctx.register_udtf("relative_strength", Arc::new(crate::quant::RelativeStrengthTableFunction));
         ctx.register_udtf("read_tickdata", Arc::new(crate::tickdata::ReadTickdataTableFunction));
         crate::market::register_udtfs(&ctx);
-        let hft_reg = Arc::new(RwLock::new(HftRegistry::default()));
-        {
+        let hft_reg = Arc::new(RwLock::new(HftRegistry::default()));        {
             let tt = Arc::new(crate::hft_tf::TickToTradeTableFunction::new(hft_reg.clone()));
             ctx.register_udtf("tick_to_trade", tt.clone());
             ctx.register_udtf("ttrade", tt);
@@ -143,6 +147,7 @@ impl GtvContext {
         Self {
             ctx,
             knn_collections,
+            any_indexes,
             hft_reg,
         }
     }
@@ -354,6 +359,13 @@ impl GtvContext {
             })?
             .insert(name.to_string(), collection);
         Ok(())
+    }
+
+    /// Register a persisted (loaded) index for `ann(name, query, k [, metric])`.
+    pub fn register_any_index(&self, name: &str, index: AnyIndex) {
+        if let Ok(mut map) = self.any_indexes.write() {
+            map.insert(name.to_string(), index);
+        }
     }
 }
 

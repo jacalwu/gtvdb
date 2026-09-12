@@ -1973,10 +1973,12 @@ dependencies = [
  "cudarc",
  "futures-util",
  "gtv-array",
+ "gtv-catalog",
  "gtv-core",
  "gtv-delta",
  "gtv-engine",
  "gtv-index",
+ "gtv-index-store",
  "gtv-pattern",
  "gtv-proto",
  "gtv-storage",
@@ -2016,6 +2018,7 @@ dependencies = [
  "datafusion",
  "gtv-array",
  "gtv-core",
+ "gtv-index",
  "gtv-pattern",
  "gtv-storage",
  "serde",
@@ -2031,6 +2034,21 @@ dependencies = [
  "arrow",
  "gtv-core",
  "rayon",
+ "serde",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "gtv-index-store"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "gtv-catalog",
+ "gtv-core",
+ "gtv-index",
+ "gtv-storage",
+ "serde",
+ "serde_json",
  "thiserror 2.0.20",
 ]
 

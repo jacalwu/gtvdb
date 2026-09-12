@@ -3,6 +3,7 @@
 //! Phase 2 registers the gtv array primitives and graph traversal as
 //! DataFusion UDFs / table functions so they can be driven from SQL.
 
+pub mod ann;
 pub mod asof;
 pub mod analytics;
 pub mod bt;

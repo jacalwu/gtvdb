@@ -634,3 +634,10 @@ Behaviour notes:
   on `valid_from` plus a per-64-edge zone map on `valid_to`, giving ~17x lower
   latency than a linear scan on high-degree nodes (low degree keeps the linear
   fast path).
+- **Index lifecycle (`gtv-index-store`)**: `index_save <name> <root> <table> [type] [metric]`
+  builds a `flat` / `ivf` / `hnsw` index from a table and persists it as
+  `<root>/<index_id>/v<n>/index.gtvidx` (manifest + payload + blake3 checksum);
+  `index_load <name> <root> [version]` loads it for the SQL
+  `ann(name, query, k [, metric])` function. Versions swap atomically through
+  `CURRENT`, supporting shadow builds, atomic swap and rollback; a container or
+  payload checksum mismatch refuses to load.

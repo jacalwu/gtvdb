@@ -8,4 +8,5 @@ license.workspace = true
 arrow.workspace = true
 thiserror.workspace = true
 rayon.workspace = true
+serde.workspace = true
 gtv-core = { path = "../gtv-core" }

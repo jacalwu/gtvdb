@@ -30,7 +30,7 @@ use gtv_core::{EdgeTable, Metric, NodeTable, TemporalCSR, TemporalGraph, Travers
 use gtv_delta::{DeltaEdge, LsmStore};
 use gtv_engine::hft_exec::KernelPlan;
 use gtv_engine::GtvContext;
-use gtv_index::HnswIndex;
+use gtv_index::{AnyIndex, BuildOptions, HnswIndex};
 use gtv_pattern::Pattern;
 use gtv_storage::{parquet, HdbStore, SnapshotStore};
 use gtv_udf::WasmUdf;
@@ -952,6 +952,71 @@ async fn run(
                 "registered knn collection `{name}` from `{table}` ({n} × {dim}, metric={metric})"
             );
         }
+        "index_save" => {
+            // index_save <name> <store_root> <table> [type] [metric]
+            let name = require_arg(&tokens, 1, "index_save <name> <root> <table> [type] [metric]")?;
+            let root = require_arg(&tokens, 2, "index_save <name> <root> <table> [type] [metric]")?;
+            let table = require_arg(&tokens, 3, "index_save <name> <root> <table> [type] [metric]")?;
+            let type_str = optional_arg(&tokens, 4).unwrap_or("flat");
+            let metric_str = optional_arg(&tokens, 5).unwrap_or("l2");
+            let metric = Metric::parse(metric_str)
+                .ok_or_else(|| anyhow!("unknown metric `{metric_str}` (l2|cosine|dot)"))?;
+
+            let batches = ctx.sql(&format!("SELECT * FROM {table}")).await?;
+            let ids = extract_u64(&batches, "id")?;
+            let dim = infer_vec_dim(&batches)?;
+            let n = ids.len();
+            let mut vectors = vec![vec![0.0f32; dim]; n];
+            for d in 0..dim {
+                let vals = extract_f64(&batches, &format!("v{d}"))?;
+                for (i, v) in vals.iter().enumerate() {
+                    vectors[i][d] = *v as f32;
+                }
+            }
+            let options = match type_str.to_ascii_lowercase().as_str() {
+                "flat" => BuildOptions::Flat,
+                "ivf" => {
+                    let nlist = (n / 16).clamp(1, 256);
+                    let nprobe = (nlist / 4).max(1);
+                    BuildOptions::Ivf { nlist, nprobe }
+                }
+                "hnsw" => BuildOptions::Hnsw {
+                    m: 16,
+                    ef_construction: 100,
+                    ef_search: 100,
+                },
+                other => return Err(anyhow!("unknown index type `{other}` (flat|ivf|hnsw)")),
+            };
+            let index = AnyIndex::build(ids, vectors, metric, &options)?;
+            let store = gtv_index_store::IndexStore::open(root)?;
+            let v = store.save(name, &index, &options, &gtv_index_store::IndexMeta::default())?;
+            ctx.register_any_index(name, index);
+            println!(
+                "saved index `{name}` v{} ({:?}, metric={metric}, dim={dim}, rows={n}) to {root}",
+                v.version,
+                options.index_type()
+            );
+        }
+        "index_load" => {
+            // index_load <name> <store_root> [version]
+            let name = require_arg(&tokens, 1, "index_load <name> <root> [version]")?;
+            let root = require_arg(&tokens, 2, "index_load <name> <root> [version]")?;
+            let version = optional_arg(&tokens, 3)
+                .map(|s| s.parse::<u32>())
+                .transpose()?;
+            let store = gtv_index_store::IndexStore::open(root)?;
+            let loaded = store.load(name, version)?;
+            let m = &loaded.manifest;
+            println!(
+                "loaded index `{name}` v{} ({:?}, metric={}, dim={}, rows={}) from {root}",
+                store.current_version(name)?.unwrap_or(0),
+                m.index_type,
+                m.metric,
+                m.dim,
+                m.row_count
+            );
+            ctx.register_any_index(name, loaded.index);
+        }
         "hdb_save" => {
             // hdb_save <table> <date> [root] — persist a table to the HDB layout
             // (<root>/<date>/<table>/<symbol>.parquet, split by `symbol` if present).
@@ -1782,6 +1847,8 @@ const DF_TABLE_FNS: &[&str] = &[
     "read_csv",
     "read_parquet",
     "knn",
+    "ann",
+    "ann_search",
     "vector_search",
     "neighbors",
     "khop",
@@ -1945,6 +2012,8 @@ fn print_help() {
          \x20 aj_bench <left> <right> [tol]  full left×right as-of join sweep (1M×1M)\n\
          \x20 wash_from <table>     bind wash/wash_trade to a table (src, dst, valid_from, valid_to)\n\
          \x20 knn_from <name> <t> [d] [metric]  register a vector collection (id, v0..v{{d-1}}); metric=l2|cosine|dot\n\
+         \x20 index_save <name> <root> <t> [type] [metric]  build+persist an index (flat|ivf|hnsw)\n\
+         \x20 index_load <name> <root> [version]  load a persisted index for SQL `ann(...)`\n\
          \x20 catalog               list persisted tables (GTV_HOME catalog)\n\
          \x20 drop table <name>     drop a table from memory [+ persisted catalog]\n\
          \x20 remote <host:port> <sql>  execute SQL on a remote gtv-server\n\

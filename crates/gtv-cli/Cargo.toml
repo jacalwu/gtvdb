@@ -17,6 +17,7 @@ gtv-core = { path = "../gtv-core" }
 gtv-array = { path = "../gtv-array" }
 gtv-engine = { path = "../gtv-engine" }
 gtv-index = { path = "../gtv-index" }
+gtv-index-store = { path = "../gtv-index-store" }
 gtv-storage = { path = "../gtv-storage" }
 gtv-catalog = { path = "../gtv-catalog" }
 gtv-delta = { path = "../gtv-delta" }
