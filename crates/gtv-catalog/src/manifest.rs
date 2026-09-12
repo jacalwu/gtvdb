@@ -41,6 +41,8 @@ pub struct SourceOffset {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FileFormat {
     Parquet,
+    /// External CSV reference (registered, never written by the catalog).
+    Csv,
 }
 
 /// One immutable columnar data file.
@@ -49,6 +51,10 @@ pub struct DataFile {
     pub file_id: DataFileId,
     pub path: String,
     pub format: FileFormat,
+    /// `true` when the catalog wrote the file; `false` for an external
+    /// CSV/Parquet reference (checksum/row_count are then best-effort).
+    #[serde(default = "default_managed")]
+    pub managed: bool,
     pub row_count: u64,
     pub size_bytes: u64,
     pub column_stats: Vec<ColumnStat>,
@@ -71,6 +77,10 @@ pub enum CommitOp {
     Append,
     Overwrite,
     Delete,
+}
+
+fn default_managed() -> bool {
+    true
 }
 
 /// A committed, immutable table version.

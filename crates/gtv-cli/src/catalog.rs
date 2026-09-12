@@ -1,31 +1,33 @@
 //! Table catalog: persistence of registered tables across REPL restarts.
 //!
-//! Enabled by setting `GTV_HOME` to a directory. The catalog keeps one TSV
-//! manifest (`catalog.tsv`) at the home root:
+//! Enabled by setting `GTV_HOME` to a directory. Since B2-1 this is a thin
+//! façade over [`gtv_catalog::FsCatalog`]: the old `catalog.tsv` TSV manifest is
+//! replaced by versioned table/snapshot/manifest metadata with an atomic commit
+//! protocol. Existing `catalog.tsv` files are imported once, on first open.
 //!
-//! ```text
-//! name  kind    path          rows  created
-//! ticks csv     /abs/ticks.csv       2025-..
-//! myt   snapshot snap/myt.parquet  6  2025-..
-//! ```
+//! Two kinds of persistence are supported:
 //!
-//! `kind` is one of:
-//! * `csv` / `parquet` — a reference to the original data file. On restart the
-//!   file is re-read (no data duplication; the source remains authoritative).
-//! * `snapshot` — a materialized Parquet copy under `<home>/snap/`, written for
-//!   tables with no backing file (e.g. `CREATE TABLE … AS SELECT …`).
+//! * **external reference** (`csv` / `parquet`) — the table's rows come from an
+//!   existing file on disk; the source stays authoritative and is re-read on
+//!   restart. Schema is inferred from the file.
+//! * **managed snapshot** (`snapshot`) — the catalog owns the Parquet file
+//!   (e.g. `CREATE TABLE … AS SELECT …`), written under `<home>/data/`.
 //!
-//! Loads on startup are best-effort: a missing source file logs a warning and
-//! is skipped rather than aborting the session.
+//! Loads on startup are best-effort: a missing source file logs a warning and is
+//! skipped rather than aborting the session.
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context as _, Result};
+use anyhow::{anyhow, Context as _, Result};
 use arrow::array::RecordBatch;
 use arrow::compute::concat_batches;
+use arrow::datatypes::SchemaRef;
 use chrono::Local;
+use gtv_catalog::{
+    CommitOp, CommitOptions, FileFormat, FsCatalog, NewFile, PartitionSpec, TableMeta,
+};
 use gtv_engine::GtvContext;
 
 /// Where a persisted table's rows come from on the next startup.
@@ -36,48 +38,31 @@ pub enum Kind {
     Snapshot,
 }
 
-impl Kind {
-    fn as_str(self) -> &'static str {
-        match self {
-            Kind::Csv => "csv",
-            Kind::Parquet => "parquet",
-            Kind::Snapshot => "snapshot",
-        }
-    }
-
-    fn parse(s: &str) -> Option<Kind> {
-        match s {
-            "csv" => Some(Kind::Csv),
-            "parquet" => Some(Kind::Parquet),
-            "snapshot" => Some(Kind::Snapshot),
-            _ => None,
-        }
-    }
-}
-
-/// One persisted table.
+/// One persisted table (a display view over the catalog metadata).
 #[derive(Clone, Debug)]
 pub struct Entry {
     pub name: String,
     pub kind: Kind,
-    /// Absolute path (source file for csv/parquet, snapshot file for snapshot).
     pub path: PathBuf,
     pub rows: u64,
     pub created: String,
 }
 
-/// A persisted-table manifest rooted at a directory.
+/// A persisted-table catalog rooted at a directory.
 #[derive(Debug)]
 pub struct Catalog {
     home: PathBuf,
+    fs: FsCatalog,
     entries: BTreeMap<String, Entry>,
 }
 
-const MANIFEST: &str = "catalog.tsv";
-const SNAP_DIR: &str = "snap";
+const LEGACY_MANIFEST: &str = "catalog.tsv";
 
-fn now() -> String {
-    Local::now().format("%Y-%m-%dT%H:%M:%S").to_string()
+fn fmt_time(ns: i64) -> String {
+    chrono::DateTime::from_timestamp_nanos(ns)
+        .with_timezone(&Local)
+        .format("%Y-%m-%dT%H:%M:%S")
+        .to_string()
 }
 
 fn abs_path(p: &str) -> PathBuf {
@@ -91,20 +76,19 @@ fn abs_path(p: &str) -> PathBuf {
     }
 }
 
-fn slug(name: &str) -> String {
-    let s: String = name
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
-        .collect();
-    if s.is_empty() { "table".into() } else { s }
-}
-
 impl Catalog {
     /// Open (or create) the catalog under `home`. `home` must be writable.
     pub fn open(home: &Path) -> Result<Catalog> {
-        fs::create_dir_all(home).with_context(|| format!("create catalog dir {}", home.display()))?;
-        let mut cat = Catalog { home: home.to_path_buf(), entries: BTreeMap::new() };
-        cat.load()?;
+        fs::create_dir_all(home)
+            .with_context(|| format!("create catalog dir {}", home.display()))?;
+        let fs = FsCatalog::open(home).map_err(|e| anyhow!("{e}"))?;
+        let mut cat = Catalog {
+            home: home.to_path_buf(),
+            fs,
+            entries: BTreeMap::new(),
+        };
+        cat.import_legacy()?;
+        cat.refresh()?;
         Ok(cat)
     }
 
@@ -130,136 +114,143 @@ impl Catalog {
 
     /// Record a table whose rows come from a CSV file on disk.
     pub fn record_csv(&mut self, name: &str, path: &str) -> Result<()> {
-        self.upsert(Entry {
-            name: name.to_string(),
-            kind: Kind::Csv,
-            path: abs_path(path),
-            rows: 0,
-            created: now(),
-        })
+        let abs = abs_path(path);
+        self.fs
+            .register_external(name, abs.to_str().unwrap(), FileFormat::Csv)
+            .map_err(|e| anyhow!("{e}"))?;
+        self.refresh()
     }
 
     /// Record a table whose rows come from a Parquet file on disk.
     pub fn record_parquet(&mut self, name: &str, path: &str) -> Result<()> {
-        self.upsert(Entry {
-            name: name.to_string(),
-            kind: Kind::Parquet,
-            path: abs_path(path),
-            rows: 0,
-            created: now(),
-        })
+        let abs = abs_path(path);
+        self.fs
+            .register_external(name, abs.to_str().unwrap(), FileFormat::Parquet)
+            .map_err(|e| anyhow!("{e}"))?;
+        self.refresh()
     }
 
-    /// Materialize `batches` as a snapshot Parquet file and record it.
-    pub fn record_snapshot(&mut self, name: &str, schema: &arrow::datatypes::SchemaRef, batches: &[RecordBatch]) -> Result<u64> {
-        let snap = self.home.join(SNAP_DIR);
-        fs::create_dir_all(&snap).with_context(|| format!("create {}", snap.display()))?;
-        let file = snap.join(format!("{}.parquet", slug(name)));
+    /// Materialize `batches` as a managed snapshot Parquet file and record it.
+    pub fn record_snapshot(
+        &mut self,
+        name: &str,
+        schema: &SchemaRef,
+        batches: &[RecordBatch],
+    ) -> Result<u64> {
         let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
         let combined = if batches.is_empty() {
             RecordBatch::new_empty(schema.clone())
         } else {
             concat_batches(schema, batches).with_context(|| format!("concat snapshot `{name}`"))?
         };
-        gtv_storage::write_batch(file.to_str().unwrap(), &combined)
-            .with_context(|| format!("write snapshot `{name}`"))?;
-        self.upsert(Entry {
-            name: name.to_string(),
-            kind: Kind::Snapshot,
-            path: file,
-            rows: rows as u64,
-            created: now(),
-        })?;
+
+        let table = match self.fs.table(name) {
+            Ok(t) => t.table_id,
+            Err(gtv_catalog::CatalogError::TableNotFound(_)) => self
+                .fs
+                .create_table(name, schema.clone(), PartitionSpec::single())
+                .map_err(|e| anyhow!("{e}"))?,
+            Err(e) => return Err(anyhow!("{e}")),
+        };
+        let op = if self
+            .fs
+            .latest(table)
+            .map_err(|e| anyhow!("{e}"))?
+            .is_some()
+        {
+            CommitOp::Overwrite
+        } else {
+            CommitOp::Append
+        };
+        self.fs
+            .commit(
+                table,
+                op,
+                vec![NewFile::unpartitioned(combined)],
+                &CommitOptions::default(),
+            )
+            .map_err(|e| anyhow!("{e}"))?;
+        self.refresh()?;
         Ok(rows as u64)
     }
 
-    /// Remove a table from the manifest; deletes the snapshot file (but never
-    /// a referenced csv/parquet source file). Returns the removed entry.
+    /// Remove a table from the catalog. Returns the removed entry.
     pub fn remove(&mut self, name: &str) -> Result<Option<Entry>> {
-        let Some(entry) = self.entries.remove(name) else {
+        let removed = self.fs.drop_table(name).map_err(|e| anyhow!("{e}"))?;
+        if removed.is_none() {
             return Ok(None);
-        };
-        if entry.kind == Kind::Snapshot {
-            let _ = fs::remove_file(&entry.path);
         }
-        self.save()?;
-        Ok(Some(entry))
+        Ok(self.entries.remove(name))
     }
 
-    /// Replay every entry into `ctx`, best-effort: tables whose source file is
+    /// Replay every table into `ctx`, best-effort: tables whose source file is
     /// missing are skipped with a warning. Returns the number restored.
     pub fn replay(&self, ctx: &GtvContext) -> usize {
         let mut restored = 0usize;
-        for e in self.entries.values() {
-            match e.kind {
-                Kind::Csv => match ctx.register_csv(e.path.to_str().unwrap(), &e.name) {
-                    Ok(()) => restored += 1,
-                    Err(err) => eprintln!(
-                        "catalog: skip `{}` ({}) — {}",
-                        e.name,
-                        e.path.display(),
-                        err
-                    ),
-                },
-                Kind::Parquet => match ctx.register_parquet(e.path.to_str().unwrap(), &e.name) {
-                    Ok(()) => restored += 1,
-                    Err(err) => eprintln!(
-                        "catalog: skip `{}` ({}) — {}",
-                        e.name,
-                        e.path.display(),
-                        err
-                    ),
-                },
-                Kind::Snapshot => match gtv_storage::read_batches(e.path.to_str().unwrap()) {
-                    Ok(batches) => {
-                        let first = batches.first().cloned();
-                        match first {
-                            Some(b) if ctx.register_batches(&e.name, b.schema(), batches).is_ok() => {
-                                restored += 1;
-                            }
-                            _ => eprintln!("catalog: skip `{}` ({}) — empty/unreadable", e.name, e.path.display()),
-                        }
-                    }
-                    Err(err) => eprintln!(
-                        "catalog: skip `{}` ({}) — {}",
-                        e.name,
-                        e.path.display(),
-                        err
-                    ),
-                },
+        let tables = self.fs.list_tables().unwrap_or_default();
+        for meta in tables {
+            match self.replay_one(ctx, &meta) {
+                Ok(true) => restored += 1,
+                Ok(false) => eprintln!("catalog: skip `{}` — empty/unreadable", meta.name),
+                Err(err) => eprintln!("catalog: skip `{}` — {err}", meta.name),
             }
         }
         restored
     }
 
-    /// Persist the in-memory manifest to `<home>/catalog.tsv` (atomic replace).
-    pub fn save(&self) -> Result<()> {
-        let path = self.home.join(MANIFEST);
-        let tmp = self.home.join(format!("{MANIFEST}.tmp"));
-        let mut out = String::new();
-        out.push_str("# gtv table catalog v1\n");
-        out.push_str("# name\tkind\tpath\trows\tcreated\n");
-        for e in self.entries.values() {
-            out.push_str(&format!(
-                "{}\t{}\t{}\t{}\t{}\n",
-                e.name,
-                e.kind.as_str(),
-                e.path.display(),
-                e.rows,
-                e.created
-            ));
+    fn replay_one(&self, ctx: &GtvContext, meta: &TableMeta) -> Result<bool> {
+        let Some(snap) = self.fs.latest(meta.table_id).map_err(|e| anyhow!("{e}"))? else {
+            return Ok(false);
+        };
+        let files = self
+            .fs
+            .files(meta.table_id, snap)
+            .map_err(|e| anyhow!("{e}"))?;
+        let Some(first) = files.first() else {
+            return Ok(false);
+        };
+
+        if !first.managed {
+            let res = match first.format {
+                FileFormat::Csv => ctx.register_csv(&first.path, &meta.name),
+                FileFormat::Parquet => ctx.register_parquet(&first.path, &meta.name),
+            };
+            return Ok(res.is_ok());
         }
-        fs::write(&tmp, out).with_context(|| format!("write {}", tmp.display()))?;
-        fs::rename(&tmp, &path).with_context(|| format!("rename to {}", path.display()))?;
-        Ok(())
+
+        // Managed: concat every Parquet file of the snapshot.
+        let mut schema: Option<SchemaRef> = None;
+        let mut batches: Vec<RecordBatch> = Vec::new();
+        for f in &files {
+            let bs = gtv_storage::read_batches(&f.path)
+                .map_err(|e| anyhow!("read {}: {e}", f.path))?;
+            if schema.is_none() {
+                schema = bs.first().map(|b| b.schema());
+            }
+            batches.extend(bs);
+        }
+        let Some(schema) = schema else {
+            return Ok(false);
+        };
+        Ok(ctx.register_batches(&meta.name, schema, batches).is_ok())
     }
 
-    fn load(&mut self) -> Result<()> {
-        let path = self.home.join(MANIFEST);
-        if !path.exists() {
+    /// Import a legacy `catalog.tsv` manifest once (only when the new catalog is
+    /// empty). The legacy file is left in place.
+    fn import_legacy(&mut self) -> Result<()> {
+        if !self
+            .fs
+            .table_names()
+            .map_err(|e| anyhow!("{e}"))?
+            .is_empty()
+        {
             return Ok(());
         }
-        let text = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        let path = self.home.join(LEGACY_MANIFEST);
+        let Ok(text) = fs::read_to_string(&path) else {
+            return Ok(());
+        };
+        let mut imported = 0usize;
         for (lineno, raw) in text.lines().enumerate() {
             let line = raw.trim();
             if line.is_empty() || line.starts_with('#') {
@@ -267,43 +258,92 @@ impl Catalog {
             }
             let mut cols = line.split('\t');
             let (Some(name), Some(kind), Some(p)) = (cols.next(), cols.next(), cols.next()) else {
-                eprintln!("catalog: malformed line {} in {}", lineno + 1, path.display());
+                eprintln!("catalog: malformed legacy line {}", lineno + 1);
                 continue;
             };
-            let rows = cols.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
-            let created = cols.next().unwrap_or("").to_string();
-            let Some(kind) = Kind::parse(kind) else {
-                eprintln!("catalog: unknown kind `{kind}` on line {}", lineno + 1);
-                continue;
-            };
-            let path = Path::new(p);
-            let path = if path.is_absolute() {
-                path.to_path_buf()
+            let rel = Path::new(p);
+            let src = if rel.is_absolute() {
+                rel.to_path_buf()
             } else {
-                self.home.join(path)
+                self.home.join(rel)
             };
-            self.entries.insert(
-                name.to_string(),
-                Entry { name: name.to_string(), kind, path, rows, created },
+            let src = src.to_string_lossy().into_owned();
+            let res = match kind {
+                "csv" => self.fs.register_external(name, &src, FileFormat::Csv),
+                "parquet" | "snapshot" => {
+                    self.fs.register_external(name, &src, FileFormat::Parquet)
+                }
+                other => {
+                    eprintln!("catalog: unknown legacy kind `{other}` (line {})", lineno + 1);
+                    continue;
+                }
+            };
+            match res {
+                Ok(_) => imported += 1,
+                Err(e) => eprintln!("catalog: legacy import `{name}` failed: {e}"),
+            }
+        }
+        if imported > 0 {
+            eprintln!(
+                "catalog: imported {imported} table(s) from legacy {LEGACY_MANIFEST}; \
+                 future state is stored under metadata/"
             );
         }
         Ok(())
     }
 
-    fn upsert(&mut self, entry: Entry) -> Result<()> {
-        self.entries.insert(entry.name.clone(), entry);
-        self.save()
+    /// Rebuild the display cache from the catalog metadata.
+    fn refresh(&mut self) -> Result<()> {
+        self.entries.clear();
+        for meta in self.fs.list_tables().map_err(|e| anyhow!("{e}"))? {
+            let (kind, path, rows) = self.describe(&meta);
+            self.entries.insert(
+                meta.name.clone(),
+                Entry {
+                    name: meta.name.clone(),
+                    kind,
+                    path,
+                    rows,
+                    created: fmt_time(meta.created_at),
+                },
+            );
+        }
+        Ok(())
+    }
+
+    fn describe(&self, meta: &TableMeta) -> (Kind, PathBuf, u64) {
+        let Ok(Some(snap)) = self.fs.latest(meta.table_id) else {
+            return (Kind::Snapshot, PathBuf::new(), 0);
+        };
+        let Ok(files) = self.fs.files(meta.table_id, snap) else {
+            return (Kind::Snapshot, PathBuf::new(), 0);
+        };
+        let rows: u64 = files.iter().map(|f| f.row_count).sum();
+        let path = files
+            .first()
+            .map(|f| PathBuf::from(&f.path))
+            .unwrap_or_default();
+        if let Some(first) = files.first() {
+            if !first.managed {
+                let kind = match first.format {
+                    FileFormat::Csv => Kind::Csv,
+                    FileFormat::Parquet => Kind::Parquet,
+                };
+                return (kind, path, rows);
+            }
+        }
+        (Kind::Snapshot, path, rows)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Int64Array, ArrayRef};
+    use arrow::array::{ArrayRef, Int64Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use std::sync::Arc;
 
-    fn sample_batch() -> (arrow::datatypes::SchemaRef, RecordBatch) {
+    fn sample_batch() -> (SchemaRef, RecordBatch) {
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
         let batch = RecordBatch::try_new(
             schema.clone(),
@@ -314,41 +354,76 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_manifest() {
-        let dir = std::env::temp_dir().join(format!("gtv_cat_test_{}", std::process::id()));
+    fn roundtrip_managed_snapshot() {
+        let dir = std::env::temp_dir().join(format!("gtv_cat_facade_{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         {
             let mut cat = Catalog::open(&dir).unwrap();
-            cat.record_csv("ticks", "/tmp/ticks.csv").unwrap();
             let (schema, batch) = sample_batch();
             let n = cat
                 .record_snapshot("myt", &schema, std::slice::from_ref(&batch))
                 .unwrap();
             assert_eq!(n, 3);
-            assert_eq!(cat.names().count(), 2);
+            assert_eq!(cat.names().count(), 1);
+            let e = cat.get("myt").unwrap();
+            assert_eq!(e.kind, Kind::Snapshot);
+            assert_eq!(e.rows, 3);
         }
         {
-            // Reopen: entries survive.
             let cat = Catalog::open(&dir).unwrap();
-            let ticks = cat.get("ticks").expect("ticks entry");
-            assert_eq!(ticks.kind, Kind::Csv);
-            assert_eq!(ticks.path, Path::new("/tmp/ticks.csv"));
-            let myt = cat.get("myt").expect("myt entry");
-            assert_eq!(myt.kind, Kind::Snapshot);
-            assert_eq!(myt.rows, 3);
-            assert!(myt.path.exists(), "snapshot file written");
+            let e = cat.get("myt").expect("myt survives");
+            assert_eq!(e.kind, Kind::Snapshot);
+            assert_eq!(e.rows, 3);
         }
         {
             let mut cat = Catalog::open(&dir).unwrap();
-            cat.remove("myt").unwrap();
+            assert!(cat.remove("myt").unwrap().is_some());
             assert!(cat.get("myt").is_none());
         }
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn slug_sanitizes() {
-        assert_eq!(slug("my.table/1"), "my_table_1");
-        assert_eq!(slug("ticks"), "ticks");
+    fn external_csv_reference_is_registered() {
+        let dir = std::env::temp_dir().join(format!("gtv_cat_csv_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let csv = dir.join("ticks.csv");
+        fs::write(&csv, "t,p\n1,10.0\n2,11.0\n").unwrap();
+
+        {
+            let mut cat = Catalog::open(&dir).unwrap();
+            cat.record_csv("ticks", csv.to_str().unwrap()).unwrap();
+            let e = cat.get("ticks").unwrap();
+            assert_eq!(e.kind, Kind::Csv);
+            assert_eq!(e.path, csv);
+        }
+        {
+            let cat = Catalog::open(&dir).unwrap();
+            assert_eq!(cat.get("ticks").unwrap().kind, Kind::Csv);
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_manifest_is_imported() {
+        let dir = std::env::temp_dir().join(format!("gtv_cat_legacy_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let csv = dir.join("legacy.csv");
+        fs::write(&csv, "a\n1\n2\n").unwrap();
+        fs::write(
+            dir.join("catalog.tsv"),
+            format!(
+                "# gtv table catalog v1\n# name\tkind\tpath\trows\tcreated\nlegacy\tcsv\t{}\t0\t2024-01-01T00:00:00\n",
+                csv.display()
+            ),
+        )
+        .unwrap();
+
+        let cat = Catalog::open(&dir).unwrap();
+        let e = cat.get("legacy").expect("legacy table imported");
+        assert_eq!(e.kind, Kind::Csv);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

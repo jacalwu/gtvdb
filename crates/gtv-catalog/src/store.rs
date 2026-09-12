@@ -260,6 +260,90 @@ impl FsCatalog {
         self.save_tables(&tables)
     }
 
+    /// All registered tables.
+    pub fn list_tables(&self) -> Result<Vec<TableMeta>> {
+        self.load_tables()
+    }
+
+    /// All registered table names.
+    pub fn table_names(&self) -> Result<Vec<String>> {
+        Ok(self.load_tables()?.into_iter().map(|t| t.name).collect())
+    }
+
+    /// Register an existing external CSV/Parquet file as a table (or replace the
+    /// current version of it). The file is never copied, so the source stays
+    /// authoritative; the schema is inferred from the file.
+    pub fn register_external(
+        &self,
+        name: &str,
+        path: &str,
+        format: FileFormat,
+    ) -> Result<TableId> {
+        let schema = match format {
+            FileFormat::Csv => gtv_storage::infer_csv_schema(path, 1024)?,
+            FileFormat::Parquet => gtv_storage::parquet_schema(path)?,
+        };
+        let table = match self.table(name) {
+            Ok(t) => t.table_id,
+            Err(CatalogError::TableNotFound(_)) => {
+                self.create_table(name, schema.clone(), PartitionSpec::single())?
+            }
+            Err(e) => return Err(e),
+        };
+        let meta = self.table_by_id(table)?;
+
+        let file = DataFile {
+            file_id: DataFileId::new(),
+            path: path.to_string(),
+            format,
+            managed: false,
+            row_count: 0,
+            size_bytes: fs::metadata(path).map(|m| m.len()).unwrap_or(0),
+            column_stats: Vec::new(),
+            event_time_min: i64::MIN,
+            event_time_max: i64::MAX,
+            schema_version: SchemaVersion(meta.schema_version),
+            partition: Vec::new(),
+            checksum: String::new(),
+            source_offsets: Vec::new(),
+            commit_id: CommitId::new(),
+        };
+        let mut summary = serde_json::json!({});
+        summary["external"] = serde_json::Value::Bool(true);
+        let snapshot = Snapshot {
+            snapshot_id: SnapshotId::new(),
+            parent: self.latest(table)?,
+            table_id: table,
+            schema_version: SchemaVersion(meta.schema_version),
+            spec_version: meta.spec.version,
+            files: vec![file.file_id],
+            op: CommitOp::Overwrite,
+            summary,
+            created_at: now_ns(),
+        };
+        self.append_jsonl(&self.files_path(table), &file)?;
+        self.write_json(&self.manifest_path(table, snapshot.snapshot_id), &snapshot)?;
+        self.append_jsonl(&self.snapshots_path(table), &snapshot)?;
+        write_atomic(
+            &self.latest_path(table),
+            snapshot.snapshot_id.to_string().as_bytes(),
+        )?;
+        Ok(table)
+    }
+
+    /// Remove a table from the registry. The metadata directory is deleted;
+    /// managed data files are left on disk (they may be shared by snapshots).
+    pub fn drop_table(&self, name: &str) -> Result<Option<TableMeta>> {
+        let mut tables = self.load_tables()?;
+        let Some(pos) = tables.iter().position(|t| t.name == name) else {
+            return Ok(None);
+        };
+        let meta = tables.remove(pos);
+        self.save_tables(&tables)?;
+        let _ = fs::remove_dir_all(self.table_dir(meta.table_id));
+        Ok(Some(meta))
+    }
+
     // -- schemas ------------------------------------------------------------
 
     /// Fetch a specific schema version.
@@ -475,6 +559,7 @@ impl FsCatalog {
             file_id,
             path: path.to_string_lossy().into_owned(),
             format: FileFormat::Parquet,
+            managed: true,
             row_count: nf.batch.num_rows() as u64,
             size_bytes,
             column_stats: column_stats(&nf.batch),

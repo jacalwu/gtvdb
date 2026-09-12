@@ -15,5 +15,5 @@ pub use cache::StaticCache;
 pub use csv::read_csv;
 pub use error::{Result, StorageError};
 pub use hdb::{read_parquet_mmap, HdbStore};
-pub use parquet::{read_batches, write_batch};
+pub use parquet::{infer_csv_schema, parquet_schema, read_batches, write_batch};
 pub use snapshot::{Snapshot, SnapshotStore};
