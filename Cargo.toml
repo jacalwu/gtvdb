@@ -8,7 +8,7 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
-arrow = { version = "59", features = ["prettyprint", "csv"] }
+arrow = { version = "59", features = ["prettyprint", "csv", "ipc"] }
 parquet = { version = "59", features = ["arrow"] }
 datafusion = "55"
 thiserror = "2"
@@ -18,6 +18,11 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time"]
 tonic = "0.14"
 prost = "0.14"
 rayon = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+blake3 = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = "0.4"
 
 # ---------------------------------------------------------------------------
 # Build-time tuning.
