@@ -173,6 +173,12 @@ SELECT * FROM wash_trade(500);             -- 全名
 SELECT id FROM knn('songs', '0.1,0.1', 3);          -- 簡稱
 SELECT id FROM vector_search('songs', '0.1,0.1', 3); -- 全名
 -- 回傳最相近的 3 首歌曲 id（8, 0, 1）
+
+-- 完整簽名：knn(name, query, k [, label [, metric]])
+SELECT id FROM knn('songs', '0.1,0.1', 3, 'pop');          -- 只喺 label='pop' 內搜
+SELECT id FROM knn('tss', '0.1,0.1', 3, '*', 'cosine');    -- '*' = 不篩 label；metric=cosine
+-- metric ∈ l2（預設）| cosine | dot；查詢 metric 必須同 collection 一致，
+-- 不一致會回 MetricMismatch（唔會靜默用錯 metric）。
 ```
 
 ### TC5 — 點時間訂單簿快照（O(log N) 零拷貝）
@@ -319,9 +325,10 @@ FROM t;
 
 ```text
 help | tables | providers | quit
-neighbors <node> [T]       k-hop <node> <k> [T]
+neighbors <node> [T]       khop <node> <k> [T] [--max-edges N] [--max-frontier N] [--max-degree N]
 mavg <n> | msum <n> | deltas
 asof [t ...]               knn <node> [k] [--mask ids]
+knn_from <name> <table> [dim] [metric]   # metric = l2（預設）| cosine | dot
 save <table> <path>        load <table> <path>
 loadcsv <table> <path>     bgload <table> <path> [ms]
 LOAD CSV '<path>' INTO <table>          doc-style CSV 匯入（loadcsv 的別名）
@@ -352,6 +359,8 @@ align('表',freq_sec,'ffill'|'drop')            # 多標的對齊到規則網格
 dq_report('表') | dq_check('表')                # 資料品質：NaN/重複/時間倒退/標的覆蓋
 health_check('表'[,max_age_days[,min_rows]])    # 健康度：freshness vs 恆指交易日曆 等
 strategy_stats('表')                            # 訊號診斷：hit/Brier/ECE/PSI（需 up + p_up 欄）
+khop(src, k, valid_at[, max_hops, max_edges])   # 資源受限 k-hop BFS：visited bitmap + budget
+                                                # 回傳 (hop, dst)；超出 budget 回 BudgetExceeded
 crm_alloc('loan_exposure','collateral','guarantee','collateral_edges','guarantee_edges','BASE',T[, 'ead'])  # 每筆貸款的 CRM 覆蓋（§8）
 crm_audit('loan_exposure','collateral','guarantee','collateral_edges','guarantee_edges','BASE',T[, 'ead'])  # 分配稽核紀錄（§8）
 metrics                                        # 引擎計數器
@@ -576,3 +585,23 @@ JOIN loan_exposure l USING (loan_id);
   gtv> load mco testcase/hft/data/stocks_MCO_tick.parquet
   gtv> SELECT count(*) FROM tick_to_trade('mco', 100);
   ```
+
+---
+
+## 11. 向量 metric 與圖走訪預算（prod_p1）
+
+- **Distance metric**：`l2`（預設，平方歐氏）、`cosine`（`1 − cos`，索引會對
+  rows 同 query 做 unit-normalize）、`dot`（內積，內部用負內積令「越小越近」統一）。
+  索引建構時鎖定 metric 同 dimension；查詢 metric 不一致回 `MetricMismatch`，
+  dimension 不一致回 `DimensionMismatch`。`dot` 唔係 metric（違反三角不等式），
+  ANN recall 可能下降，建議改用 `cosine`。
+- **`knn_from <name> <table> [dim] [metric]`**：由表註冊 vector collection，
+  預設 L2；查詢時亦可以 `knn(name, q, k, '*', metric)` 指定（`'*'` = 不篩 label）。
+- **`khop(src, k, valid_at[, max_hops, max_edges])`**：資源受限 k-hop BFS。
+  每個節點最多訪問一次（visited bitmap），frontier 排序確定；超出
+  `max_hops` / `max_edges` / frontier / rows / memory / deadline 會回
+  `BudgetExceeded`，唔會 OOM。CLI 另支援 `--max-frontier`、`--max-degree`
+  （高 degree guard，超過且無 predicate 時拒絕）。
+- **TemporalCSR 自適應索引**：每個 source 嘅連續 edge run 做 binary search
+  （`valid_from`）+ 每 64 條 edge 一個 zone map（`valid_to`），高 degree 節點
+  查詢實測較線性掃描快 ~17×；低 degree 保持線性快路。

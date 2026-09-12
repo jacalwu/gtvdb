@@ -183,6 +183,13 @@ impl TableFunctionImpl for KnnTableFunction {
         let label = exprs.get(3).map(expr_to_string).transpose()?;
         let requested_metric = exprs.get(4).map(expr_to_string).transpose()?;
 
+        // `'*'` means "do not filter by label" so the metric (5th arg) can be
+        // supplied for collections that carry no labels.
+        let label = match label.as_deref() {
+            Some("*") => None,
+            _ => label,
+        };
+
         let query: Vec<f32> = query
             .split(',')
             .map(|t| {

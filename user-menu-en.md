@@ -176,6 +176,12 @@ SELECT * FROM wash_trade(500);             -- full
 SELECT id FROM knn('songs', '0.1,0.1', 3);          -- short
 SELECT id FROM vector_search('songs', '0.1,0.1', 3); -- full
 -- returns top-3 nearest song ids (8, 0, 1)
+
+-- full signature: knn(name, query, k [, label [, metric]])
+SELECT id FROM knn('songs', '0.1,0.1', 3, 'pop');          -- search only label='pop'
+SELECT id FROM knn('tss', '0.1,0.1', 3, '*', 'cosine');    -- '*' = no label filter; metric=cosine
+-- metric ∈ l2 (default) | cosine | dot; the query metric must match the
+-- collection, otherwise a MetricMismatch is returned (never a silent wrong metric).
 ```
 
 ### TC5 — Point-in-time order-book snapshot (O(log N) zero-copy)
@@ -324,9 +330,10 @@ Quant operators (phase 2):
 
 ```text
 help | tables | providers | quit
-neighbors <node> [T]       k-hop <node> <k> [T]
+neighbors <node> [T]       khop <node> <k> [T] [--max-edges N] [--max-frontier N] [--max-degree N]
 mavg <n> | msum <n> | deltas
 asof [t ...]               knn <node> [k] [--mask ids]
+knn_from <name> <table> [dim] [metric]   # metric = l2 (default) | cosine | dot
 save <table> <path>        load <table> <path>
 loadcsv <table> <path>     bgload <table> <path> [ms]
 LOAD CSV '<path>' INTO <table>          doc-style CSV import (alias of loadcsv)
@@ -358,6 +365,8 @@ backtest('table',cost_bps,stop,tp[,'SYM']) | bt_report(...)    # single-asset st
 pf_backtest('table',cost_bps) | pf_report(...)                # equal-weight portfolio + rebalance
 dq_report('table') | dq_check('table') | health_check('table')   # data quality & freshness
 strategy_stats('table')              # hit / Brier / ECE / PSI over decision rows (up + p_up)
+khop(src, k, valid_at[, max_hops, max_edges])   # resource-bounded k-hop BFS: visited bitmap + budget
+                                                # returns (hop, dst); over-budget -> BudgetExceeded
 crm_alloc('loan_exposure','collateral','guarantee','collateral_edges','guarantee_edges','BASE',T[, 'ead'])  # per-loan CRM cover (§8)
 crm_audit('loan_exposure','collateral','guarantee','collateral_edges','guarantee_edges','BASE',T[, 'ead'])  # audit trail (§8)
 metrics                              # engine counters (see above)
@@ -600,3 +609,28 @@ Behaviour notes:
   gtv> load mco testcase/hft/data/stocks_MCO_tick.parquet
   gtv> SELECT count(*) FROM tick_to_trade('mco', 100);
   ```
+
+---
+
+## 11. Vector metrics & graph-traversal budgets (prod_p1)
+
+- **Distance metric**: `l2` (default, squared Euclidean), `cosine` (`1 - cos`;
+  the index unit-normalizes rows and the query), `dot` (inner product, stored as
+  the negative inner product so "lower = closer" holds uniformly). The metric and
+  dimension are fixed at build time; a mismatched query metric returns
+  `MetricMismatch` and a mismatched dimension returns `DimensionMismatch`. `dot`
+  is not a metric (it violates the triangle inequality), so ANN recall can drop —
+  prefer `cosine`.
+- **`knn_from <name> <table> [dim] [metric]`** registers a collection from a
+  table (default L2); a query may also override with
+  `knn(name, q, k, '*', metric)` where `'*'` means "no label filter".
+- **`khop(src, k, valid_at[, max_hops, max_edges])`** is a resource-bounded k-hop
+  BFS. Each node is visited at most once (visited bitmap) and frontiers are
+  deterministically ordered; exceeding hops / edges / frontier / rows / memory /
+  deadline returns `BudgetExceeded` instead of OOM. The CLI also supports
+  `--max-frontier` and `--max-degree` (a high-degree guard that rejects a node
+  above the limit unless an edge predicate is supplied).
+- **Adaptive TemporalCSR**: each source's contiguous edge run is binary-searched
+  on `valid_from` plus a per-64-edge zone map on `valid_to`, giving ~17x lower
+  latency than a linear scan on high-degree nodes (low degree keeps the linear
+  fast path).
