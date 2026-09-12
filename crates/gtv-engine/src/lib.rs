@@ -8,6 +8,7 @@ pub mod analytics;
 pub mod bt;
 pub mod context;
 pub mod csv;
+pub mod crm;
 pub mod datetime;
 pub mod graph;
 pub mod hft;

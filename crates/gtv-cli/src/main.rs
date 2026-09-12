@@ -730,7 +730,27 @@ async fn run(
             parquet::write_batch(path, &all)?;
             println!("wrote `{table}` ({} rows) -> {path}", all.num_rows());
         }
-        "load" => {
+        "load" | "LOAD" => {
+            // LOAD CSV 'path' INTO <table>  (doc-style CSV import) and
+            // load <table> <path>  (traditional Parquet import).
+            if tokens.get(1).is_some_and(|w| w.eq_ignore_ascii_case("csv")) {
+                let path = require_arg(&tokens, 2, "LOAD CSV 'path' INTO <table>")?;
+                let path = path.trim_matches(|c| c == '\'' || c == '"').to_string();
+                if !tokens.get(3).is_some_and(|w| w.eq_ignore_ascii_case("into")) {
+                    return Err(anyhow!(
+                        "usage: LOAD CSV 'path' INTO <table>  (got `{line}`)"
+                    ));
+                }
+                let table = require_arg(&tokens, 4, "LOAD CSV 'path' INTO <table>")?;
+                let table = table.trim_end_matches(';');
+                ctx.register_csv(&path, table)?;
+                println!("loaded `{table}` from {path}");
+                if let Some(cat) = catalog.as_mut() {
+                    cat.record_csv(table, &path)?;
+                    println!("catalog: persisted `{table}` (reloads {path})");
+                }
+                return Ok(Action::Continue);
+            }
             let table = require_arg(&tokens, 1, "load <table> <path>")?;
             let path = require_arg(&tokens, 2, "load <table> <path>")?;
             let batches = parquet::read_batches(path)?;
@@ -1728,6 +1748,8 @@ const DF_TABLE_FNS: &[&str] = &[
     "dq_check",
     "health_check",
     "strategy_stats",
+    "crm_alloc",
+    "crm_audit",
 ];
 
 /// Read a data file, auto-detecting CSV vs Parquet by extension.
@@ -1843,6 +1865,7 @@ fn print_help() {
          \x20 save <table> <path>   write a table to a Parquet file\n\
          \x20 load <table> <path>   load a Parquet file as a table\n\
          \x20 loadcsv <table> <path>  load CSV from disk into a session table\n\
+         \x20 LOAD CSV '<path>' INTO <table>  same as loadcsv (doc-style SQL)\n\
          \x20 load <table> <path>   load Parquet from disk into a session table\n\
          \x20 bgload <table> <path> [ms]  background re-import (CSV or Parquet)\n\
          \x20 live <table> <symbol...>  stream LSE live ticks (needs LSE_API_KEY)\n\
@@ -1891,7 +1914,17 @@ fn print_help() {
          \x20 SELECT t, mavg(price, 3) OVER (ORDER BY t) FROM prices;\n\
          \x20 SELECT * FROM read_csv('path/to/ticks.csv');\n\
          \x20 SELECT * FROM read_parquet('path/to/ticks.parquet');\n\
-         \x20 CREATE TABLE t AS SELECT * FROM read_csv('path/to/ticks.csv');"
+         \x20 CREATE TABLE t AS SELECT * FROM read_csv('path/to/ticks.csv');\n\
+         \x20 CRM allocation (crm-allocation.md) after `LOAD CSV … INTO` the five tables:\n\
+         \x20 SELECT * FROM crm_alloc('loan_exposure','collateral','guarantee',\n\
+         \x20    'collateral_edges','guarantee_edges','BASE',-1);   per-loan cover\n\
+         \x20 SELECT * FROM crm_audit(/* same args */);              full audit trail\n\
+         \x20   T = as-of ns (valid_from<=T<valid_to; -1 = none); scenario '' = any;\n\
+         \x20   optional 8th arg = exposure column (default 'ead');\n\
+         \x20   optional 9th arg = method: 'greedy'(default) | 'haircut_efficiency'\n\
+         \x20     (collateral by eff value, loans by RW) | 'lp' (Phase-3 exact LP,\n\
+         \x20     honours per-edge ratio/amount caps; needs `--features gtv-engine/crm-lp`)\n\
+         \x20   crm_audit stage = specified | greedy | lp"
     );
 }
 

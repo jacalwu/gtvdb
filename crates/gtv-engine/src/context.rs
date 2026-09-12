@@ -89,6 +89,12 @@ impl GtvContext {
                 "align",
                 Arc::new(crate::quant::AlignTableFunction::new(hft_reg.clone())),
             );
+            let crm_alloc = Arc::new(crate::crm::CrmAllocTableFunction::new(hft_reg.clone()));
+            ctx.register_udtf("crm_alloc", crm_alloc);
+            ctx.register_udtf(
+                "crm_audit",
+                Arc::new(crate::crm::CrmAuditTableFunction::new(hft_reg.clone())),
+            );
             ctx.register_udtf(
                 "backtest",
                 Arc::new(crate::bt::BacktestTableFunction::new(hft_reg.clone())),

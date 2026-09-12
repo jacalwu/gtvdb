@@ -6,3 +6,16 @@ license.workspace = true
 
 [dependencies]
 arrow.workspace = true
+
+[features]
+default = []
+# Phase-3 exact LP allocator over the optimizable CRM pool. Kept optional so the
+# default build stays dependency-light; swap `microlp` for e.g. `highs` in the
+# optional good_lp dependency for large models (same modeling code).
+crm-lp = ["dep:good_lp"]
+
+[dependencies.good_lp]
+version = "1"
+optional = true
+default-features = false
+features = ["microlp"]

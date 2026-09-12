@@ -6,6 +6,9 @@
 
 pub mod asof;
 pub mod backtest;
+pub mod crm;
+#[cfg(feature = "crm-lp")]
+pub mod crm_lp;
 pub mod hft_ops;
 pub mod micro;
 pub mod quant;

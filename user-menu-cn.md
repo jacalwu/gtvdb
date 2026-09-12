@@ -62,6 +62,7 @@ pit(500)             -- 裸表函數 == SELECT * FROM pit(500)
 
 ```text
 gtv> loadcsv ticks /data/ticks.csv        # CSV -> session 表 `ticks`
+gtv> LOAD CSV '/data/ticks.csv' INTO ticks   # doc-style 別名（同 loadcsv）
 gtv> load    ticks /data/ticks.parquet    # Parquet -> session 表 `ticks`
 gtv> save    ticks /data/ticks.parquet    # 把任意已註冊表寫成 Parquet
 ```
@@ -323,6 +324,7 @@ mavg <n> | msum <n> | deltas
 asof [t ...]               knn <node> [k] [--mask ids]
 save <table> <path>        load <table> <path>
 loadcsv <table> <path>     bgload <table> <path> [ms]
+LOAD CSV '<path>' INTO <table>          doc-style CSV 匯入（loadcsv 的別名）
 live <table> <symbol...>   串流 LSE 即時 tick（需 LSE_API_KEY）
 fetch <table> <symbol> [limit]  抓取 LSE 歷史 tick（REST API）
 yahoo <table> <symbol...> [--range 1y]  抓 Yahoo 日線 OHLCV
@@ -350,6 +352,8 @@ align('表',freq_sec,'ffill'|'drop')            # 多標的對齊到規則網格
 dq_report('表') | dq_check('表')                # 資料品質：NaN/重複/時間倒退/標的覆蓋
 health_check('表'[,max_age_days[,min_rows]])    # 健康度：freshness vs 恆指交易日曆 等
 strategy_stats('表')                            # 訊號診斷：hit/Brier/ECE/PSI（需 up + p_up 欄）
+crm_alloc('loan_exposure','collateral','guarantee','collateral_edges','guarantee_edges','BASE',T[, 'ead'])  # 每筆貸款的 CRM 覆蓋（§8）
+crm_audit('loan_exposure','collateral','guarantee','collateral_edges','guarantee_edges','BASE',T[, 'ead'])  # 分配稽核紀錄（§8）
 metrics                                        # 引擎計數器
 ```
 
@@ -442,7 +446,116 @@ EVENT_MODE=1 ./holdings_forecast.sh     # 事件風險層（門檻建議 0.80、
 
 ---
 
-## 8. 效能說明
+## 8. CRM 分配（信用風險緩釋）
+
+對 `crm-allocation.md`（倉庫根目錄）的五張表執行 greedy CRM 分配：
+
+* 一筆貸款可有多個抵押品 + 多個擔保人，反之亦然（多對多圖）；
+* 抵押品價值先做 haircut 調整：
+  `C × (1 − haircut − fx_haircut − maturity_mm)`（下限 0）；
+* `specified`（合約鎖定）邊 **先** 分配；剩餘 `optimizable` 邊進入確定性
+  greedy / priority 分配（來源與貸款按 priority 排序，相同時依 id 升序）；
+* 擔保階段總在抵押品階段之後，因此擔保只覆蓋殘餘暴露：
+  `CRMg = min(G, E − CRMc)`；
+* 每次分配都會寫入 audit trail（可稽核 / 可重跑）。
+
+載入五張 CSV（schema 與產生器見 `crm-allocation.md` §1–§3），然後分配：
+
+```text
+gtv> LOAD CSV '/home/jacal/gtvdb/testcase/loan_exposure.csv'     INTO loan_exposure
+gtv> LOAD CSV '/home/jacal/gtvdb/testcase/collateral.csv'        INTO collateral
+gtv> LOAD CSV '/home/jacal/gtvdb/testcase/guarantee.csv'         INTO guarantee
+gtv> LOAD CSV '/home/jacal/gtvdb/testcase/collateral_edges.csv'  INTO collateral_edges
+gtv> LOAD CSV '/home/jacal/gtvdb/testcase/guarantee_edges.csv'   INTO guarantee_edges
+
+gtv> SELECT * FROM crm_alloc('loan_exposure','collateral','guarantee',
+        'collateral_edges','guarantee_edges','BASE',-1);
+```
+
+參數：`crm_alloc(loan_tbl, coll_tbl, guar_tbl, coll_edges_tbl,
+guar_edges_tbl, scenario, T [, exposure_col [, method]])`：
+
+* `scenario` 過濾 `scenario_id` 列（`''` 或 `'*'` = 不區分情境）；
+* `T` = as-of 時間點（ns）— 只保留 `valid_from <= T < valid_to` 的列；
+  `-1` = 不做時間過濾；
+* 可選 `exposure_col` = 要緩釋的貸款暴露欄（預設 `ead`，例如 `'pv'`）；
+* 可選 `method` = `'greedy'`（預設）| `'haircut_efficiency'` | `'lp'`：
+  - `greedy` — 抵押品依類型品質（CASH > BOND > EQUITY）、貸款依 `pd`
+    （風險高者先覆蓋）；
+  - `haircut_efficiency` — 抵押品依 haircut 調整後的**有效價值**
+    （`C × (1 − Hc − Hfx − Hmm)`，大者先用）、貸款依**風險權重 RW**
+    （`rw` 欄 → rating 對照表 → `pd`）；Phase 1 與分配規則相同，只改排序鍵；
+  - `lp` — 精確 LP（需 `crm-lp` feature）。
+
+輸出（每個在切片內的貸款一行）：
+`loan_id, exposure, collateral_cover, guarantee_cover, net_exposure`。
+
+完整 audit trail（相同輸入、相同確定性執行）：
+
+```text
+gtv> SELECT * FROM crm_audit('loan_exposure','collateral','guarantee',
+        'collateral_edges','guarantee_edges','BASE',-1);
+```
+
+audit 欄位：`seq, stage (specified|greedy|lp), source_kind
+(collateral|guarantee), source_id, loan_id, amount, source_remaining,
+loan_remaining`。
+
+一致性檢查 / 報表：
+
+```sql
+-- as-of / scenario 切片內的貸款數：
+SELECT count(*) FROM crm_alloc('loan_exposure','collateral','guarantee',
+        'collateral_edges','guarantee_edges','BASE',-1);
+-- 暴露守恒：Σ(collateral_cover + guarantee_cover + net_exposure) = Σ ead
+SELECT sum(collateral_cover + guarantee_cover + net_exposure) AS exposure_total,
+       min(net_exposure) AS min_net
+FROM crm_alloc('loan_exposure','collateral','guarantee',
+        'collateral_edges','guarantee_edges','BASE',-1);
+-- 覆蓋來源分佈：
+SELECT stage, source_kind, count(*) AS allocs, sum(amount) AS amount
+FROM crm_audit('loan_exposure','collateral','guarantee',
+        'collateral_edges','guarantee_edges','BASE',-1)
+GROUP BY stage, source_kind;
+```
+
+greedy vs LP（`method`）：Phase 1（specified）共用且完全相同；只有
+optimizable 池的解法不同。
+
+```text
+cargo build -p gtv-cli --features gtv-engine/crm-lp     # 啟用 Phase 3（microlp）
+gtv> SELECT * FROM crm_alloc('loan_exposure','collateral','guarantee',
+        'collateral_edges','guarantee_edges','BASE',-1,'ead','greedy');  -- 啟發式
+gtv> SELECT * FROM crm_alloc('loan_exposure','collateral','guarantee',
+        'collateral_edges','guarantee_edges','BASE',-1,'ead','lp');      -- 精確 LP
+-- 風險加權殘餘：LP 最小化 Σ pd × net_exposure（optimizable 池）
+SELECT round(sum(r.net_exposure*l.pd),2) AS risk_weighted_net
+FROM crm_alloc('loan_exposure','collateral','guarantee',
+        'collateral_edges','guarantee_edges','BASE',-1,'ead','lp') r
+JOIN loan_exposure l USING (loan_id);
+```
+
+行為說明：
+
+* scenario / as-of 過濾逐表進行；端點被切片過濾掉的邊屬「無效」會被丟棄；
+  引用源表中不存在的 id 則中止執行（資料錯誤）。
+* 預設優先級：貸款用 `pd`（風險高者先覆蓋）、抵押品用 `type`
+  （CASH > BOND > EQUITY）、擔保人用 `rating`（AAA > AA > A …）。
+  任一張表加 `priority` 欄即可覆蓋該表預設值。
+* 情境沒有資料（例如尚未載入 `STRESS`）回傳空結果 — 不是錯誤。
+* `method='lp'` 對 optimizable 邊建立精確線性規劃
+  （`x_e ≥ 0`、貸款需求 + 來源容量約束），**並遵守每條邊的合約上限**
+  （`collateral_edges.ratio` 與 `guarantee_edges.amount`）；greedy Phase 2
+  依參考語意刻意忽略這些上限，因此只有當 cap 生效時兩者結果才會不同。
+  未開啟 feature 時 `method='lp'` 會回傳明確的重建提示。
+* 純 Rust kernel（也可直接呼叫）：`gtv_array::crm::crm_alloc_greedy`
+  （Phase 1+2）與 `gtv_array::crm_lp::crm_alloc_lp`
+  （Phase 3，需 `crm-lp` feature；求解器走 `good_lp` — 預設 `microlp`，
+  大模型可把 `good_lp` 的 feature 換成 `highs`）。
+
+---
+
+## 9. 效能說明
 
 - `hft` 模式下，`pit` / `wash` / `aj` / `ofi` / 裸表掃描會先編譯成 **KernelPlan**
   （依查詢文字快取），之後直接呼叫 compiled kernel——熱路徑零 DataFusion 規劃。
@@ -453,7 +566,7 @@ EVENT_MODE=1 ./holdings_forecast.sh     # 事件風險層（門檻建議 0.80、
 
 ---
 
-## 9. 備註
+## 10. 備註
 
 - `full` 模式是完整 DataFusion SQL；`hft` 模式是低延遲子集（不支援 JOIN / GROUP BY
   / CTE / 子查詢）。

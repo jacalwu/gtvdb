@@ -63,6 +63,7 @@ pit(500)             -- bare table fn    == SELECT * FROM pit(500)
 
 ```text
 gtv> loadcsv ticks /data/ticks.csv        # CSV -> session table `ticks`
+gtv> LOAD CSV '/data/ticks.csv' INTO ticks   # doc-style alias (same as loadcsv)
 gtv> load    ticks /data/ticks.parquet    # Parquet -> session table `ticks`
 gtv> save    ticks /data/ticks.parquet    # write any registered table to Parquet
 ```
@@ -328,6 +329,7 @@ mavg <n> | msum <n> | deltas
 asof [t ...]               knn <node> [k] [--mask ids]
 save <table> <path>        load <table> <path>
 loadcsv <table> <path>     bgload <table> <path> [ms]
+LOAD CSV '<path>' INTO <table>          doc-style CSV import (alias of loadcsv)
 live <table> <symbol...>   stream LSE live ticks (needs LSE_API_KEY)
 fetch <table> <symbol> [limit]  pull LSE historical ticks (REST API)
 yahoo <table> <symbol...> [--range 1y]  pull daily OHLCV from Yahoo
@@ -356,6 +358,8 @@ backtest('table',cost_bps,stop,tp[,'SYM']) | bt_report(...)    # single-asset st
 pf_backtest('table',cost_bps) | pf_report(...)                # equal-weight portfolio + rebalance
 dq_report('table') | dq_check('table') | health_check('table')   # data quality & freshness
 strategy_stats('table')              # hit / Brier / ECE / PSI over decision rows (up + p_up)
+crm_alloc('loan_exposure','collateral','guarantee','collateral_edges','guarantee_edges','BASE',T[, 'ead'])  # per-loan CRM cover (§8)
+crm_audit('loan_exposure','collateral','guarantee','collateral_edges','guarantee_edges','BASE',T[, 'ead'])  # audit trail (§8)
 metrics                              # engine counters (see above)
 ```
 
@@ -454,7 +458,127 @@ boundaries (Futu has no historical tick dumps, Yahoo intraday lookback caps).
 
 ---
 
-## 8. Performance Notes
+## 8. CRM Allocation (credit-risk mitigation)
+
+Greedy CRM (credit-risk-mitigation) allocator over the five tables of
+`crm-allocation.md` (repo root):
+
+* one loan may carry many collaterals **and** many guarantors, and vice versa
+  (multi-to-multi graph);
+* collateral capacity is haircut-adjusted up-front:
+  `C × (1 − haircut − fx_haircut − maturity_mm)` (floored at 0);
+* `specified` (contract-locked) edges are allocated **first**; remaining
+  `optimizable` edges go to a deterministic greedy / priority allocator
+  (sources & loans ranked by priority — ties broken by ascending id);
+* guarantee phases always follow collateral phases, so a guarantee covers the
+  residual exposure: `CRMg = min(G, E − CRMc)`;
+* every allocation is recorded in an audit trail (auditable / replayable).
+
+Load the five CSVs (schema + generator in `crm-allocation.md` §1–§3), then
+allocate:
+
+```text
+gtv> LOAD CSV 'loan_exposure.csv'     INTO loan_exposure
+gtv> LOAD CSV 'collateral.csv'        INTO collateral
+gtv> LOAD CSV 'guarantee.csv'         INTO guarantee
+gtv> LOAD CSV 'collateral_edges.csv'  INTO collateral_edges
+gtv> LOAD CSV 'guarantee_edges.csv'   INTO guarantee_edges
+
+gtv> SELECT * FROM crm_alloc('loan_exposure','collateral','guarantee',
+        'collateral_edges','guarantee_edges','BASE',-1);
+```
+
+Arguments: `crm_alloc(loan_tbl, coll_tbl, guar_tbl, coll_edges_tbl,
+guar_edges_tbl, scenario, T [, exposure_col [, method]])`:
+
+* `scenario` filters `scenario_id` rows (`''` or `'*'` = any scenario);
+* `T` = as-of instant in ns — only rows with `valid_from <= T < valid_to`
+  participate; `-1` = no temporal filter;
+* optional `exposure_col` = loan exposure to mitigate (default `ead`,
+  e.g. `'pv'`);
+* optional `method` = `'greedy'` (default) | `'haircut_efficiency'` |
+  `'lp'`:
+  - `greedy` — collateral by type quality (CASH > BOND > EQUITY), loans by
+    `pd` (riskier first);
+  - `haircut_efficiency` — collateral consumed by haircut-adjusted **effective
+    value** (`C × (1 − Hc − Hfx − Hmm)`, largest first), loans by **risk
+    weight** (`rw` column → rating map → `pd`); same Phase 1 + allocation rule,
+    only the ordering keys change;
+  - `lp` — exact LP (needs `crm-lp` feature).
+
+Output (per loan in the slice):
+`loan_id, exposure, collateral_cover, guarantee_cover, net_exposure`.
+
+Full audit trail (same inputs, same deterministic run):
+
+```text
+gtv> SELECT * FROM crm_audit('loan_exposure','collateral','guarantee',
+        'collateral_edges','guarantee_edges','BASE',-1);
+```
+
+Audit columns: `seq, stage (specified|greedy|lp), source_kind
+(collateral|guarantee), source_id, loan_id, amount, source_remaining,
+loan_remaining`.
+
+Consistency checks / reports:
+
+```sql
+-- loans inside the as-of/scenario slice:
+SELECT count(*) FROM crm_alloc('loan_exposure','collateral','guarantee',
+        'collateral_edges','guarantee_edges','BASE',-1);
+-- exposure conservation: Σ(collateral_cover + guarantee_cover + net_exposure) = Σ ead
+SELECT sum(collateral_cover + guarantee_cover + net_exposure) AS exposure_total,
+       min(net_exposure) AS min_net
+FROM crm_alloc('loan_exposure','collateral','guarantee',
+        'collateral_edges','guarantee_edges','BASE',-1);
+-- where the cover came from:
+SELECT stage, source_kind, count(*) AS allocs, sum(amount) AS amount
+FROM crm_audit('loan_exposure','collateral','guarantee',
+        'collateral_edges','guarantee_edges','BASE',-1)
+GROUP BY stage, source_kind;
+```
+
+Greedy vs LP (`method`): Phase 1 (specified) is shared and byte-identical;
+only the optimizable pool differs.
+
+```text
+cargo build -p gtv-cli --features gtv-engine/crm-lp     # enable Phase 3 (microlp)
+gtv> SELECT * FROM crm_alloc('loan_exposure','collateral','guarantee',
+        'collateral_edges','guarantee_edges','BASE',-1,'ead','greedy');  -- heuristic
+gtv> SELECT * FROM crm_alloc('loan_exposure','collateral','guarantee',
+        'collateral_edges','guarantee_edges','BASE',-1,'ead','lp');      -- exact LP
+-- risk-weighted residual: LP minimises Σ pd × net_exposure over the optimizable pool
+SELECT round(sum(r.net_exposure*l.pd),2) AS risk_weighted_net
+FROM crm_alloc('loan_exposure','collateral','guarantee',
+        'collateral_edges','guarantee_edges','BASE',-1,'ead','lp') r
+JOIN loan_exposure l USING (loan_id);
+```
+
+Behaviour notes:
+
+* Scenario / as-of filtering is applied per table. Edges whose endpoint was
+  filtered out of the slice are inert and dropped; an edge that references an
+  id that never existed in the source tables aborts the run (data error).
+* Default priorities: loans by `pd` (riskier covered first), collaterals by
+  `type` (CASH > BOND > EQUITY), guarantors by `rating` (AAA > AA > A …).
+  Adding a `priority` column to any of the five tables overrides the default
+  for that table.
+* Running a scenario with no rows (e.g. `STRESS` before it is loaded) returns
+  an empty result — not an error.
+* `method='lp'` builds an exact linear program over the optimizable edges
+  (`x_e ≥ 0`, loan-demand + source-capacity rows) **and honours the per-edge
+  contractual caps** carried by `collateral_edges.ratio` and
+  `guarantee_edges.amount`; the greedy phase 2 deliberately ignores those caps
+  (reference semantics), so the two methods only differ when caps bind.
+  Without the feature, `method='lp'` returns a clear rebuild hint.
+* Kernels (pure Rust, callable directly): `gtv_array::crm::crm_alloc_greedy`
+  (phases 1+2) and `gtv_array::crm_lp::crm_alloc_lp` (phase 3, `crm-lp`
+  feature; solver backend via `good_lp` — `microlp` by default, swap the
+  `good_lp` feature for `highs` on large models).
+
+---
+
+## 9. Performance Notes
 
 - In `hft` mode, `pit` / `wash` / `aj` / `ofi` / bare table scans are compiled once
   into a **KernelPlan** (cached by query text) and executed directly on the
@@ -466,7 +590,7 @@ boundaries (Futu has no historical tick dumps, Yahoo intraday lookback caps).
 
 ---
 
-## 9. Notes
+## 10. Notes
 
 - The `full` mode is the complete DataFusion SQL surface; the `hft` mode is the
   latency-first subset (no JOIN / GROUP BY / CTE / subquery).
