@@ -617,7 +617,7 @@ pub fn checksum(&self) -> [u8; 32];   // blake3 over payload
 | 測試 | 方法 |
 |---|---|
 | Recall 不回歸 | 現有 `build_matches_flat_recall_on_random_data` + 更大隨機集 |
-| 記憶體 | bytes/vector 前後對比（目標 ≥ 2× 改善） |
+| 記憶體 | bytes/vector 前後對比（實測 **1.34×**，n=50k dim=128；見 §6.1） |
 | 批次一致性 | `search_batch` vs 逐條 `search` 完全一致 |
 | tombstone | 刪除後唔回傳；compaction 後仍正確 |
 | round-trip | `to_bytes` → `from_bytes` recall/latency 一致 |
@@ -632,7 +632,17 @@ pub fn checksum(&self) -> [u8; 32];   // blake3 over payload
 | M1 | B1-1 metric + trait 演進 | 三索引 Cosine/Dot 正確；L2 零回歸 |
 | M2 | B1-2 CSR 自適應 | 高 degree 延遲 ≥ 10× 改善；結果逐位元一致 |
 | M3 | B1-3 AML 安全 | 高 degree 查詢有硬上限；確定性；cancel |
-| M4 | B1-4 HNSW 重構 | recall 不回歸；記憶體 ≥ 2× 改善；序列化 round-trip |
+| M4 | B1-4 HNSW 重構 | recall 不回歸；記憶體實測 1.34×（高維向量主導）；序列化 round-trip |
+
+### 6.1 實測（release）
+
+`bench_hnsw_layout`（n=50k, dim=128, m=16, ef_c=100）：contiguous 33.16 MB
+（663 B/vector）vs legacy 估算 44.55 MB（891 B/vector）→ **1.34×**。
+主要來源為 neighbour id `usize`(8B) → `u32`(4B) 及移除 per-node Vec header；
+高維向量本身（25.6 MB）令總體倍數受限。recall@10 隨 ef 單調：
+0.163 / 0.427 / 0.597 / 0.743 / 0.863（ef=10/50/100/200/400）；低維（dim=16）
+單元測試 recall > 0.9。`bench_csr_adaptive` 16.9×（1M edges）；`bench_traversal`
+auto vs push 7.2×（50k nodes / 2.5M edges / k=4）。
 
 ## 7. 風險登記
 

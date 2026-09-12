@@ -15,7 +15,9 @@ pub mod traits;
 pub mod traversal;
 
 pub use chunk::TemporalEdgeChunk;
-pub use csr::{Neighbor, NeighborStrategy, Neighbors, TemporalCSR, TemporalCsrStats};
+pub use csr::{
+    DirectionMode, Neighbor, NeighborStrategy, Neighbors, TemporalCSR, TemporalCsrStats,
+};
 pub use error::{GtvError, Result};
 pub use graph::TemporalGraph;
 pub use metric::{DistanceMetric, Metric};

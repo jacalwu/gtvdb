@@ -241,6 +241,59 @@ impl HnswIndex {
         self.tombstone_count
     }
 
+    /// Total allocated neighbour slots (fixed-capacity layout).
+    pub fn neighbour_slots(&self) -> usize {
+        self.neighbours.len()
+    }
+
+    /// Total live neighbour entries across all `(node, level)` blocks.
+    pub fn neighbour_count(&self) -> usize {
+        (0..self.ids.len())
+            .map(|i| {
+                let top = self.levels[i];
+                (0..=top)
+                    .map(|l| self.level_count(i as u32, l))
+                    .sum::<usize>()
+            })
+            .sum()
+    }
+
+    /// Resident bytes of the contiguous layout (payload length, excluding the
+    /// doubling slack that a growing `Vec` may carry during build).
+    pub fn memory_bytes(&self) -> usize {
+        self.ids.len() * std::mem::size_of::<u64>()
+            + self.vectors.len() * std::mem::size_of::<f32>()
+            + self.levels.len()
+            + self.node_offset.len() * std::mem::size_of::<u32>()
+            + self.neighbours.len() * std::mem::size_of::<u32>()
+            + self.block_start.len() * std::mem::size_of::<u32>()
+            + self.counts.len()
+            + self.deleted.len()
+    }
+
+    /// Analytical footprint of the previous per-node layout
+    /// (`Node { id, vector: Vec<f32>, layers: Vec<Vec<usize>> }`), used to
+    /// quantify the B1-4 improvement without keeping the old code alive.
+    pub fn estimated_legacy_bytes(&self) -> usize {
+        // Node struct = id (8) + two Vec headers (24 each).
+        const NODE_STRUCT: usize = 8 + 24 + 24;
+        // Per-heap-allocation bookkeeping (malloc header + rounding); a
+        // conservative, platform-independent constant.
+        const ALLOC_OVERHEAD: usize = 16;
+        let n = self.ids.len();
+        let mut bytes = n * NODE_STRUCT;
+        bytes += n * (self.dim * std::mem::size_of::<f32>() + ALLOC_OVERHEAD);
+        for i in 0..n {
+            let top = self.levels[i];
+            for level in 0..=top {
+                let cnt = self.level_count(i as u32, level);
+                // The legacy layout stored neighbours as `usize` (8 bytes).
+                bytes += 24 + ALLOC_OVERHEAD + cnt * std::mem::size_of::<usize>();
+            }
+        }
+        bytes
+    }
+
     // -- contiguous-layout accessors ---------------------------------------
 
     #[inline]
@@ -366,6 +419,9 @@ impl HnswIndex {
         scratch: &mut Scratch,
         report: &mut SearchReport,
     ) -> Vec<(f32, u32)> {
+        // Each beam search is independent: clear the generation-stamped visited
+        // set (O(1)) so marks from a previous layer / query never leak in.
+        scratch.reset();
         let allowed = |i: u32| -> bool {
             if self.deleted.get(i as usize).copied().unwrap_or(false) {
                 return false;
@@ -1077,5 +1133,27 @@ mod tests {
         let want: Vec<u64> = brute.into_iter().take(5).map(|(_, id)| id).collect();
         let got: Vec<u64> = exact.iter().map(|h| h.id).collect();
         assert_eq!(got, want);
+    }
+
+    #[test]
+    fn recall_at_10_is_high_on_low_dim() {
+        use crate::FlatIndex;
+        let (ids, vectors) = random_vectors(2_000, 16, 123);
+        let flat = FlatIndex::new(ids.clone(), vectors.clone()).unwrap();
+        let hnsw = HnswIndex::build(ids, vectors.clone(), 16, 200, 100).unwrap();
+        let (mut hit, mut total) = (0usize, 0usize);
+        for q in vectors.iter().step_by(20) {
+            let exact: Vec<u64> = flat.search(q, 10, None).unwrap().iter().map(|h| h.id).collect();
+            let approx: Vec<u64> = hnsw
+                .search_with_ef(q, 10, 100, None)
+                .unwrap()
+                .iter()
+                .map(|h| h.id)
+                .collect();
+            hit += exact.iter().filter(|id| approx.contains(id)).count();
+            total += exact.len();
+        }
+        let recall = hit as f64 / total as f64;
+        assert!(recall > 0.9, "recall@10 = {recall}");
     }
 }

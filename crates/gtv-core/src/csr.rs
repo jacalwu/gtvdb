@@ -50,6 +50,17 @@ pub enum NeighborStrategy {
     BinarySearchZoneMap,
 }
 
+/// BFS expansion direction for [`TemporalCSR::khop_directed`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectionMode {
+    /// Expand the frontier edge by edge (`|frontier| × degree`).
+    Push,
+    /// Scan unvisited nodes and pull from their in-neighbours (`V + E_rev`).
+    Pull,
+    /// Pick the cheaper direction per hop (needs the transposed graph).
+    Auto,
+}
+
 /// Aggregate index statistics.
 #[derive(Debug, Clone)]
 pub struct TemporalCsrStats {
@@ -425,7 +436,7 @@ impl TemporalCSR {
         Ok(frontiers)
     }
 
-    /// Resource-bounded k-hop BFS (B1-3).
+    /// Resource-bounded, push-direction k-hop BFS (B1-3).
     ///
     /// Unlike [`TemporalCSR::khop`], every node is visited at most once via a
     /// global visited bitmap, so the frontier and total work are deterministic
@@ -444,10 +455,45 @@ impl TemporalCSR {
         predicate: Option<&dyn EdgePredicate>,
         cancel: Option<&CancelToken>,
     ) -> Result<KhopResult> {
+        self.khop_directed(
+            seeds,
+            k,
+            valid_at,
+            budget,
+            predicate,
+            cancel,
+            None,
+            DirectionMode::Push,
+        )
+    }
+
+    /// Direction-optimizing k-hop BFS (B1-3).
+    ///
+    /// With a dense frontier, expanding it edge-by-edge (`push`) touches
+    /// `|frontier| × degree` edges. The `pull` step instead scans every
+    /// unvisited node and stops at its first in-neighbour that is in the
+    /// frontier, which costs `V + E_rev` but is independent of the frontier
+    /// size. Provide the [`TemporalCSR::transpose`] as `reverse` to enable it.
+    ///
+    /// [`DirectionMode::Auto`] picks the cheaper direction per hop. Predicates
+    /// are evaluated on the *forward* edge (`src -> dst`) in both directions.
+    #[allow(clippy::too_many_arguments)]
+    pub fn khop_directed(
+        &self,
+        seeds: &UInt64Array,
+        k: usize,
+        valid_at: i64,
+        budget: &TraversalBudget,
+        predicate: Option<&dyn EdgePredicate>,
+        cancel: Option<&CancelToken>,
+        reverse: Option<&TemporalCSR>,
+        mode: DirectionMode,
+    ) -> Result<KhopResult> {
         let tracker = BudgetTracker::new(budget.clone(), cancel.cloned());
         tracker.check_time()?;
         let k = k.min(budget.max_hops);
         let mut visited = VisitedSet::new(self.node_count);
+        let mut in_frontier = VisitedSet::new(self.node_count);
 
         let mut current: Vec<u64> = seeds.values().as_ref().to_vec();
         for &s in &current {
@@ -461,14 +507,23 @@ impl TemporalCSR {
             visited.mark(s);
         }
 
+        let avg_degree = if self.node_count == 0 {
+            0.0
+        } else {
+            self.edge_count() as f64 / self.node_count as f64
+        };
+
         let mut frontiers = Vec::with_capacity(k);
         let mut pending_edges = 0u64;
         for _hop in 0..k {
             tracker.check_time()?;
-            let mut next: Vec<u64> = Vec::new();
-            for &s in &current {
-                let deg = self.degree(s)?;
-                if let Some(guard) = budget.max_degree {
+            if current.is_empty() {
+                break;
+            }
+
+            if let Some(guard) = budget.max_degree {
+                for &s in &current {
+                    let deg = self.degree(s)?;
                     if deg > guard && predicate.is_none() {
                         return Err(GtvError::HighDegreeNode {
                             node: s,
@@ -477,23 +532,48 @@ impl TemporalCSR {
                         });
                     }
                 }
-                for nb in self.neighbors(s, valid_at)? {
-                    pending_edges += 1;
-                    if pending_edges >= 4096 {
-                        tracker.add_edges(pending_edges)?;
-                        pending_edges = 0;
-                        tracker.check_time()?;
-                    }
-                    if let Some(p) = predicate {
-                        if !p.keep(&nb) {
-                            continue;
-                        }
-                    }
-                    if visited.mark(nb.dst) {
-                        next.push(nb.dst);
-                    }
-                }
             }
+
+            let p = current.len() as f64 / self.node_count.max(1) as f64;
+            let use_pull = match mode {
+                DirectionMode::Push => false,
+                DirectionMode::Pull => true,
+                // Direction-optimizing trigger (random-graph model): with a
+                // frontier fraction `p`, pull is expected to scan
+                // `V(1-p)/p` edges (early exit) vs push's `pV*avg`. Pull wins
+                // when `(1-p) < p^2 * avg_degree`.
+                DirectionMode::Auto => {
+                    reverse.is_some() && (1.0 - p) < p * p * avg_degree.max(1.0)
+                }
+            };
+
+            let mut next = if use_pull {
+                let rev = reverse.ok_or_else(|| {
+                    GtvError::InvalidArgument(
+                        "pull traversal requires the transposed graph (reverse)".into(),
+                    )
+                })?;
+                self.pull_frontier(
+                    rev,
+                    &current,
+                    valid_at,
+                    predicate,
+                    &mut visited,
+                    &mut in_frontier,
+                    &tracker,
+                    &mut pending_edges,
+                )?
+            } else {
+                self.push_frontier(
+                    &current,
+                    valid_at,
+                    predicate,
+                    &mut visited,
+                    &tracker,
+                    &mut pending_edges,
+                )?
+            };
+
             tracker.add_edges(pending_edges)?;
             pending_edges = 0;
             next.sort_unstable();
@@ -504,14 +584,131 @@ impl TemporalCSR {
             tracker.record_frontier(next.len())?;
             tracker.add_rows(next.len() as u64)?;
             let mem = visited.memory_bytes()
-                + (next.len() as u64) * std::mem::size_of::<u64>() as u64
-                + (current.len() as u64) * std::mem::size_of::<u64>() as u64;
+                + in_frontier.memory_bytes()
+                + (next.len() as u64 + current.len() as u64) * std::mem::size_of::<u64>() as u64;
             tracker.check_memory(mem)?;
             frontiers.push(UInt64Array::from(next.clone()));
             current = next;
         }
         let stats = tracker.stats(frontiers.len());
         Ok(KhopResult { frontiers, stats })
+    }
+
+    /// Push step: expand `current` edge by edge into the next frontier.
+    #[allow(clippy::too_many_arguments)]
+    fn push_frontier(
+        &self,
+        current: &[u64],
+        valid_at: i64,
+        predicate: Option<&dyn EdgePredicate>,
+        visited: &mut VisitedSet,
+        tracker: &BudgetTracker,
+        pending_edges: &mut u64,
+    ) -> Result<Vec<u64>> {
+        let mut next: Vec<u64> = Vec::new();
+        for &s in current {
+            for nb in self.neighbors(s, valid_at)? {
+                *pending_edges += 1;
+                if *pending_edges >= 4096 {
+                    tracker.add_edges(*pending_edges)?;
+                    *pending_edges = 0;
+                    tracker.check_time()?;
+                }
+                if let Some(p) = predicate {
+                    if !p.keep(&nb) {
+                        continue;
+                    }
+                }
+                if visited.mark(nb.dst) {
+                    next.push(nb.dst);
+                }
+            }
+        }
+        Ok(next)
+    }
+
+    /// Pull step: scan every unvisited node and stop at its first in-neighbour
+    /// that is in `current` (requires the transposed graph).
+    #[allow(clippy::too_many_arguments)]
+    fn pull_frontier(
+        &self,
+        reverse: &TemporalCSR,
+        current: &[u64],
+        valid_at: i64,
+        predicate: Option<&dyn EdgePredicate>,
+        visited: &mut VisitedSet,
+        in_frontier: &mut VisitedSet,
+        tracker: &BudgetTracker,
+        pending_edges: &mut u64,
+    ) -> Result<Vec<u64>> {
+        in_frontier.reset();
+        for &s in current {
+            in_frontier.mark(s);
+        }
+        let mut next: Vec<u64> = Vec::new();
+        for u in 0..self.node_count as u64 {
+            if visited.seen(u) {
+                continue;
+            }
+            for nb in reverse.neighbors(u, valid_at)? {
+                *pending_edges += 1;
+                if *pending_edges >= 4096 {
+                    tracker.add_edges(*pending_edges)?;
+                    *pending_edges = 0;
+                    tracker.check_time()?;
+                }
+                // `nb.dst` is the original source; must be in the frontier.
+                if !in_frontier.seen(nb.dst) {
+                    continue;
+                }
+                // Evaluate the predicate on the forward edge (src=nb.dst -> dst=u).
+                let edge = Neighbor {
+                    dst: u,
+                    edge_type: nb.edge_type,
+                    valid_from: nb.valid_from,
+                    valid_to: nb.valid_to,
+                };
+                if let Some(p) = predicate {
+                    if !p.keep(&edge) {
+                        continue;
+                    }
+                }
+                visited.mark(u);
+                next.push(u);
+                break;
+            }
+        }
+        Ok(next)
+    }
+
+    /// Build the transposed (reverse) CSR: every edge `s -> d` becomes `d -> s`
+    /// with the same `valid_from` / `valid_to` / `edge_type`. Used by the pull /
+    /// direction-optimizing traversal and as a general reverse-index primitive.
+    pub fn transpose(&self) -> Result<TemporalCSR> {
+        let n = self.dst.len();
+        let mut src = Vec::with_capacity(n);
+        let mut dst = Vec::with_capacity(n);
+        let mut vf = Vec::with_capacity(n);
+        let mut vt = Vec::with_capacity(n);
+        let mut et = Vec::with_capacity(n);
+        for s in 0..self.node_count {
+            let (a, b) = self.edge_range(s as u64)?;
+            for e in a..b {
+                src.push(self.dst[e]);
+                dst.push(s as u64);
+                vf.push(self.valid_from[e]);
+                vt.push(self.valid_to[e]);
+                et.push(self.edge_type[e]);
+            }
+        }
+        TemporalCSR::from_arrays(
+            &UInt64Array::from(src),
+            &UInt64Array::from(dst),
+            &TimestampNanosecondArray::from(vf),
+            &TimestampNanosecondArray::from(vt),
+            &UInt16Array::from(et),
+            self.node_count,
+        )
     }
 }
 
@@ -885,5 +1082,98 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(err, GtvError::HighDegreeNode { .. }));
+    }
+
+    // ---- B1-3b: direction-optimizing BFS ----------------------------------
+
+    #[test]
+    fn transpose_reverses_edges() {
+        let csr = cyclic();
+        let rev = csr.transpose().unwrap();
+        // 0 -> 1 exists in the forward graph, so 1 -> 0 exists in the reverse.
+        let fwd: Vec<u64> = csr.neighbors(0, 0).unwrap().map(|n| n.dst).collect();
+        assert_eq!(fwd, vec![1]);
+        let back: Vec<u64> = rev.neighbors(1, 0).unwrap().map(|n| n.dst).collect();
+        assert_eq!(back, vec![0]);
+    }
+
+    #[test]
+    fn pull_and_auto_match_push() {
+        let (csr, _) = random_csr(64, 4_000, 0xBEEF);
+        let rev = csr.transpose().unwrap();
+        let seeds = UInt64Array::from(vec![0u64, 1, 2, 3, 4, 5]);
+        let budget = TraversalBudget::unlimited();
+        let push = csr
+            .khop_directed(&seeds, 4, 5_000, &budget, None, None, None, DirectionMode::Push)
+            .unwrap();
+        let pull = csr
+            .khop_directed(
+                &seeds,
+                4,
+                5_000,
+                &budget,
+                None,
+                None,
+                Some(&rev),
+                DirectionMode::Pull,
+            )
+            .unwrap();
+        let auto = csr
+            .khop_directed(
+                &seeds,
+                4,
+                5_000,
+                &budget,
+                None,
+                None,
+                Some(&rev),
+                DirectionMode::Auto,
+            )
+            .unwrap();
+        let fronts = |r: &KhopResult| -> Vec<Vec<u64>> {
+            r.frontiers.iter().map(|a| a.values().to_vec()).collect()
+        };
+        assert_eq!(fronts(&push), fronts(&pull));
+        assert_eq!(fronts(&push), fronts(&auto));
+    }
+
+    #[test]
+    fn pull_honours_predicate_on_forward_edge() {
+        // 2 -> 3 has edge_type 2; reverse pull from seed 2 must respect it.
+        let csr = cyclic();
+        let rev = csr.transpose().unwrap();
+        let pred = |nb: &Neighbor| nb.edge_type == 2;
+        let pred: &dyn EdgePredicate = &pred;
+        let r = csr
+            .khop_directed(
+                &UInt64Array::from(vec![2u64]),
+                1,
+                0,
+                &TraversalBudget::unlimited(),
+                Some(pred),
+                None,
+                Some(&rev),
+                DirectionMode::Pull,
+            )
+            .unwrap();
+        assert_eq!(r.frontiers[0].values().as_ref(), &[3u64]);
+    }
+
+    #[test]
+    fn pull_requires_reverse() {
+        let csr = cyclic();
+        let err = csr
+            .khop_directed(
+                &UInt64Array::from(vec![0u64]),
+                2,
+                0,
+                &TraversalBudget::unlimited(),
+                None,
+                None,
+                None,
+                DirectionMode::Pull,
+            )
+            .unwrap_err();
+        assert!(matches!(err, GtvError::InvalidArgument(_)));
     }
 }
