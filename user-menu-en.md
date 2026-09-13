@@ -334,6 +334,8 @@ neighbors <node> [T]       khop <node> <k> [T] [--max-edges N] [--max-frontier N
 mavg <n> | msum <n> | deltas
 asof [t ...]               knn <node> [k] [--mask ids]
 knn_from <name> <table> [dim] [metric]   # metric = l2 (default) | cosine | dot
+embedding_register <name> <table>        # register a standard (governed) embedding table
+embedding_build <name> <root> <table> [type] [metric]   # governed index (flat|ivf|hnsw)
 save <table> <path>        load <table> <path>
 loadcsv <table> <path>     bgload <table> <path> [ms]
 LOAD CSV '<path>' INTO <table>          doc-style CSV import (alias of loadcsv)
@@ -369,6 +371,7 @@ khop(src, k, valid_at[, max_hops, max_edges])   # resource-bounded k-hop BFS: vi
                                                 # returns (hop, dst); over-budget -> BudgetExceeded
 crm_alloc('loan_exposure','collateral','guarantee','collateral_edges','guarantee_edges','BASE',T[, 'ead'])  # per-loan CRM cover (§8)
 crm_audit('loan_exposure','collateral','guarantee','collateral_edges','guarantee_edges','BASE',T[, 'ead'])  # audit trail (§8)
+embedding_search(name, q, k [, tenant [, as_of]])  # governed vector search: provenance + tenant + expiry (§12)
 metrics                              # engine counters (see above)
 ```
 
@@ -641,3 +644,41 @@ Behaviour notes:
   `ann(name, query, k [, metric])` function. Versions swap atomically through
   `CURRENT`, supporting shadow builds, atomic swap and rollback; a container or
   payload checksum mismatch refuses to load.
+
+---
+
+## 12. Governed embedding search (prod_p2 B2-4)
+
+A standard embedding table (`gtv-catalog::embedding_schema`) carries provenance
+and lifecycle on every row:
+
+```text
+entity_id, embedding: FixedSizeList<Float32>[dim],
+model_id, model_version, tokenizer_version, dimension,
+distance_metric, normalized, created_at,
+effective_from, effective_to, source_hash,
+feature_version, tenant_id, classification
+```
+
+- **`embedding_register <name> <table>`** registers a governed collection from
+  a session table. Registration validates that the `dimension` column matches
+  the `FixedSizeList` length, that a batch uses a single model / version / dim /
+  metric / normalized flag, that `source_hash` is non-empty and that
+  `effective_from <= effective_to`; violations are rejected outright (no silent
+  indexing).
+- **`embedding_search(name, q, k [, tenant [, as_of]])`** searches with `q` (a
+  comma-separated float vector, e.g. `'1.0,0.0'`) and returns
+  `(id, distance, model_id, model_version, source_hash, feature_version)`.
+  - `tenant` limits results to that tenant; `'*'` is an admin cross-tenant view;
+    omitted means no tenant filter. Queries never cross tenants otherwise.
+  - `as_of` keeps only rows with `effective_from <= as_of < effective_to` (a
+    null `effective_to` is open-ended), so expired embeddings are never hit.
+  - Distance is reported like `knn` / `ann` (L2 becomes Euclidean).
+- **`embedding_build <name> <root> <table> [type] [metric]`** runs the same
+  validation plus expiry/tenant filtering, then builds a `flat` / `ivf` / `hnsw`
+  index and persists it; a spec that disagrees with the data on dimension / model
+  / metric is refused. The manifest records `feature_version` and `normalized`,
+  so every hit is traceable to its model, source hash and feature version.
+- **Governance**: expiry, replacement and rebuild all go through the same
+  validation + `filter_active` choke point; any retrieval can list `model_id` /
+  `version` / `source_hash` / `feature_version` / `tenant_id`.

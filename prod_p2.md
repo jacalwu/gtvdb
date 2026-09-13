@@ -205,11 +205,11 @@ Risk/AML/ALM/FTP 結果無法重演或解釋。
 
 **驗收條件**
 
-- [ ] schema 層可驗 `dimension` 同 `FixedSizeList` 長度一致。
-- [ ] 混入不同 model / dim / metric 嘅向量 → 建索引時被拒。
-- [ ] 每個檢索結果可列出 model_id / version / source_hash / feature_version。
-- [ ] 支援 embedding 過期（effective_to）後唔再被檢索命中。
-- [ ] tenant_id 隔離：跨 tenant 查詢唔會互相命中（P0 最基本）。
+- [x] schema 層可驗 `dimension` 同 `FixedSizeList` 長度一致。
+- [x] 混入不同 model / dim / metric 嘅向量 → 建索引時被拒。
+- [x] 每個檢索結果可列出 model_id / version / source_hash / feature_version。
+- [x] 支援 embedding 過期（effective_to）後唔再被檢索命中。
+- [x] tenant_id 隔離：跨 tenant 查詢唔會互相命中（P0 最基本）。
 
 **風險**
 

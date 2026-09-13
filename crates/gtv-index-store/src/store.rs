@@ -35,6 +35,8 @@ pub struct IndexMeta {
     pub model_id: String,
     pub model_version: String,
     pub embedding_model: String,
+    pub feature_version: String,
+    pub normalized: bool,
     pub tombstone_count: u64,
 }
 
@@ -190,6 +192,8 @@ impl IndexStore {
             model_id: meta.model_id.clone(),
             model_version: meta.model_version.clone(),
             embedding_model: meta.embedding_model.clone(),
+            feature_version: meta.feature_version.clone(),
+            normalized: meta.normalized,
             dim: index.dim() as u32,
             metric: index.metric().as_str().to_string(),
             build_options: options.clone(),

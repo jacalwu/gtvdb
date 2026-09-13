@@ -329,6 +329,8 @@ neighbors <node> [T]       khop <node> <k> [T] [--max-edges N] [--max-frontier N
 mavg <n> | msum <n> | deltas
 asof [t ...]               knn <node> [k] [--mask ids]
 knn_from <name> <table> [dim] [metric]   # metric = l2（預設）| cosine | dot
+embedding_register <name> <table>        # 註冊標準 embedding 表（schema 驗證 + 治理）
+embedding_build <name> <root> <table> [type] [metric]   # 建構受治理向量索引（flat|ivf|hnsw）
 save <table> <path>        load <table> <path>
 loadcsv <table> <path>     bgload <table> <path> [ms]
 LOAD CSV '<path>' INTO <table>          doc-style CSV 匯入（loadcsv 的別名）
@@ -363,6 +365,7 @@ khop(src, k, valid_at[, max_hops, max_edges])   # 資源受限 k-hop BFS：visit
                                                 # 回傳 (hop, dst)；超出 budget 回 BudgetExceeded
 crm_alloc('loan_exposure','collateral','guarantee','collateral_edges','guarantee_edges','BASE',T[, 'ead'])  # 每筆貸款的 CRM 覆蓋（§8）
 crm_audit('loan_exposure','collateral','guarantee','collateral_edges','guarantee_edges','BASE',T[, 'ead'])  # 分配稽核紀錄（§8）
+embedding_search(name, q, k [, tenant [, as_of]])  # 受治理向量檢索：provenance + 租戶 + 過期過濾（§12）
 metrics                                        # 引擎計數器
 ```
 
@@ -611,3 +614,37 @@ JOIN loan_exposure l USING (loan_id);
   `index_load <name> <root> [version]` 載入後可用 SQL
   `ann(name, query, k [, metric])` 查詢。版本以 `CURRENT` 原子切換，支援
   shadow build、atomic swap 同 rollback；container 或 payload checksum 不符會拒絕載入。
+
+---
+
+## 12. 受治理 Embedding 檢索（prod_p2 B2-4）
+
+標準 embedding 表（`gtv-catalog::embedding_schema`）每一行都帶齊 provenance 同生命週期：
+
+```text
+entity_id, embedding: FixedSizeList<Float32>[dim],
+model_id, model_version, tokenizer_version, dimension,
+distance_metric, normalized, created_at,
+effective_from, effective_to, source_hash,
+feature_version, tenant_id, classification
+```
+
+- **`embedding_register <name> <table>`**：由 session 表註冊受治理 collection。
+  註冊時驗證 `dimension` 同 `FixedSizeList` 長度一致、同一批只准單一
+  model / version / dim / metric / normalized、`source_hash` 非空、
+  `effective_from <= effective_to`；唔符會明確拒絕（唔會靜默建索引）。
+- **`embedding_search(name, q, k [, tenant [, as_of]])`**：以 `q`（逗號分隔
+  float，e.g. `'1.0,0.0'`）檢索，回傳
+  `(id, distance, model_id, model_version, source_hash, feature_version)`。
+  - `tenant`：只回該租戶嘅向量；`'*'` = 管理員跨租戶檢視；省略 = 不加租戶
+    過濾。跨租戶**永遠唔會**互相命中。
+  - `as_of`：只回 `effective_from <= as_of < effective_to`（`effective_to`
+    為 null 代表長期有效）嘅向量，過期 embedding 唔會再被命中。
+  - distance 報告方式同 `knn` / `ann` 一致（L2 → 歐氏距離）。
+- **`embedding_build <name> <root> <table> [type] [metric]`**：先過同一套驗證
+  + 過期/租戶過濾，再建 `flat` / `ivf` / `hnsw` 索引並持久化；spec 同資料
+  dimension / model / metric 唔一致會被拒。manifest 會記錄
+  `feature_version` 同 `normalized`，令檢索結果可追溯模型、來源 hash、特徵版本。
+- **治理**：embedding 過期、替換、重建全部經同一條 validation + `filter_active`
+  choke point；任何檢索結果都可列出 `model_id` / `version` / `source_hash` /
+  `feature_version` / `tenant_id`。

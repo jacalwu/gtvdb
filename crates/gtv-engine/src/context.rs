@@ -16,6 +16,7 @@ use gtv_index::AnyIndex;
 
 use crate::hft_exec::{compile_hft, AsofResource, HftRegistry, KernelPlan, PitResource};
 use crate::knn::{KnnCollection, KnnTableFunction};
+use crate::embedding::{EmbeddingCollection, EmbeddingRegistry, EmbeddingSearchTableFunction};
 
 /// Options attached to a lineage-enabled execution.
 #[derive(Debug, Clone, Default)]
@@ -48,6 +49,8 @@ pub struct GtvContext {
     ctx: SessionContext,
     knn_collections: Arc<RwLock<HashMap<String, KnnCollection>>>,
     any_indexes: crate::ann::IndexRegistry,
+    /// Governed embedding collections (B2-4) for `embedding_search`.
+    embedding_collections: EmbeddingRegistry,
     /// Registered tables mapped to the catalog snapshot they were loaded from.
     table_sources: Arc<RwLock<HashMap<String, TableRef>>>,
     hft_reg: Arc<RwLock<HftRegistry>>,
@@ -92,6 +95,11 @@ impl GtvContext {
         let any_indexes: crate::ann::IndexRegistry = Arc::new(RwLock::new(HashMap::new()));
         ctx.register_udtf("ann", Arc::new(crate::ann::AnnTableFunction::new(any_indexes.clone())));
         ctx.register_udtf("ann_search", Arc::new(crate::ann::AnnTableFunction::new(any_indexes.clone())));
+        let embedding_collections: EmbeddingRegistry = Arc::new(RwLock::new(HashMap::new()));
+        ctx.register_udtf(
+            "embedding_search",
+            Arc::new(EmbeddingSearchTableFunction::new(embedding_collections.clone())),
+        );
         ctx.register_udtf("read_csv", Arc::new(crate::csv::ReadCsvTableFunction::new()));
         ctx.register_udtf("read_parquet", Arc::new(crate::csv::ReadParquetTableFunction::new()));
         ctx.register_udtf("read_yahoo", Arc::new(crate::yahoo::ReadYahooTableFunction::new()));
@@ -178,6 +186,7 @@ impl GtvContext {
             ctx,
             knn_collections,
             any_indexes,
+            embedding_collections,
             table_sources: Arc::new(RwLock::new(HashMap::new())),
             hft_reg,
         }
@@ -396,6 +405,22 @@ impl GtvContext {
     pub fn register_any_index(&self, name: &str, index: AnyIndex) {
         if let Ok(mut map) = self.any_indexes.write() {
             map.insert(name.to_string(), index);
+        }
+    }
+
+    /// Register a governed embedding batch (catalog standard schema) for
+    /// `embedding_search(name, query, k [, tenant [, as_of]])`. The batch is
+    /// validated (dimension / single model-metric / provenance) first.
+    pub fn register_embedding(&self, name: &str, batch: &RecordBatch) -> Result<()> {
+        let collection = EmbeddingCollection::from_batch(batch)?;
+        self.register_embedding_collection(name, collection);
+        Ok(())
+    }
+
+    /// Register an already-built [`EmbeddingCollection`].
+    pub fn register_embedding_collection(&self, name: &str, collection: EmbeddingCollection) {
+        if let Ok(mut map) = self.embedding_collections.write() {
+            map.insert(name.to_string(), collection);
         }
     }
 

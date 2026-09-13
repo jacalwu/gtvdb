@@ -11,6 +11,7 @@ pub mod context;
 pub mod csv;
 pub mod crm;
 pub mod datetime;
+pub mod embedding;
 pub mod graph;
 pub mod hft;
 pub mod hft_exec;
@@ -29,4 +30,5 @@ pub mod yahoo;
 mod expr_util;
 
 pub use context::{ExecutionOptions, GtvContext};
+pub use embedding::{EmbeddingCollection, EmbeddingHit, EmbeddingRegistry, EmbeddingSearchTableFunction};
 pub use lineage::{extract_udfs, ReplayError, ENGINE_VERSION, LINEAGE_TABLE};

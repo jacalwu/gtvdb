@@ -1027,6 +1027,97 @@ async fn run(
             );
             ctx.register_any_index(name, loaded.index);
         }
+        "embedding_register" => {
+            // embedding_register <name> <table>
+            let name = require_arg(&tokens, 1, "embedding_register <name> <table>")?;
+            let table = require_arg(&tokens, 2, "embedding_register <name> <table>")?;
+            let batches = ctx.sql(&format!("SELECT * FROM {table}")).await?;
+            let Some(first) = batches.first() else {
+                return Err(anyhow!("table `{table}` is empty"));
+            };
+            let all = concat_batches(&first.schema(), &batches)?;
+            ctx.register_embedding(name, &all)?;
+            let g = gtv_catalog::validate_embedding_batch(&all).map_err(|e| anyhow!("{e}"))?;
+            println!(
+                "registered embedding collection `{name}` ({}@{}, dim={}, metric={}, normalized={}, rows={})",
+                g.model_id,
+                g.model_version,
+                g.dimension,
+                g.distance_metric,
+                g.normalized,
+                all.num_rows()
+            );
+            println!("query: SELECT * FROM embedding_search('{name}', '<vec>', <k>, '<tenant>')");
+        }
+        "embedding_build" => {
+            // embedding_build <name> <root> <table> [type] [metric]
+            let name = require_arg(
+                &tokens,
+                1,
+                "embedding_build <name> <root> <table> [type] [metric]",
+            )?;
+            let root = require_arg(
+                &tokens,
+                2,
+                "embedding_build <name> <root> <table> [type] [metric]",
+            )?;
+            let table = require_arg(
+                &tokens,
+                3,
+                "embedding_build <name> <root> <table> [type] [metric]",
+            )?;
+            let type_str = optional_arg(&tokens, 4).unwrap_or("flat");
+
+            let batches = ctx.sql(&format!("SELECT * FROM {table}")).await?;
+            let Some(first) = batches.first() else {
+                return Err(anyhow!("table `{table}` is empty"));
+            };
+            let all = concat_batches(&first.schema(), &batches)?;
+            let g = gtv_catalog::validate_embedding_batch(&all).map_err(|e| anyhow!("{e}"))?;
+            let metric_str = optional_arg(&tokens, 5).unwrap_or(g.distance_metric.as_str());
+            let metric = Metric::parse(metric_str)
+                .ok_or_else(|| anyhow!("unknown metric `{metric_str}` (l2|cosine|dot)"))?;
+            let n = all.num_rows();
+            let options = match type_str.to_ascii_lowercase().as_str() {
+                "flat" => BuildOptions::Flat,
+                "ivf" => {
+                    let nlist = (n / 16).clamp(1, 256);
+                    let nprobe = (nlist / 4).max(1);
+                    BuildOptions::Ivf { nlist, nprobe }
+                }
+                "hnsw" => BuildOptions::Hnsw {
+                    m: 16,
+                    ef_construction: 100,
+                    ef_search: 100,
+                },
+                other => return Err(anyhow!("unknown index type `{other}` (flat|ivf|hnsw)")),
+            };
+            let spec = gtv_index_store::EmbeddingIndexSpec {
+                name: name.to_string(),
+                table: None,
+                corpus_snapshot_id: None,
+                model_id: g.model_id.clone(),
+                model_version: g.model_version.clone(),
+                feature_version: g.feature_version.clone(),
+                metric,
+                dim: g.dimension,
+                normalized: g.normalized,
+                build_options: options.clone(),
+            };
+            let store = gtv_index_store::IndexStore::open(root)?;
+            let (v, manifest) = gtv_index_store::build_and_save(
+                &store,
+                &spec,
+                &all,
+                gtv_catalog::schema::now_ns(),
+                None,
+            )
+            .map_err(|e| anyhow!("{e}"))?;
+            println!(
+                "saved embedding index `{name}` v{} (metric={}, dim={}, rows={}) to {root}",
+                v.version, manifest.metric, manifest.dim, manifest.row_count
+            );
+        }
         "hdb_save" => {
             // hdb_save <table> <date> [root] — persist a table to the HDB layout
             // (<root>/<date>/<table>/<symbol>.parquet, split by `symbol` if present).
@@ -2125,6 +2216,8 @@ fn print_help() {
          \x20 knn_from <name> <t> [d] [metric]  register a vector collection (id, v0..v{{d-1}}); metric=l2|cosine|dot\n\
          \x20 index_save <name> <root> <t> [type] [metric]  build+persist an index (flat|ivf|hnsw)\n\
          \x20 index_load <name> <root> [version]  load a persisted index for SQL `ann(...)`\n\
+         \x20 embedding_register <name> <table>  register a standard embedding table for embedding_search(...)\n\
+         \x20 embedding_build <name> <root> <table> [type] [metric]  build a governed index (flat|ivf|hnsw)\n\
          \x20 catalog               list persisted tables (GTV_HOME catalog)\n\
          \x20 lineage               list recorded executions (GTV_HOME)\n\
          \x20 lineage_run <sql>     execute + record lineage (execution_id, checksum)\n\

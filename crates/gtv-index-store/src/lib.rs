@@ -10,10 +10,12 @@
 //!   is switched atomically — enabling shadow builds, atomic swaps and rollback.
 
 pub mod container;
+pub mod embedding;
 pub mod manifest;
 pub mod store;
 
 pub use container::{decode, encode, CONTAINER_MAGIC, CONTAINER_VERSION};
+pub use embedding::{build_and_save, build_index_from_embeddings, EmbeddingIndexError, EmbeddingIndexSpec};
 pub use manifest::IndexManifest;
 pub use store::{IndexMeta, IndexStore, IndexVersion, LoadedIndex};
 

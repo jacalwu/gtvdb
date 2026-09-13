@@ -24,6 +24,12 @@ pub struct IndexManifest {
     pub model_version: String,
     #[serde(default)]
     pub embedding_model: String,
+    /// Feature-pipeline version that generated the embeddings (B2-4).
+    #[serde(default)]
+    pub feature_version: String,
+    /// Whether the indexed vectors were L2-normalized at build time (B2-4).
+    #[serde(default)]
+    pub normalized: bool,
     pub dim: u32,
     /// `l2` / `cosine` / `dot`.
     pub metric: String,

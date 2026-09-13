@@ -7,6 +7,7 @@
 //! here.
 
 pub mod error;
+pub mod embedding;
 pub mod id;
 pub mod lineage;
 pub mod manifest;
@@ -16,6 +17,10 @@ pub mod stats;
 pub mod store;
 
 pub use error::{CatalogError, Result};
+pub use embedding::{
+    active_entity_ids, embedding_schema, filter_active, read_embeddings, schema_dimension,
+    validate_embedding_batch, EmbeddingGovernance, EmbeddingProvenance, EMBEDDING_COLUMN,
+};
 pub use id::{CommitId, DataFileId, IndexId, SnapshotId, TableId};
 pub use lineage::{
     query_hash, ExecutionId, ExecutionRecord, IndexRef, ModelRef, TableRef, UdfRef,

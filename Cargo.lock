@@ -2045,6 +2045,7 @@ dependencies = [
 name = "gtv-index-store"
 version = "0.1.0"
 dependencies = [
+ "arrow",
  "blake3",
  "gtv-catalog",
  "gtv-core",

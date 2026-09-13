@@ -9,6 +9,7 @@ gtv-core = { path = "../gtv-core" }
 gtv-index = { path = "../gtv-index" }
 gtv-catalog = { path = "../gtv-catalog" }
 gtv-storage = { path = "../gtv-storage" }
+arrow.workspace = true
 blake3.workspace = true
 serde.workspace = true
 serde_json.workspace = true
