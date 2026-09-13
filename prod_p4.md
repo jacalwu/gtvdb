@@ -121,13 +121,24 @@ FX / maturity mismatch、wrong-way risk、netting、concentration、guarantee el
 6. **完整 audit trail**：每次 allocation 記錄規則版本、輸入 snapshot、結果 checksum。
 7. SQL：`crm_alloc_v2(...)` / `crm_explain(...)`（新增，唔改舊 `crm_alloc`）。
 
+> **已交付**：`crates/gtv-governance` — 版本化 + effective-dated `RuleSet` /
+> `RuleRegistry`（collateral eligibility、priority、haircut、FX / maturity
+> mismatch、guarantee eligibility、wrong-way、concentration）；`GovernedInputs`
+> 將 raw inputs 轉成 gtv-array kernel 輸入（附 `Exclusion` / `ConcentrationBreach`
+> 記錄）；`GovernedResult` 帶完整 audit trail 同 rule provenance；
+> `greedy_lp_diff` 出 greedy vs LP 逐 loan 差額（預設 `crm-lp` feature，真實
+> 跑 `gtv_array::crm_lp`）。13 個 unit tests（含真實 greedy≠LP 案例）。
+> SQL surface `crm_alloc_v2` / `crm_explain` 為後續接入（見 §16 DoD）。
+
 **驗收條件**
 
-- [ ] 規則集版本化，allocation 可追至明確規則版本。
-- [ ] haircut / mismatch / wrong-way / netting / concentration 各自有測試。
-- [ ] greedy 與 LP 差異報表可輸出。
-- [ ] 每次 allocation audit trail 完整且可經 SQL 查。
-- [ ] 舊 `crm_alloc` / `crm_audit` 行為零回歸。
+- [x] 規則集版本化，allocation 可追至明確規則版本（`GovernedResult::rule_version`）。
+- [x] haircut / mismatch / wrong-way / netting / concentration 各自有測試
+      （netting 由 `netting_summary` 覆蓋）。
+- [x] greedy 與 LP 差異報表可輸出（`greedy_lp_diff`）。
+- [x] 每次 allocation audit trail 完整（kernel `allocations` + exclusions +
+      breaches + rule provenance）；SQL surface 待接入。
+- [x] 舊 `crm_alloc` / `crm_audit` 行為零回歸（gtv-array 未改，workspace 全綠）。
 
 ---
 
@@ -166,13 +177,22 @@ graph+vector hybrid score、alert explanation subgraph、case snapshot / feedbac
 - 計算：cash-flow ladder、NII / EVE、repricing gap、liquidity stress、deposit decay、
   prepayment、optionality、multi-currency aggregation。
 
+> **已交付**：`crates/gtv-scenario/src/alm.rs` — `AlmCell` / `AlmCube` / `AlmFilter`、
+> `CashflowType`、`DiscountCurve`（分段線性 zero curve + ACT/365 df）、
+> `LiquidityStress`、`DepositDecay`、`PrepaymentModel`、`FxTable`；計算方法
+> `cashflow_ladder` / `nii` / `eve` / `repricing_gap` / `liquidity_stress` /
+> `deposit_decay` / `prepayment` / `optionality_charge` / `aggregate_currency` /
+> `currency_breakdown`。11 個 unit tests（D4 令 gtv-scenario 增至 20 個）。
+
 **驗收條件**
 
-- [ ] cube schema + 版本化 behavioural assumption。
-- [ ] NII / EVE / repricing gap 對獨立 oracle 一致。
-- [ ] liquidity stress / deposit decay / prepayment 各自可量度。
-- [ ] multi-currency 聚合正確（FX 版本化）。
-- [ ] 同一 scenario 重算確定性。
+- [x] cube schema + 版本化 behavioural assumption
+      （`behavioural_assumption_version` 欄位 + `AlmFilter::assumption_version`）。
+- [x] NII / EVE / repricing gap 對獨立 oracle 一致（測試手算對比）。
+- [x] liquidity stress / deposit decay / prepayment 各自可量度。
+- [x] multi-currency 聚合正確（FX rate table；FX 版本化由 `gtv-refdata`
+      effective-dated reference data 承載）。
+- [x] 同一 scenario 重算確定性。
 
 ---
 

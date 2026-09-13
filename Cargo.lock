@@ -2045,6 +2045,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "gtv-governance"
+version = "0.1.0"
+dependencies = [
+ "gtv-array",
+ "gtv-refdata",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "gtv-index"
 version = "0.1.0"
 dependencies = [

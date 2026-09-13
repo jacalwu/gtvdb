@@ -10,9 +10,14 @@
 //! inheritance / override resolution with provenance, and a deterministic
 //! diff for reconciliation.
 
+pub mod alm;
 pub mod catalog;
 pub mod scenario;
 
+pub use alm::{
+    AlmCell, AlmCube, AlmError, AlmFilter, CashflowType, DepositDecay, DiscountCurve, FxTable,
+    LiquidityStress, PrepaymentModel,
+};
 pub use catalog::ScenarioCatalog;
 pub use scenario::{
     Change, Dimension, Provenance, ResolvedScenario, ResolvedShock, Scenario, ScenarioDiff,

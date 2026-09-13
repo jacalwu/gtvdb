@@ -1,0 +1,22 @@
+[package]
+name = "gtv-governance"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# prod_p4 D2/D3 (roadmap P2.2 / P2.3): externalised, versioned CRM governance
+# rules, governed allocation with an audit trail, and greedy-vs-LP reconciliation.
+#
+# Enterprise-batch boundary: it depends on the analysis-engine *kernel*
+# (gtv-array) one-way, never the other way round (doc/prod_p4_design.md §1).
+
+[features]
+default = ["crm-lp"]
+# Enable the exact LP allocator (gtv-array/crm-lp) so the greedy-vs-LP
+# reconciliation report is real. Turn it off for a dependency-light build.
+crm-lp = ["gtv-array/crm-lp"]
+
+[dependencies]
+gtv-array = { path = "../gtv-array" }
+gtv-refdata = { path = "../gtv-refdata" }
+thiserror.workspace = true
