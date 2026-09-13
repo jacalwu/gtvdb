@@ -499,6 +499,29 @@ impl FsCatalog {
             .collect())
     }
 
+    /// All committed snapshots of a table, oldest first (append-only log order).
+    pub fn snapshots(&self, table: TableId) -> Result<Vec<Snapshot>> {
+        self.read_jsonl(&self.snapshots_path(table))
+    }
+
+    /// The newest snapshot committed at or before `system_ts` (system time).
+    ///
+    /// This is the catalog half of `AS OF SYSTEM TIME`: system time is versioned
+    /// by immutable snapshots, so the returned id pins exactly what the system
+    /// knew at `system_ts`.
+    pub fn snapshot_as_of(&self, table: TableId, system_ts: i64) -> Result<Option<SnapshotId>> {
+        let mut best: Option<Snapshot> = None;
+        for snap in self.snapshots(table)? {
+            if snap.created_at > system_ts {
+                continue;
+            }
+            if best.as_ref().map_or(true, |b| snap.created_at >= b.created_at) {
+                best = Some(snap);
+            }
+        }
+        Ok(best.map(|s| s.snapshot_id))
+    }
+
     fn find_by_key(&self, table: TableId, key: &str) -> Result<Option<SnapshotId>> {
         for snap in self.read_jsonl::<Snapshot>(&self.snapshots_path(table))? {
             if snap.summary.get("idempotency_key").and_then(|v| v.as_str()) == Some(key) {

@@ -744,3 +744,38 @@ planner 按 `selectivity = allowed / total` 揀五種策略之一：
   AnnConfig}`；`execute_ann` 回傳 `RerankResult { hits, approx_scores,
   exact_scores }` 同 `AnnTelemetry`（strategy、candidate / filtered count、
   latency 分解、reason）。
+
+---
+
+## 16. 雙時間軸模型（prod_p3 B3-2）
+
+每個 fact 可以帶兩條互相獨立嘅時間軸：**business time**（幾時為真）同
+**system time**（系統幾時知悉）。Temporal CSR 只索引 business time；system time
+交由不可變嘅 table version 處理，更正只會 append 新版本，永不覆寫歷史。
+
+- `gtv_core::BitemporalRange { business_from, business_to, system_from,
+  system_to }`（半開區間；`i64::MAX` = 無限期），提供 `contains`、
+  `business_overlaps`、`system_overlaps`、`overlaps`。
+- `bitemporal_edge_schema()` 喺 edge table 上加 `business_valid_from/to`、
+  `system_valid_from/to`、`event_time`、`ingest_time`、`business_date`，同時
+  **保留 legacy `valid_from/to` 欄位**，所以舊查詢結果不變。
+  `migrate_legacy_edges(batch, system_from)` 做升級（`business_* = valid_*`、
+  `system_from` 由 caller 指定、`system_to = MAX`）。
+- `gtv_storage::BitemporalStore` 保存 append-only 嘅 system version：
+  - `record(table, system_from, batches)` append 一個版本（同一 timestamp 重播
+    係 idempotent；舊版本永不改動）；
+  - `as_of_system(table, system_ts)` 重演「嗰時系統所知」；
+  - `as_of(table, business_ts, system_ts)` 兩軸合用；
+  - `overlaps(table, key_column)` 標出矛盾版本。
+- `gtv_catalog::FsCatalog::snapshot_as_of(table, system_ts)` 喺不可變 snapshot log
+  上解析同一個 system-time cut。
+- SQL（先用 `GtvContext::register_bitemporal_version` 註冊版本）：
+
+  ```sql
+  SELECT * FROM as_of('edges', 50, 1500);             -- business 50 @ system 1500
+  SELECT * FROM as_of('edges', 50);                   -- business 50 @ 最新已知
+  SELECT * FROM bitemporal_overlaps('edges', 'src');  -- 矛盾版本
+  ```
+
+  `as_of(table, business_ts [, system_ts])` 嘅 `system_ts` 預設為最新版本；當
+  business 時點唔喺任何區間內，會回傳一個 schema 正確嘅空結果。

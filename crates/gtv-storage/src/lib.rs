@@ -2,6 +2,7 @@
 //! time-travel store.
 
 pub mod atomic;
+pub mod bitemporal;
 pub mod cache;
 pub mod csv;
 pub mod error;
@@ -10,6 +11,7 @@ pub mod parquet;
 pub mod snapshot;
 
 pub use atomic::{fsync_dir, tmp_path, write_atomic, write_batch_atomic};
+pub use bitemporal::BitemporalStore;
 
 pub use cache::StaticCache;
 pub use csv::read_csv;

@@ -793,3 +793,40 @@ The planner picks one of five strategies from `selectivity = allowed / total`:
   AnnConfig}`; `execute_ann` returns `RerankResult { hits, approx_scores,
   exact_scores }` plus `AnnTelemetry` (strategy, candidate / filtered counts,
   latency breakdown, reason).
+
+---
+
+## 16. Bitemporal time model (prod_p3 B3-2)
+
+Every fact can carry two independent time axes: **business time** (when it is
+true) and **system time** (when the system knew it). The temporal CSR keeps
+indexing business time only; system time is versioned by immutable table
+versions, so a correction appends a new version instead of overwriting history.
+
+- `gtv_core::BitemporalRange { business_from, business_to, system_from,
+  system_to }` (half-open; `i64::MAX` = open-ended) with `contains`,
+  `business_overlaps`, `system_overlaps` and `overlaps`.
+- `bitemporal_edge_schema()` extends the edge table with
+  `business_valid_from/to`, `system_valid_from/to`, `event_time`, `ingest_time`
+  and `business_date` while **keeping the legacy `valid_from/to` columns**, so
+  old queries are unchanged. `migrate_legacy_edges(batch, system_from)` performs
+  the upgrade (`business_* = valid_*`, given `system_from`, `system_to = MAX`).
+- `gtv_storage::BitemporalStore` holds append-only system versions:
+  - `record(table, system_from, batches)` appends a version (re-recording the
+    same timestamp is idempotent; older versions are never mutated);
+  - `as_of_system(table, system_ts)` replays "what the system knew at";
+  - `as_of(table, business_ts, system_ts)` combines both axes;
+  - `overlaps(table, key_column)` flags contradictory versions.
+- `gtv_catalog::FsCatalog::snapshot_as_of(table, system_ts)` resolves the same
+  system-time cut over the immutable snapshot log.
+- SQL (register versions with `GtvContext::register_bitemporal_version`):
+
+  ```sql
+  SELECT * FROM as_of('edges', 50, 1500);             -- business 50 @ system cut 1500
+  SELECT * FROM as_of('edges', 50);                   -- business 50 @ latest known
+  SELECT * FROM bitemporal_overlaps('edges', 'src');  -- contradictory versions
+  ```
+
+  `as_of(table, business_ts [, system_ts])` defaults `system_ts` to the latest
+  version and returns a schema-typed empty result when the business instant is
+  outside every interval.

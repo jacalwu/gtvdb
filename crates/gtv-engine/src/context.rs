@@ -51,6 +51,8 @@ pub struct GtvContext {
     any_indexes: crate::ann::IndexRegistry,
     /// Governed embedding collections (B2-4) for `embedding_search`.
     embedding_collections: EmbeddingRegistry,
+    /// Bitemporal system-time versions for `as_of` (B3-2).
+    bitemporal: crate::bitemporal::BitemporalRegistry,
     /// Registered tables mapped to the catalog snapshot they were loaded from.
     table_sources: Arc<RwLock<HashMap<String, TableRef>>>,
     hft_reg: Arc<RwLock<HftRegistry>>,
@@ -103,6 +105,19 @@ impl GtvContext {
         ctx.register_udtf(
             "embedding_search",
             Arc::new(EmbeddingSearchTableFunction::new(embedding_collections.clone())),
+        );
+        let bitemporal: crate::bitemporal::BitemporalRegistry =
+            Arc::new(RwLock::new(gtv_storage::BitemporalStore::new()));
+        let as_of = Arc::new(crate::bitemporal::BitemporalAsOfTableFunction::new(
+            bitemporal.clone(),
+        ));
+        ctx.register_udtf("as_of", as_of.clone());
+        ctx.register_udtf("bitemporal_as_of", as_of);
+        ctx.register_udtf(
+            "bitemporal_overlaps",
+            Arc::new(crate::bitemporal::BitemporalOverlapsTableFunction::new(
+                bitemporal.clone(),
+            )),
         );
         ctx.register_udtf("read_csv", Arc::new(crate::csv::ReadCsvTableFunction::new()));
         ctx.register_udtf("read_parquet", Arc::new(crate::csv::ReadParquetTableFunction::new()));
@@ -195,6 +210,7 @@ impl GtvContext {
             knn_collections,
             any_indexes,
             embedding_collections,
+            bitemporal,
             table_sources: Arc::new(RwLock::new(HashMap::new())),
             hft_reg,
         }
@@ -453,6 +469,31 @@ impl GtvContext {
         if let Ok(mut map) = self.embedding_collections.write() {
             map.insert(name.to_string(), collection);
         }
+    }
+
+    /// Append a system-time version of `table` for the bitemporal `as_of`
+    /// surface. Corrections append a new `system_from`; older versions stay
+    /// queryable.
+    pub fn register_bitemporal_version(
+        &self,
+        table: &str,
+        system_from: i64,
+        batches: Vec<RecordBatch>,
+    ) -> Result<()> {
+        self.bitemporal
+            .write()
+            .map_err(|_| {
+                datafusion::error::DataFusionError::Execution(
+                    "bitemporal registry poisoned".into(),
+                )
+            })?
+            .record(table, system_from, batches)
+            .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))
+    }
+
+    /// Shared bitemporal store (for the CLI / catalog wiring).
+    pub fn bitemporal_store(&self) -> crate::bitemporal::BitemporalRegistry {
+        self.bitemporal.clone()
     }
 
     /// Record which catalog snapshot a registered table was loaded from, so a

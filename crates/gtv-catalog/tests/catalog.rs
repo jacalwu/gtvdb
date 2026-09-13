@@ -83,6 +83,46 @@ fn commit_append_is_immutable_and_readable() {
 }
 
 #[test]
+fn snapshot_as_of_replays_system_time() {
+    let (cat, table) = fresh("sys_asof");
+    let s1 = cat
+        .commit(
+            table,
+            CommitOp::Append,
+            vec![NewFile::unpartitioned(batch(&[1], &[1.0], &[10]))],
+            &CommitOptions::default(),
+        )
+        .unwrap();
+    // Distinct system timestamps (commit `created_at` is wall-clock ns).
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    let s2 = cat
+        .commit(
+            table,
+            CommitOp::Append,
+            vec![NewFile::unpartitioned(batch(&[2], &[2.0], &[20]))],
+            &CommitOptions::default(),
+        )
+        .unwrap();
+
+    let snaps = cat.snapshots(table).unwrap();
+    assert_eq!(snaps.len(), 2);
+    assert_eq!(snaps[0].snapshot_id, s1);
+    assert_eq!(snaps[1].snapshot_id, s2);
+    let (t1, t2) = (snaps[0].created_at, snaps[1].created_at);
+    assert!(t1 < t2, "system timestamps must be ordered: {t1} !< {t2}");
+
+    // Before the first commit nothing was known; each cut pins its snapshot.
+    assert_eq!(cat.snapshot_as_of(table, t1 - 1).unwrap(), None);
+    assert_eq!(cat.snapshot_as_of(table, t1).unwrap(), Some(s1));
+    assert_eq!(cat.snapshot_as_of(table, t2 - 1).unwrap(), Some(s1));
+    assert_eq!(cat.snapshot_as_of(table, t2).unwrap(), Some(s2));
+    assert_eq!(cat.snapshot_as_of(table, i64::MAX).unwrap(), Some(s2));
+    // The old cut still resolves to the old snapshot's files.
+    assert_eq!(cat.files(table, s1).unwrap().len(), 1);
+    assert_eq!(cat.files(table, s2).unwrap().len(), 2);
+}
+
+#[test]
 fn overwrite_replaces_files() {
     let (cat, table) = fresh("overwrite");
     cat.commit(

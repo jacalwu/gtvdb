@@ -6,6 +6,7 @@
 pub mod ann;
 pub mod asof;
 pub mod analytics;
+pub mod bitemporal;
 pub mod bt;
 pub mod context;
 pub mod csv;

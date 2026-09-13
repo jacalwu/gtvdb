@@ -104,11 +104,11 @@ late event、去重、replay、DLQ、backpressure。
 
 **驗收條件**
 
-- [ ] 可重演「當日收市時系統所知嘅資料」（system time 切片）。
-- [ ] 更正資料唔覆蓋歷史版本；兩個時間軸可獨立查詢。
-- [ ] Risk / ALM / FTP 結果可按原始 cutoff 重算。
-- [ ] bitemporal overlap 檢查可偵測同一 entity 嘅矛盾版本。
-- [ ] 舊資料（單時間軸）遷移後查詢結果不變。
+- [x] 可重演「當日收市時系統所知嘅資料」（system time 切片）。
+- [x] 更正資料唔覆蓋歷史版本；兩個時間軸可獨立查詢。
+- [x] Risk / ALM / FTP 結果可按原始 cutoff 重算。
+- [x] bitemporal overlap 檢查可偵測同一 entity 嘅矛盾版本。
+- [x] 舊資料（單時間軸）遷移後查詢結果不變。
 
 **風險**
 

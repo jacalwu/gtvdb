@@ -2098,6 +2098,7 @@ dependencies = [
  "arrow",
  "bytes",
  "chrono",
+ "gtv-core",
  "libc",
  "memmap2",
  "parquet",
