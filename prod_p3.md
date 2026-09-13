@@ -141,11 +141,11 @@ late event、去重、replay、DLQ、backpressure。
 
 **驗收條件**
 
-- [ ] 三種 selectivity 情境下，自適應策略嘅 recall / latency 優於固定策略（量度）。
-- [ ] `Exact` 模式結果與 FlatIndex 完全一致。
-- [ ] 每個查詢可輸出所用 strategy + candidate / filtered count + latency。
-- [ ] Recall@K 可持續量度（抽樣），並有 baseline 回歸測試。
-- [ ] filter 與 temporal predicate 可同時套用。
+- [x] 三種 selectivity 情境下，自適應策略嘅 recall / latency 優於固定策略（量度）。
+- [x] `Exact` 模式結果與 FlatIndex 完全一致。
+- [x] 每個查詢可輸出所用 strategy + candidate / filtered count + latency。
+- [x] Recall@K 可持續量度（抽樣），並有 baseline 回歸測試。
+- [x] filter 與 temporal predicate 可同時套用。
 
 **風險**
 

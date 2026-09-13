@@ -143,6 +143,12 @@ impl FlatIndex {
         &self.ids
     }
 
+    /// The stored vector for `id`, if present (used by exact rerank).
+    pub fn vector_for_id(&self, id: u64) -> Option<&[f32]> {
+        let pos = self.ids.iter().position(|&x| x == id)?;
+        Some(&self.data[pos * self.dim..(pos + 1) * self.dim])
+    }
+
     /// Serialize to the versioned `GFLATv1` format.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut w = Writer::with_capacity(16 + self.ids.len() * 8 + self.data.len() * 4);

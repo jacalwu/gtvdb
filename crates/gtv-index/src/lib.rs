@@ -6,12 +6,17 @@
 //! - [`IvfIndex`] — inverted-file index (coarse partition + exact `f32` probe scan).
 //! - [`HnswIndex`] — approximate Hierarchical Navigable Small World graph.
 
+pub mod ann;
 pub mod bytes;
 pub mod flat;
 pub mod hnsw;
 pub mod index;
 pub mod ivf;
 
+pub use ann::{
+    allowed_count, estimate_recall, execute_ann, plan_ann, recall_curve, AnnConfig, AnnPlan,
+    AnnStrategy, AnnTelemetry, LatencyBreakdown, RerankResult, RerankedHit,
+};
 pub use flat::FlatIndex;
 pub use hnsw::HnswIndex;
 pub use index::{AnyIndex, BuildOptions, IndexType, PersistableIndex};

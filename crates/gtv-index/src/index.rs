@@ -168,6 +168,42 @@ impl AnyIndex {
         }
     }
 
+    /// The stored vector for `id`, if present (exact-rerank accessor).
+    pub fn vector_for_id(&self, id: u64) -> Option<&[f32]> {
+        match self {
+            AnyIndex::Flat(i) => i.vector_for_id(id),
+            AnyIndex::Ivf(i) => i.vector_for_id(id),
+            AnyIndex::Hnsw(i) => i.vector_for_id(id),
+        }
+    }
+
+    /// The index's ids in the *filter-mask* order (the order of the ids the
+    /// index was built from). For Flat this is insertion order; for IVF it undoes
+    /// the cell reordering so a `BooleanArray` mask lines up with the internal
+    /// `orig_pos` domain.
+    pub fn ids(&self) -> Vec<u64> {
+        match self {
+            AnyIndex::Flat(i) => i.ids().to_vec(),
+            AnyIndex::Ivf(i) => i.mask_order_ids(),
+            AnyIndex::Hnsw(i) => i.ids().to_vec(),
+        }
+    }
+
+    /// Exact top-K (brute force / full probe) under an optional mask. This is
+    /// the oracle path used by the B3-3 `Exact` / `PreFilterExact` strategies.
+    pub fn exact_search(
+        &self,
+        query: &[f32],
+        k: usize,
+        mask: Option<&arrow::array::BooleanArray>,
+    ) -> Result<Vec<VectorHit>> {
+        match self {
+            AnyIndex::Flat(i) => i.search(query, k, mask),
+            AnyIndex::Ivf(i) => i.exact_search(query, k, mask),
+            AnyIndex::Hnsw(i) => i.brute_search(query, k, mask),
+        }
+    }
+
     /// Serialize the concrete index payload (no container header).
     pub fn to_bytes(&self) -> Vec<u8> {
         match self {

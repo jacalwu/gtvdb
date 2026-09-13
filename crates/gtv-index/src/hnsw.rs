@@ -714,20 +714,44 @@ impl HnswIndex {
         k: usize,
         mask: &BooleanArray,
     ) -> Result<Vec<VectorHit>> {
+        self.brute_search(query, k, Some(mask))
+    }
+
+    /// The stored vector for `id`, if present (used by exact rerank).
+    pub fn vector_for_id(&self, id: u64) -> Option<&[f32]> {
+        let pos = *self.pos_of.get(&id)?;
+        Some(self.vector(pos))
+    }
+
+    /// The node ids in storage order.
+    pub fn ids(&self) -> &[u64] {
+        &self.ids
+    }
+
+    /// Exact brute-force top-K over live nodes allowed by `mask` (B3-3 exact
+    /// scan / oracle path for HNSW).
+    pub fn brute_search(
+        &self,
+        query: &[f32],
+        k: usize,
+        mask: Option<&BooleanArray>,
+    ) -> Result<Vec<VectorHit>> {
         if query.len() != self.dim {
             return Err(GtvError::DimensionMismatch {
                 index: self.dim,
                 query: query.len(),
             });
         }
-        if mask.len() != self.ids.len() {
-            return Err(GtvError::InvalidArgument(
-                "filter mask length mismatch".into(),
-            ));
+        if let Some(m) = mask {
+            if m.len() != self.ids.len() {
+                return Err(GtvError::InvalidArgument(
+                    "filter mask length mismatch".into(),
+                ));
+            }
         }
         let query = self.prepare_query(query);
         let mut scored: Vec<(f32, u64)> = (0..self.ids.len())
-            .filter(|&i| mask.value(i) && !self.deleted[i])
+            .filter(|&i| !self.deleted[i] && mask.map_or(true, |m| m.value(i)))
             .map(|i| (self.dist(&query, self.vector(i as u32)), self.ids[i]))
             .collect();
         scored.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));

@@ -705,3 +705,42 @@ reconciliation（source/target row count 同 amount sum）。
   同掃描成本（probed rows），印出 recall/cost 曲線並揀出符合 target 嘅**最低成本**組合。
   table 需有 `id` + `v0..v{d-1}` 欄位（同 `index_save` 一致）。
 - API：`gtv_index::{kmeans_train, tune_ivf, tune_ivf_curve, select_tuned}`。
+
+---
+
+## 15. Filter-aware ANN + 精確 rerank（prod_p3 B3-3）
+
+`ann(...)` 新增兩個可選參數，將 metadata filter 同向量檢索結合，並控制執行策略：
+
+```text
+ann(name, query, k [, metric [, filter [, strategy]]])
+```
+
+- `filter` — 逗號分隔嘅 **id allow-list**（例如 `'1,7,42'`）；`'*'`、空或省略
+  代表「無 filter」。id 對應 index 自身嘅 id（同 `knn_from` / `index_save` 同一 domain）。
+- `strategy` — `auto`（預設）按 filter selectivity 分派；`exact` 強制精確 oracle
+  （監管 / 高風險）。未知值會被拒絕。
+
+planner 按 `selectivity = allowed / total` 揀五種策略之一：
+
+| selectivity | Flat / HNSW | IVF |
+|---|---|---|
+| `< 1%` | `pre_filter_exact` | `pre_filter_exact` |
+| `1–20%` | `oversampled_hnsw` | `filtered_ivf` |
+| `>= 20%` | `oversampled_hnsw` | `post_filter_rerank` |
+| `strategy='exact'` | `exact` | `exact` |
+
+- **精確 rerank**：ANN 候選（按 `k / selectivity * safety` 放大，有上限）會用原始
+  `f32` 向量重新計分，所以即使候選集係近似，回報嘅距離仍然精確。
+- **`ann_explain(name, query, k [, metric [, filter [, strategy]]])`** 回傳所選 plan
+  嘅一行 telemetry：
+
+  `strategy, oversample, exact_rerank, total_count, allowed_count, selectivity,
+   candidate_count, filtered_count, recall_estimate, filter_us, ann_us,
+   rerank_us, reason`
+
+  `recall_estimate` 會抽最多 16 條 corpus 向量對精確 oracle 量度（`Exact` ⇒ 1.0）。
+- Rust API：`gtv_index::{plan_ann, execute_ann, estimate_recall, recall_curve,
+  AnnConfig}`；`execute_ann` 回傳 `RerankResult { hits, approx_scores,
+  exact_scores }` 同 `AnnTelemetry`（strategy、candidate / filtered count、
+  latency 分解、reason）。

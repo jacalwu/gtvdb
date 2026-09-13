@@ -440,6 +440,43 @@ impl IvfIndex {
         })
     }
 
+    /// B3-3 `FilteredIvf`: probe at least `nprobe` cells, widening the probe set
+    /// (up to every cell) until at least `k` allowed candidates are found.
+    pub fn filtered_search(
+        &self,
+        query: &[f32],
+        k: usize,
+        filter_mask: Option<&BooleanArray>,
+    ) -> Result<Vec<VectorHit>> {
+        if query.len() != self.dim {
+            return Err(GtvError::DimensionMismatch {
+                index: self.dim,
+                query: query.len(),
+            });
+        }
+        if let Some(m) = filter_mask {
+            if m.len() != self.ids.len() {
+                return Err(GtvError::InvalidArgument(
+                    "filter mask length mismatch".into(),
+                ));
+            }
+        }
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        let mut probe = self.nprobe.min(self.nlist).max(1);
+        loop {
+            let hits = self.search_scored_probe(query, k, filter_mask, probe);
+            if hits.len() >= k || probe >= self.nlist {
+                return Ok(hits
+                    .into_iter()
+                    .map(|(distance, id)| VectorHit { id, distance })
+                    .collect());
+            }
+            probe = (probe * 2).min(self.nlist);
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.ids.len()
     }
@@ -462,6 +499,60 @@ impl IvfIndex {
 
     pub fn nprobe(&self) -> usize {
         self.nprobe
+    }
+
+    /// Zero-copy access to the (cell-ordered) vector ids.
+    pub fn ids(&self) -> &[u64] {
+        &self.ids
+    }
+
+    /// Ids in the *original input / filter-mask* order (undo the cell
+    /// reordering). The `BooleanArray` filter domain is the order of the ids
+    /// passed to the constructor, matching [`crate::FlatIndex`].
+    pub fn mask_order_ids(&self) -> Vec<u64> {
+        let n = self.ids.len();
+        let mut out = vec![0u64; n];
+        for p in 0..n {
+            out[self.orig_pos[p] as usize] = self.ids[p];
+        }
+        out
+    }
+
+    /// The stored vector for `id`, if present (used by exact rerank).
+    pub fn vector_for_id(&self, id: u64) -> Option<&[f32]> {
+        let pos = self.ids.iter().position(|&x| x == id)?;
+        Some(&self.data[pos * self.dim..(pos + 1) * self.dim])
+    }
+
+    /// B3-3: an exact scan over *every* cell (equivalent to `nprobe = nlist`),
+    /// used by the `PreFilterExact` / `Exact` strategies.
+    pub fn exact_search(
+        &self,
+        query: &[f32],
+        k: usize,
+        filter_mask: Option<&BooleanArray>,
+    ) -> Result<Vec<VectorHit>> {
+        if query.len() != self.dim {
+            return Err(GtvError::DimensionMismatch {
+                index: self.dim,
+                query: query.len(),
+            });
+        }
+        if let Some(m) = filter_mask {
+            if m.len() != self.ids.len() {
+                return Err(GtvError::InvalidArgument(
+                    "filter mask length mismatch".into(),
+                ));
+            }
+        }
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        Ok(self
+            .search_scored_probe(query, k, filter_mask, self.nlist)
+            .into_iter()
+            .map(|(distance, id)| VectorHit { id, distance })
+            .collect())
     }
 
     /// Reconstruct from raw (already-normalized) components, e.g. after loading
@@ -696,6 +787,18 @@ impl IvfIndex {
 
     /// Exact `f32` top-K over the `nprobe` nearest cells.
     fn search_scored(&self, query: &[f32], k: usize, mask: Option<&BooleanArray>) -> Vec<(f32, u64)> {
+        self.search_scored_probe(query, k, mask, self.nprobe)
+    }
+
+    /// Exact `f32` top-K over the `probe` nearest cells (B3-3 uses
+    /// `probe = nlist` for the exact-scan strategy).
+    fn search_scored_probe(
+        &self,
+        query: &[f32],
+        k: usize,
+        mask: Option<&BooleanArray>,
+        probe: usize,
+    ) -> Vec<(f32, u64)> {
         #[cfg(target_arch = "x86_64")]
         let use_simd =
             std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma");
@@ -706,7 +809,7 @@ impl IvfIndex {
         let metric = self.metric;
 
         // 1. Distance to every centroid, then keep the `nprobe` nearest.
-        let nprobe = self.nprobe.min(self.nlist);
+        let nprobe = probe.min(self.nlist);
         let mut cd: Vec<(f32, u32)> = (0..self.nlist)
             .map(|c| {
                 let row = &self.centroids[c * self.dim..(c + 1) * self.dim];

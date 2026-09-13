@@ -95,6 +95,10 @@ impl GtvContext {
         let any_indexes: crate::ann::IndexRegistry = Arc::new(RwLock::new(HashMap::new()));
         ctx.register_udtf("ann", Arc::new(crate::ann::AnnTableFunction::new(any_indexes.clone())));
         ctx.register_udtf("ann_search", Arc::new(crate::ann::AnnTableFunction::new(any_indexes.clone())));
+        ctx.register_udtf(
+            "ann_explain",
+            Arc::new(crate::ann::AnnExplainTableFunction::new(any_indexes.clone())),
+        );
         let embedding_collections: EmbeddingRegistry = Arc::new(RwLock::new(HashMap::new()));
         ctx.register_udtf(
             "embedding_search",

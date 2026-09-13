@@ -750,3 +750,46 @@ The `IvfIndex` coarse quantizer is upgraded from evenly-spaced sampling to
   picks the **cheapest** combination meeting the target. The table needs
   `id` + `v0..v{d-1}` columns (same shape as `index_save`).
 - API: `gtv_index::{kmeans_train, tune_ivf, tune_ivf_curve, select_tuned}`.
+
+---
+
+## 15. Filter-aware ANN + exact rerank (prod_p3 B3-3)
+
+`ann(...)` takes two extra optional arguments that combine a metadata filter with
+vector search and control the execution strategy:
+
+```text
+ann(name, query, k [, metric [, filter [, strategy]]])
+```
+
+- `filter` — a comma-separated **id allow-list** (e.g. `'1,7,42'`); `'*'`, empty
+  or omitted means "no filter". Ids match the index's own ids (same domain as
+  `knn_from` / `index_save`).
+- `strategy` — `auto` (default) dispatches on filter selectivity; `exact` forces
+  the exact oracle (regulatory / high-risk). Unknown values are rejected.
+
+The planner picks one of five strategies from `selectivity = allowed / total`:
+
+| selectivity | Flat / HNSW | IVF |
+|---|---|---|
+| `< 1%` | `pre_filter_exact` | `pre_filter_exact` |
+| `1–20%` | `oversampled_hnsw` | `filtered_ivf` |
+| `>= 20%` | `oversampled_hnsw` | `post_filter_rerank` |
+| `strategy='exact'` | `exact` | `exact` |
+
+- **Exact rerank**: ANN candidates (oversampled by `k / selectivity * safety`,
+  capped) are re-scored against the original `f32` vectors, so the reported
+  distance is exact even when the candidate set is approximate.
+- **`ann_explain(name, query, k [, metric [, filter [, strategy]]])`** returns one
+  row of telemetry for the chosen plan:
+
+  `strategy, oversample, exact_rerank, total_count, allowed_count, selectivity,
+   candidate_count, filtered_count, recall_estimate, filter_us, ann_us,
+   rerank_us, reason`
+
+  `recall_estimate` samples up to 16 corpus vectors against the exact oracle
+  (`Exact` ⇒ 1.0).
+- From Rust: `gtv_index::{plan_ann, execute_ann, estimate_recall, recall_curve,
+  AnnConfig}`; `execute_ann` returns `RerankResult { hits, approx_scores,
+  exact_scores }` plus `AnnTelemetry` (strategy, candidate / filtered counts,
+  latency breakdown, reason).
