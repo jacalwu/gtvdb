@@ -33,6 +33,8 @@ use crate::alm::{AlmCell, AlmCube, AlmFilter, CashflowType, DiscountCurve};
 pub enum IrrbbError {
     #[error("cash-flow vector length {got} does not match {expected} time bands")]
     ShapeMismatch { expected: usize, got: usize },
+    #[error("curve error: {0}")]
+    Curve(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -739,6 +741,250 @@ pub fn tdrr_bands(
     out
 }
 
+// ---------------------------------------------------------------------------
+// Automatic interest-rate option risk (KAO) — Black-76
+// ---------------------------------------------------------------------------
+
+/// Standard normal CDF.
+pub fn norm_cdf(x: f64) -> f64 {
+    0.5 * (1.0 + erf(x / std::f64::consts::SQRT_2))
+}
+
+/// Error function, Abramowitz & Stegun 7.1.26 (|error| <= 1.5e-7).
+fn erf(x: f64) -> f64 {
+    let sign = if x < 0.0 { -1.0 } else { 1.0 };
+    let x = x.abs();
+    let t = 1.0 / (1.0 + 0.3275911 * x);
+    let poly = ((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t
+        + 0.254829592)
+        * t;
+    sign * (1.0 - poly * (-x * x).exp())
+}
+
+/// Cap or floor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OptionKind {
+    Cap,
+    Floor,
+}
+
+/// A single caplet / floorlet on a forward rate over `[start_years, end_years)`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Caplet {
+    pub kind: OptionKind,
+    pub notional: f64,
+    pub strike: f64,
+    pub start_years: f64,
+    pub end_years: f64,
+    /// Black implied volatility (annualised).
+    pub volatility: f64,
+}
+
+impl Caplet {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        kind: OptionKind,
+        notional: f64,
+        strike: f64,
+        start_years: f64,
+        end_years: f64,
+        volatility: f64,
+    ) -> Self {
+        Self {
+            kind,
+            notional,
+            strike,
+            start_years,
+            end_years,
+            volatility,
+        }
+    }
+}
+
+/// Payer or receiver swaption.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SwaptionKind {
+    Payer,
+    Receiver,
+}
+
+/// A European swaption on a fixed-vs-float swap starting at `expiry_years`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Swaption {
+    pub kind: SwaptionKind,
+    pub notional: f64,
+    pub strike: f64,
+    pub expiry_years: f64,
+    /// Absolute payment times `T_1..T_n` (years) of the underlying swap.
+    pub payment_years: Vec<f64>,
+    pub volatility: f64,
+}
+
+/// Forward rate for `[start_years, end_years)` implied by a discount curve
+/// (ACT/365 simple forward).
+pub fn forward_rate(curve: &DiscountCurve, start_years: f64, end_years: f64) -> f64 {
+    let tau = end_years - start_years;
+    if tau <= 0.0 {
+        return 0.0;
+    }
+    let df_t = curve.df_years(start_years);
+    let df_u = curve.df_years(end_years);
+    if df_u <= 0.0 {
+        return 0.0;
+    }
+    (df_t / df_u - 1.0) / tau
+}
+
+/// Black-76 value of a caplet / floorlet (IR-1 §5.1.1 footnote 8).
+pub fn black_caplet(curve: &DiscountCurve, caplet: &Caplet) -> f64 {
+    let tau = caplet.end_years - caplet.start_years;
+    if tau <= 0.0 {
+        return 0.0;
+    }
+    let df = curve.df_years(caplet.start_years);
+    let forward = forward_rate(curve, caplet.start_years, caplet.end_years);
+    let k = caplet.strike;
+    let intrinsic = match caplet.kind {
+        OptionKind::Cap => (forward - k).max(0.0),
+        OptionKind::Floor => (k - forward).max(0.0),
+    };
+    let sigma = caplet.volatility;
+    let t = caplet.start_years;
+    let unit = if sigma <= 0.0 || t <= 0.0 || k <= 0.0 {
+        intrinsic
+    } else {
+        let sqrt_t = t.sqrt();
+        let d1 = ((forward / k).ln() + 0.5 * sigma * sigma * t) / (sigma * sqrt_t);
+        let d2 = d1 - sigma * sqrt_t;
+        match caplet.kind {
+            OptionKind::Cap => forward * norm_cdf(d1) - k * norm_cdf(d2),
+            OptionKind::Floor => k * norm_cdf(-d2) - forward * norm_cdf(-d1),
+        }
+    };
+    caplet.notional * tau * df * unit
+}
+
+/// Black-76 value of a European swaption.
+pub fn black_swaption(curve: &DiscountCurve, swaption: &Swaption) -> f64 {
+    if swaption.payment_years.is_empty() {
+        return 0.0;
+    }
+    let t = swaption.expiry_years;
+    let df_expiry = curve.df_years(t);
+    let mut annuity = 0.0;
+    let mut prev = t;
+    for &p in &swaption.payment_years {
+        annuity += (p - prev).max(0.0) * curve.df_years(p);
+        prev = p;
+    }
+    if annuity <= 0.0 {
+        return 0.0;
+    }
+    let df_end = curve.df_years(*swaption.payment_years.last().unwrap());
+    let swap_rate = (df_expiry - df_end) / annuity;
+    let k = swaption.strike;
+    let intrinsic = match swaption.kind {
+        SwaptionKind::Payer => (swap_rate - k).max(0.0),
+        SwaptionKind::Receiver => (k - swap_rate).max(0.0),
+    };
+    let sigma = swaption.volatility;
+    let unit = if sigma <= 0.0 || t <= 0.0 || k <= 0.0 {
+        intrinsic
+    } else {
+        let sqrt_t = t.sqrt();
+        let d1 = ((swap_rate / k).ln() + 0.5 * sigma * sigma * t) / (sigma * sqrt_t);
+        let d2 = d1 - sigma * sqrt_t;
+        match swaption.kind {
+            SwaptionKind::Payer => swap_rate * norm_cdf(d1) - k * norm_cdf(d2),
+            SwaptionKind::Receiver => k * norm_cdf(-d2) - swap_rate * norm_cdf(-d1),
+        }
+    };
+    swaption.notional * annuity * unit
+}
+
+/// A portfolio of automatic interest-rate options.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct OptionPortfolio {
+    pub caplets: Vec<Caplet>,
+    pub swaptions: Vec<Swaption>,
+}
+
+impl OptionPortfolio {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.caplets.is_empty() && self.swaptions.is_empty()
+    }
+
+    /// Net value of the options on `curve`, scaling every implied volatility by
+    /// `vol_scale`.
+    pub fn value(&self, curve: &DiscountCurve, vol_scale: f64) -> f64 {
+        let caplets: f64 = self
+            .caplets
+            .iter()
+            .map(|c| {
+                let mut scaled = c.clone();
+                scaled.volatility *= vol_scale;
+                black_caplet(curve, &scaled)
+            })
+            .sum();
+        let swaptions: f64 = self
+            .swaptions
+            .iter()
+            .map(|s| {
+                let mut scaled = s.clone();
+                scaled.volatility *= vol_scale;
+                black_swaption(curve, &scaled)
+            })
+            .sum();
+        caplets + swaptions
+    }
+}
+
+/// Apply an interest-rate shock scenario to a base curve, producing the
+/// post-shock risk-free curve used to revalue options (IR-1 §5.34.2).
+pub fn shift_curve(
+    base: &DiscountCurve,
+    scenario: ShockScenario,
+    params: ShockParams,
+    floor: f64,
+) -> Result<DiscountCurve, IrrbbError> {
+    let points: Vec<(i64, f64)> = base
+        .points()
+        .iter()
+        .map(|(days, rate)| {
+            let t = *days as f64 / 365.0;
+            (*days, post_shock_rate(*rate, scenario, params, t, floor))
+        })
+        .collect();
+    DiscountCurve::from_zero_rates(points).map_err(|e| IrrbbError::Curve(e.to_string()))
+}
+
+/// The automatic interest-rate option risk measure for one scenario
+/// (IR-1 §5.1.1):
+///
+/// ```text
+/// KAO_i,c = VAO_0,c − VAO_i,c
+/// ```
+///
+/// where `VAO_i,c` is the option portfolio revalued on the **shocked** curve
+/// with every implied volatility multiplied by **1.25** (a relative +25%
+/// increase). A positive result is a loss that adds to `ΔE_i,c`.
+pub fn option_risk_measure(
+    portfolio: &OptionPortfolio,
+    base: &DiscountCurve,
+    scenario: ShockScenario,
+    params: ShockParams,
+    floor: f64,
+) -> Result<f64, IrrbbError> {
+    let value_0 = portfolio.value(base, 1.0);
+    let shocked = shift_curve(base, scenario, params, floor)?;
+    let value_i = portfolio.value(&shocked, 1.25);
+    Ok(value_0 - value_i)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1080,5 +1326,128 @@ mod tests {
         assert!(approx(up[1], 88.0, 1e-9));
         let down = tdrr_bands(&td, 0.1, ShockScenario::ParallelDown); // u=0.8 -> 8%
         assert!(approx(down[0], 8.0, 1e-9));
+    }
+
+    #[test]
+    fn norm_cdf_matches_known_values() {
+        assert!(approx(norm_cdf(0.0), 0.5, 1e-7));
+        assert!(approx(norm_cdf(1.96), 0.9750, 1e-4));
+        assert!(approx(norm_cdf(-1.96), 0.0250, 1e-4));
+        assert!(approx(norm_cdf(1.0), 0.84134, 1e-4));
+        assert!(approx(norm_cdf(-1.0), 0.15866, 1e-4));
+    }
+
+    #[test]
+    fn black_caplet_satisfies_parity_and_reduces_to_intrinsic() {
+        let curve = DiscountCurve::flat(0.05);
+        let cap = Caplet::new(OptionKind::Cap, 1_000_000.0, 0.05, 1.0, 2.0, 0.20);
+        let floor = Caplet::new(OptionKind::Floor, 1_000_000.0, 0.05, 1.0, 2.0, 0.20);
+        let fwd = forward_rate(&curve, 1.0, 2.0);
+        let df = curve.df_years(1.0);
+        // cap - floor = N * tau * DF * (F - K)
+        let parity = black_caplet(&curve, &cap) - black_caplet(&curve, &floor);
+        assert!(approx(
+            parity,
+            1_000_000.0 * df * (fwd - 0.05),
+            1e-6
+        ));
+        // zero volatility -> intrinsic value
+        let itm = Caplet::new(OptionKind::Cap, 1_000_000.0, 0.04, 1.0, 2.0, 0.0);
+        assert!(approx(
+            black_caplet(&curve, &itm),
+            1_000_000.0 * df * (fwd - 0.04),
+            1e-6
+        ));
+        let otm = Caplet::new(OptionKind::Cap, 1_000_000.0, 0.06, 1.0, 2.0, 0.0);
+        assert_eq!(black_caplet(&curve, &otm), 0.0);
+    }
+
+    #[test]
+    fn shift_curve_applies_the_shock_and_the_floor() {
+        let curve = DiscountCurve::from_zero_rates(vec![(0, 0.02), (365 * 5, 0.04)]).unwrap();
+        let p = ShockParams::new(200.0, 300.0, 150.0);
+        let up = shift_curve(&curve, ShockScenario::ParallelUp, p, DEFAULT_RATE_FLOOR).unwrap();
+        assert!(approx(up.zero_rate(0), 0.04, 1e-9)); // +200bp
+        // floor: base 0%, parallel down 200bp -> -2%
+        let zero = DiscountCurve::flat(0.0);
+        let down = shift_curve(&zero, ShockScenario::ParallelDown, p, DEFAULT_RATE_FLOOR).unwrap();
+        assert!(approx(down.zero_rate(365), -0.02, 1e-12));
+    }
+
+    #[test]
+    fn option_risk_measure_signs_and_volatility_bump() {
+        let curve = DiscountCurve::flat(0.05);
+        let mut portfolio = OptionPortfolio::new();
+        portfolio
+            .caplets
+            .push(Caplet::new(OptionKind::Cap, 1_000_000.0, 0.05, 1.0, 2.0, 0.20));
+        let p = ShockParams::new(200.0, 300.0, 150.0);
+        // parallel down: the forward falls, the cap loses value -> KAO > 0 (loss)
+        let kao_down = option_risk_measure(
+            &portfolio,
+            &curve,
+            ShockScenario::ParallelDown,
+            p,
+            DEFAULT_RATE_FLOOR,
+        )
+        .unwrap();
+        assert!(kao_down > 0.0, "KAO should be a loss when rates fall");
+        // parallel up: the cap gains value -> KAO < 0
+        let kao_up = option_risk_measure(
+            &portfolio,
+            &curve,
+            ShockScenario::ParallelUp,
+            p,
+            DEFAULT_RATE_FLOOR,
+        )
+        .unwrap();
+        assert!(kao_up < 0.0, "KAO should be a gain when rates rise");
+        // the +25% volatility bump raises the option value on the same curve
+        assert!(portfolio.value(&curve, 1.25) > portfolio.value(&curve, 1.0));
+    }
+
+    #[test]
+    fn black_swaption_values_are_sane() {
+        let curve = DiscountCurve::flat(0.05);
+        let payer = Swaption {
+            kind: SwaptionKind::Payer,
+            notional: 1_000_000.0,
+            strike: 0.05,
+            expiry_years: 1.0,
+            payment_years: vec![2.0, 3.0, 4.0, 5.0, 6.0],
+            volatility: 0.20,
+        };
+        assert!(black_swaption(&curve, &payer) > 0.0);
+        let itm = Swaption {
+            strike: 0.04,
+            volatility: 0.0,
+            ..payer.clone()
+        };
+        assert!(black_swaption(&curve, &itm) > 0.0);
+        let otm = Swaption {
+            strike: 0.10,
+            volatility: 0.0,
+            ..payer
+        };
+        assert_eq!(black_swaption(&curve, &otm), 0.0);
+    }
+
+    #[test]
+    fn option_portfolio_combines_caplets_and_swaptions() {
+        let curve = DiscountCurve::flat(0.05);
+        let portfolio = OptionPortfolio {
+            caplets: vec![Caplet::new(OptionKind::Cap, 1_000_000.0, 0.04, 1.0, 2.0, 0.20)],
+            swaptions: vec![Swaption {
+                kind: SwaptionKind::Receiver,
+                notional: 500_000.0,
+                strike: 0.06,
+                expiry_years: 1.0,
+                payment_years: vec![2.0, 3.0, 4.0],
+                volatility: 0.15,
+            }],
+        };
+        let v = portfolio.value(&curve, 1.0);
+        assert!(v > 0.0);
+        assert_eq!(v, portfolio.value(&curve, 1.0));
     }
 }

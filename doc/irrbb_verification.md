@@ -31,7 +31,7 @@ CPR/TDRR 乘數），並以 BCBS 官方 worked example 做單元測試。餘下�
 | §5.1.1 | 19 時間帶及中點 t_k | ✅ `standard_time_bands` |
 | §5.1.1 | `ΔE(k)=CF0·exp(−r0·t_k) − CFi·exp(−ri·t_k)` | ✅ `standardised_eve_scenario` |
 | §5.1.1 | `ΔE_i,c=max(0, Σ_kΔE(k)+KAO)`、`ΔE=max_i Σ_c` | ✅ `aggregate_eve` |
-| §5.1.1 | KAO 期權風險（+25% 隱含波動） | ❌ 只有 `option_risk` 輸入參數，未接期權定價模型 |
+| §5.1.1 | KAO 期權風險（+25% 隱含波動） | ✅ `OptionPortfolio` + `option_risk_measure`（Black-76 caplet/floorlet/swaption） |
 | §5.1.2 | 按**最早重定價日** slot（本金＋coupon） | ✅ `cube_bands` / `slot_cells` / `nearest_band`（principal 按 repricing、coupon 按現金流日） |
 | §5.2.1 | 零售定息貸款 CPR：`min(1, γ_i·CPR_0)` | ✅ `cpr`（γ 乘數表） |
 | §5.2.1 | `CF_i(k)=CF_S(k)+CPR_i·NO_i(k−1)` | ✅ `prepayment_bands`（notional-outstanding 滾動） |
@@ -75,12 +75,21 @@ short +41.7bp、steepener +25.4bp、flattener −1.6bp，測試全部通過。
 ## 2. 期權風險 KAO（IR-1 §5.1.1）
 
 **條文**：`KAO_i,c = VAO_0,c − VAO_i,c`，其中 shock 情景期權淨值需用新曲線，
-並假設**隱含波動相對上升 25%**。
+並假設**隱含波動相對上升 25%**（footnote 8：可用 proprietary model）。
 
-**現狀**：`standardised_eve_scenario` 接受 `option_risk` 參數並正確加入 `ΔE_i,c`，
-但 `AlmCube::optionality_charge()` 只係把 `CashflowType::Optionality` 嘅金額求和，
-**唔係**期權重估。自動期權（caps/floors/swaptions）需要期權定價引擎（可用 D5
-`DiscountCurve` + Black 模型），目前未接。
+**實作**（Black-76）：
+- `black_caplet` / `black_swaption`（caplet/floorlet 同 payer/receiver swaption）；
+  `forward_rate` 由 `DiscountCurve` 的 DF 推導（ACT/365 simple forward）；
+  `norm_cdf` 用 A&S 7.1.26（誤差 ≤1.5e-7）。
+- `shift_curve`：把 shock 應用到曲線每一格（`post_shock_rate`，含 −2% floor）。
+- `OptionPortfolio::{caplets, swaptions}` + `value(curve, vol_scale)`。
+- `option_risk_measure(portfolio, base, scenario, params, floor)`：
+  `= value(base, 1.0) − value(shift_curve(...), 1.25)`，即 shock 曲線 + 隱含波動 +25%。
+- 可直接傳入 `standardised_eve_scenario(..., option_risk, ...)`。
+
+測試：put-call parity（`cap − floor = N·τ·DF·(F−K)`）、零波動退化為 intrinsic、
+curve shift 及 floor、KAO 符號（跌市 cap 虧損 → KAO>0；升市 → KAO<0）、
+swaption ATM/ITM 及組合。
 
 ---
 
@@ -247,11 +256,15 @@ MAS 的 IRRBB 要求見 **MAS Notice 653**（“Interest Rate Risk in the Bankin
 - **NMD / 行為現金流**：`NmdPortfolio` / `nmd_bands`、`prepayment_bands`、`tdrr_bands`。
 - **監管切換**：`Regulator::{Hkma,Mas}` + `shock_table(reporting_year)`（2026-01-01 前用
   d368 表、其後用 d578 重校準表）。
-- **16 個單元測試**，包括 BCBS d578 worked examples、HKD/USD/SGD 兩版 shock 表、
+- **期權風險 KAO**：`Caplet` / `Swaption` / `OptionPortfolio`、`black_caplet` /
+  `black_swaption` / `norm_cdf`、`forward_rate`、`shift_curve`、`option_risk_measure`
+  （shock 曲線 + 隱含波動 +25%）。
+- **22 個單元測試**，包括 BCBS d578 worked examples、HKD/USD/SGD 兩版 shock 表、
   19 帶中點、ΔE 公式手算對比、floor、NMD caps 及 slotting、γ/u 乘數、
-  prepayment/TDRR schedule、HKMA vs MAS 平行衝擊大小比較。
+  prepayment/TDRR schedule、HKMA vs MAS 平行衝擊大小比較、Black put-call parity、
+  KAO 符號、swaption 定價。
 
-`cargo test -p gtv-scenario`：**43 passed / 0 failed**（IRRBB 前 27 → +16）。
+`cargo test -p gtv-scenario`：**49 passed / 0 failed**（IRRBB 前 27 → +22）。
 
 ---
 
@@ -262,9 +275,9 @@ MAS 的 IRRBB 要求見 **MAS Notice 653**（“Interest Rate Risk in the Bankin
 2. ✅ **情景化現金流**：`prepayment_bands`（CPR + `NO(k−1)`）及 `tdrr_bands`。
 3. ✅ **NMD slotting**：`nmd_bands`（non-core O/N、core 按 caps 內平均行為期限）。
 4. ✅ **監管切換**：`Regulator::{Hkma,Mas}` + 2026 表切換。
+5. ✅ **KAO 期權定價**：Black-76 caplet/floorlet + swaption，shock 曲線 + 隱含波動 +25%。
 
 尚未完成：
-5. **KAO 期權定價**：用 D5 `DiscountCurve` + Black 模型，shock 曲線 + 隱含波動 +25%。
 6. **NII 情景**：parallel up/down 對重定價頭寸計 12 個月 ΔNII；加 §4.4.4 basis 情景。
 7. **Outlier 測試**：`ΔEVE > 15% × Tier1`。
 8. **風險無關折現**：`cube_bands` 已不讀 `discount_factor`；標準化 API 應在 doc/

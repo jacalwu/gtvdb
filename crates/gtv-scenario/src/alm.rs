@@ -432,6 +432,16 @@ impl DiscountCurve {
         }
     }
 
+    /// The `(days, zero rate)` grid points (ascending tenors).
+    pub fn points(&self) -> &[(i64, f64)] {
+        &self.points
+    }
+
+    /// Discount factor at `t_years`.
+    pub fn df_years(&self, t_years: f64) -> f64 {
+        self.df((t_years * 365.0).round() as i64)
+    }
+
     /// Zero rate at `days` (flat extrapolation at both ends).
     pub fn zero_rate(&self, days: i64) -> f64 {
         let days = days.max(0);
