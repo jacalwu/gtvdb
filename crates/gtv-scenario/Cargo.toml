@@ -1,0 +1,15 @@
+[package]
+name = "gtv-scenario"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# prod_p4 D1/D4/D5: versioned Risk / ALM / FTP scenario catalog.
+#
+# Enterprise-batch boundary: this crate is a *pure domain layer*. It does not
+# depend on gtv-engine / gtv-index / gtv-pattern, and those crates must never
+# depend on it. The analysis engine attaches to it through UDF / table-function
+# registration only (see doc/prod_p4_design.md §3).
+
+[dependencies]
+thiserror.workspace = true
