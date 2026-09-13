@@ -26,11 +26,16 @@ trap 'rm -rf "$TMP" /tmp/gtvdb_testcase/prices.parquet' EXIT
 run_one() {
   local script="$1"
   local out="$2"
+  # Drop the shell banner and catalog status chatter so the golden files only
+  # compare real command output. (Historically this was `tail -n +2`; the CLI
+  # later added a `catalog: …` line before the banner, which broke that
+  # assumption.)
+  local strip=(sed -e '/^gtv .*shell\./d' -e '/^catalog: /d')
   if [[ -n "$GTV_P5_CLIENT" ]]; then
     # P5 client hook: replay the script through the distributed endpoint.
-    $GTV_P5_CLIENT < "$script" | tail -n +2 > "$out"
+    $GTV_P5_CLIENT < "$script" | "${strip[@]}" > "$out"
   else
-    "$GTV_BIN" < "$script" 2>&1 | tail -n +2 > "$out"
+    "$GTV_BIN" < "$script" 2>&1 | "${strip[@]}" > "$out"
   fi
 }
 
