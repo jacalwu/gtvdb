@@ -1,6 +1,9 @@
 //! Integration tests for the versioned index store (B2-2).
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
 use gtv_core::{Metric, VectorIndex};
 use gtv_index::{AnyIndex, BuildOptions};
@@ -191,4 +194,63 @@ fn unknown_version_and_name_are_typed_errors() {
     store.save("x", &index, &BuildOptions::Flat, &meta()).unwrap();
     assert!(store.load("x", Some(99)).is_err());
     assert!(store.activate("x", 99).is_err());
+}
+
+/// B2-2: a shadow build + atomic swap must never break a live reader. Four
+/// reader threads hammer `load(name, None)` (always the active version) while
+/// v2 is built and `CURRENT` is swapped; every read must succeed and return
+/// either the old or the new row count.
+#[test]
+fn concurrent_readers_survive_shadow_swap() {
+    let tag = "concurrent";
+    let store = IndexStore::open(root(tag)).unwrap();
+    let (ids, vs) = vectors(64, 4, 1);
+    let v1 = AnyIndex::build(ids, vs, Metric::L2, &BuildOptions::Flat).unwrap();
+    store.save(tag, &v1, &BuildOptions::Flat, &meta()).unwrap();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let errors = Arc::new(AtomicUsize::new(0));
+    let reads = Arc::new(AtomicUsize::new(0));
+    let mut handles = Vec::new();
+    for _ in 0..4 {
+        let store = store.clone();
+        let stop = stop.clone();
+        let errors = errors.clone();
+        let reads = reads.clone();
+        handles.push(std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                match store.load(tag, None) {
+                    Ok(loaded) => {
+                        let n = loaded.manifest.row_count;
+                        if n != 64 && n != 96 {
+                            errors.fetch_add(1, Ordering::Relaxed);
+                        }
+                        if loaded.index.search(&[0.0f32; 4], 3, None).is_err() {
+                            errors.fetch_add(1, Ordering::Relaxed);
+                        }
+                        reads.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(_) => {
+                        errors.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        }));
+    }
+
+    // Shadow build v2, let readers observe v1, then atomically activate v2.
+    let (ids2, vs2) = vectors(96, 4, 2);
+    let v2 = AnyIndex::build(ids2, vs2, Metric::L2, &BuildOptions::Flat).unwrap();
+    store.build(tag, &v2, &BuildOptions::Flat, &meta()).unwrap();
+    std::thread::sleep(Duration::from_millis(20));
+    store.activate(tag, 2).unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    stop.store(true, Ordering::Relaxed);
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    assert!(reads.load(Ordering::Relaxed) > 0, "readers made progress");
+    assert_eq!(errors.load(Ordering::Relaxed), 0, "no reader was disrupted");
+    assert_eq!(store.current_version(tag).unwrap(), Some(2));
 }

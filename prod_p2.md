@@ -80,12 +80,12 @@ partition spec、file-level manifest、atomic commit、schema evolution。
 
 **驗收條件**
 
-- [ ] 斷電／中斷提交後重啟，讀者**只見到完整 committed snapshot**。
-- [ ] 同一批資料重播不產生重複 manifest entry（冪等）。
-- [ ] schema 升級後，舊分區仍可讀；不相容升級被拒並回明確錯誤。
-- [ ] 任意查詢結果可追溯至明確 file_id / schema_version / commit_id / source_offset。
-- [ ] 分區數目唔再隨 symbol 數量爆炸（用 hash_bucket / 可配置 spec 驗證）。
-- [ ] `catalog.tsv` legacy import 後所有表可正常 replay。
+- [x] 斷電／中斷提交後重啟，讀者**只見到完整 committed snapshot**。
+- [x] 同一批資料重播不產生重複 manifest entry（冪等）。
+- [x] schema 升級後，舊分區仍可讀；不相容升級被拒並回明確錯誤。
+- [x] 任意查詢結果可追溯至明確 file_id / schema_version / commit_id / source_offset。
+- [x] 分區數目唔再隨 symbol 數量爆炸（用 hash_bucket / 可配置 spec 驗證）。
+- [x] `catalog.tsv` legacy import 後所有表可正常 replay。
 
 **風險**
 
@@ -127,12 +127,12 @@ partition spec、file-level manifest、atomic commit、schema evolution。
 
 **驗收條件**
 
-- [ ] 重啟後無需逐筆 re-insert，直接 load snapshot 即可查詢。
-- [ ] 索引可由權威 embedding table（B2-4）+ corpus snapshot **完整重建**。
-- [ ] Shadow swap 期間查詢 P99 不中斷（併發壓測）。
-- [ ] load 被篡改檔案 → checksum 失敗並拒絕。
-- [ ] `IvfIndex` 至少有一條 SQL 查詢路徑，且回傳正確 Top-K。
-- [ ] rollback 後查詢結果 = 舊版本結果（確定性）。
+- [x] 重啟後無需逐筆 re-insert，直接 load snapshot 即可查詢。
+- [x] 索引可由權威 embedding table（B2-4）+ corpus snapshot **完整重建**。
+- [x] Shadow swap 期間查詢 P99 不中斷（併發壓測）。
+- [x] load 被篡改檔案 → checksum 失敗並拒絕。
+- [x] `IvfIndex` 至少有一條 SQL 查詢路徑，且回傳正確 Top-K。
+- [x] rollback 後查詢結果 = 舊版本結果（確定性）。
 
 **風險**
 
@@ -251,12 +251,15 @@ strategy_stats`，但**只係診斷，唔會阻止結果發布**，亦冇對賬�
 
 ## 7. 本批完成定義（Definition of Done）
 
-- [ ] B2-1 ~ B2-5 全部驗收條件通過。
-- [ ] 一個端到端 demo：`載入 → catalog 提交 → 建 embedding index → 查詢 →
-      lineage 記錄 → DQ gate → 按 execution_id 重演`。
-- [ ] `cargo test --workspace` 全綠；crash-injection 測試。
-- [ ] 文件：`doc/prod_p2_design.md`、操作手冊、catalog schema 文件。
-- [ ] 由 legacy `catalog.tsv` 可遷移，舊 CLI 行為不變。
+- [x] B2-1 ~ B2-5 全部驗收條件通過。
+- [x] 一個端到端 demo：`載入 → catalog 提交 → 建 embedding index → 查詢 →
+      lineage 記錄 → DQ gate → 按 execution_id 重演`
+      （`crates/gtv-cli/tests/prod_p2_e2e.rs`）。
+- [x] `cargo test --workspace` 全綠；crash-injection 測試
+      （`crates/gtv-catalog/tests/crash.rs`、index shadow-swap 併發壓測）。
+- [x] 文件：`doc/prod_p2_design.md`、操作手冊（`user-menu-{cn,en}.md`）、
+      catalog schema 文件（`doc/catalog_schema.md`）。
+- [x] 由 legacy `catalog.tsv` 可遷移，舊 CLI 行為不變。
 
 ---
 
