@@ -251,3 +251,119 @@ async fn master_get_explodes_attributes() {
         .unwrap();
     assert_eq!(none.iter().map(|b| b.num_rows()).sum::<usize>(), 0);
 }
+
+// ---------------------------------------------------------------------------
+// IRRBB config loaders (prod_p4 audit P0)
+// ---------------------------------------------------------------------------
+
+fn utf8(values: Vec<&str>) -> Arc<dyn Array> {
+    Arc::new(StringArray::from(values))
+}
+
+fn f64s(values: Vec<f64>) -> Arc<dyn Array> {
+    Arc::new(Float64Array::from(values))
+}
+
+#[test]
+fn irrbb_config_loaders_override_defaults() {
+    use gtv_scenario::{NmdCategory, ShockScenario, ShockTableVersion, IrrbbConfig};
+
+    let mut config = IrrbbConfig::default();
+
+    // scalar overrides
+    let scalars = batch(
+        Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("value", DataType::Float64, false),
+        ]),
+        vec![
+            utf8(vec!["floor", "vol_bump", "decay_divisor"]),
+            f64s(vec![-0.01, 1.5, 3.0]),
+        ],
+    );
+    let n = gtv_enterprise_sql::load::load_irrbb_scalars(&mut config, &[scalars]).unwrap();
+    assert_eq!(n, 3);
+    assert_eq!(config.floor, -0.01);
+    assert_eq!(config.vol_bump, 1.5);
+    assert_eq!(config.shock_formula.decay_divisor, 3.0);
+
+    // NMD caps (partial table keeps the other categories' defaults)
+    let caps = batch(
+        Schema::new(vec![
+            Field::new("category", DataType::Utf8, false),
+            Field::new("core_ratio_cap", DataType::Float64, false),
+            Field::new("maturity_cap_years", DataType::Float64, false),
+        ]),
+        vec![
+            utf8(vec!["non_retail"]),
+            f64s(vec![0.8]),
+            f64s(vec![2.0]),
+        ],
+    );
+    gtv_enterprise_sql::load::load_irrbb_nmd_caps(&mut config, &[caps]).unwrap();
+    assert_eq!(config.nmd_caps(NmdCategory::NonRetail).core_ratio_cap, 0.8);
+    assert_eq!(
+        config
+            .nmd_caps(NmdCategory::RetailTransactional)
+            .core_ratio_cap,
+        0.90
+    );
+
+    // scenario multipliers
+    let mults = batch(
+        Schema::new(vec![
+            Field::new("scenario", DataType::Utf8, false),
+            Field::new("cpr_gamma", DataType::Float64, false),
+            Field::new("tdrr_u", DataType::Float64, false),
+        ]),
+        vec![
+            utf8(vec!["parallel up"]),
+            f64s(vec![0.5]),
+            f64s(vec![1.5]),
+        ],
+    );
+    gtv_enterprise_sql::load::load_irrbb_scenario_multipliers(&mut config, &[mults]).unwrap();
+    assert_eq!(config.cpr_multiplier(ShockScenario::ParallelUp), 0.5);
+    assert_eq!(config.tdrr_multiplier(ShockScenario::ParallelUp), 1.5);
+
+    // time bands (loaded in arbitrary order -> sorted by midpoint)
+    let bands = batch(
+        Schema::new(vec![
+            Field::new("label", DataType::Utf8, false),
+            Field::new("start_years", DataType::Float64, false),
+            Field::new("end_years", DataType::Float64, false),
+            Field::new("midpoint_years", DataType::Float64, false),
+        ]),
+        vec![
+            utf8(vec!["1Y", "O/N"]),
+            f64s(vec![0.75, 0.0]),
+            f64s(vec![1.0, 0.0028]),
+            f64s(vec![0.875, 0.0028]),
+        ],
+    );
+    let n = gtv_enterprise_sql::load::load_irrbb_time_bands(&mut config, &[bands]).unwrap();
+    assert_eq!(n, 2);
+    assert_eq!(config.time_bands[0].label, "O/N");
+    assert_eq!(config.time_bands[1].label, "1Y");
+
+    // shock table
+    let shocks = batch(
+        Schema::new(vec![
+            Field::new("currency", DataType::Utf8, false),
+            Field::new("parallel_bps", DataType::Float64, false),
+            Field::new("short_bps", DataType::Float64, false),
+            Field::new("long_bps", DataType::Float64, false),
+        ]),
+        vec![
+            utf8(vec!["HKD"]),
+            f64s(vec![225.0]),
+            f64s(vec![375.0]),
+            f64s(vec![200.0]),
+        ],
+    );
+    let table =
+        gtv_enterprise_sql::load::load_shock_table(ShockTableVersion::Recalibrated2026, &[shocks])
+            .unwrap();
+    assert_eq!(table.params("HKD").parallel_bps, 225.0);
+    assert_eq!(table.params("MOP").short_bps, 375.0);
+}

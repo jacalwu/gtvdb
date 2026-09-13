@@ -85,6 +85,18 @@ impl ShockScenario {
             ShockScenario::ShortDown => "short_down",
         }
     }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().replace([' ', '-'], "_").as_str() {
+            "parallel_up" | "parallel" | "up" => Some(ShockScenario::ParallelUp),
+            "parallel_down" | "down" => Some(ShockScenario::ParallelDown),
+            "steepener" => Some(ShockScenario::Steepener),
+            "flattener" => Some(ShockScenario::Flattener),
+            "short_up" | "short" => Some(ShockScenario::ShortUp),
+            "short_down" => Some(ShockScenario::ShortDown),
+            _ => None,
+        }
+    }
 }
 
 /// Specified shock sizes for one currency, in basis points (IR-1 §5.34).
@@ -102,6 +114,127 @@ impl ShockParams {
             short_bps,
             long_bps,
         }
+    }
+}
+
+/// Coefficients of the six standardised shock parameterisations (IR-1 §5.34.1).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ShockFormula {
+    pub steepener_short: f64,
+    pub steepener_long: f64,
+    pub flattener_short: f64,
+    pub flattener_long: f64,
+    /// Decay denominator `x` in `exp(-t/x)` (4 for most currencies).
+    pub decay_divisor: f64,
+}
+
+impl Default for ShockFormula {
+    fn default() -> Self {
+        Self {
+            steepener_short: 0.65,
+            steepener_long: 0.9,
+            flattener_short: 0.8,
+            flattener_long: 0.6,
+            decay_divisor: 4.0,
+        }
+    }
+}
+
+/// Caps on the core proportion and average behavioural maturity of one NMD
+/// category (IR-1 §5.3.1).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NmdCaps {
+    pub core_ratio_cap: f64,
+    pub maturity_cap_years: f64,
+}
+
+/// All configurable IRRBB parameters.
+///
+/// `Default` reproduces the regulatory (HKMA IR-1 / BCBS d368+d578) values and
+/// every field can be overridden from configuration tables via the
+/// `load_irrbb_*` loaders. This is the single place the previously hardcoded
+/// constants live.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IrrbbConfig {
+    pub floor: f64,
+    pub vol_bump: f64,
+    pub shock_formula: ShockFormula,
+    pub nmd_caps: BTreeMap<NmdCategory, NmdCaps>,
+    pub cpr_multipliers: BTreeMap<ShockScenario, f64>,
+    pub tdrr_multipliers: BTreeMap<ShockScenario, f64>,
+    pub time_bands: Vec<TimeBand>,
+}
+
+impl Default for IrrbbConfig {
+    fn default() -> Self {
+        Self {
+            floor: DEFAULT_RATE_FLOOR,
+            vol_bump: 1.25,
+            shock_formula: ShockFormula::default(),
+            nmd_caps: [
+                (
+                    NmdCategory::RetailTransactional,
+                    NmdCaps {
+                        core_ratio_cap: 0.90,
+                        maturity_cap_years: 5.0,
+                    },
+                ),
+                (
+                    NmdCategory::RetailNonTransactional,
+                    NmdCaps {
+                        core_ratio_cap: 0.70,
+                        maturity_cap_years: 4.5,
+                    },
+                ),
+                (
+                    NmdCategory::NonRetail,
+                    NmdCaps {
+                        core_ratio_cap: 0.50,
+                        maturity_cap_years: 4.0,
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            cpr_multipliers: [
+                (ShockScenario::ParallelUp, 0.8),
+                (ShockScenario::ParallelDown, 1.2),
+                (ShockScenario::Steepener, 0.8),
+                (ShockScenario::Flattener, 1.2),
+                (ShockScenario::ShortUp, 0.8),
+                (ShockScenario::ShortDown, 1.2),
+            ]
+            .into_iter()
+            .collect(),
+            tdrr_multipliers: [
+                (ShockScenario::ParallelUp, 1.2),
+                (ShockScenario::ParallelDown, 0.8),
+                (ShockScenario::Steepener, 0.8),
+                (ShockScenario::Flattener, 1.2),
+                (ShockScenario::ShortUp, 1.2),
+                (ShockScenario::ShortDown, 0.8),
+            ]
+            .into_iter()
+            .collect(),
+            time_bands: standard_time_bands(),
+        }
+    }
+}
+
+impl IrrbbConfig {
+    pub fn nmd_caps(&self, category: NmdCategory) -> NmdCaps {
+        self.nmd_caps.get(&category).copied().unwrap_or(NmdCaps {
+            core_ratio_cap: 0.0,
+            maturity_cap_years: 0.0,
+        })
+    }
+
+    pub fn cpr_multiplier(&self, scenario: ShockScenario) -> f64 {
+        self.cpr_multipliers.get(&scenario).copied().unwrap_or(1.0)
+    }
+
+    pub fn tdrr_multiplier(&self, scenario: ShockScenario) -> f64 {
+        self.tdrr_multipliers.get(&scenario).copied().unwrap_or(1.0)
     }
 }
 
@@ -195,6 +328,21 @@ impl ShockTable {
         )
     }
 
+    /// Build a table from explicit `(currency, params)` rows (used by the
+    /// configuration-table loader).
+    pub fn from_params(
+        version: ShockTableVersion,
+        params: BTreeMap<String, ShockParams>,
+    ) -> Self {
+        Self {
+            version,
+            params: params
+                .into_iter()
+                .map(|(k, v)| (k.to_ascii_uppercase(), v))
+                .collect(),
+        }
+    }
+
     /// Shock sizes for `currency`; MOP follows HKD and unknown currencies fall
     /// back to 400 / 500 / 300 bps (IR-1 §5.34.3–5.34.4).
     pub fn params(&self, currency: &str) -> ShockParams {
@@ -226,15 +374,27 @@ impl ShockTable {
 /// short down    : -R_short*e^(-t/4)
 /// ```
 pub fn shock_delta_bps(scenario: ShockScenario, params: ShockParams, t_years: f64) -> f64 {
-    let decay = (-t_years / 4.0).exp();
+    shock_delta_bps_with(&ShockFormula::default(), scenario, params, t_years)
+}
+
+/// [`shock_delta_bps`] with configurable formula coefficients.
+pub fn shock_delta_bps_with(
+    formula: &ShockFormula,
+    scenario: ShockScenario,
+    params: ShockParams,
+    t_years: f64,
+) -> f64 {
+    let decay = (-t_years / formula.decay_divisor).exp();
     match scenario {
         ShockScenario::ParallelUp => params.parallel_bps,
         ShockScenario::ParallelDown => -params.parallel_bps,
         ShockScenario::Steepener => {
-            -0.65 * params.short_bps * decay + 0.9 * params.long_bps * (1.0 - decay)
+            -formula.steepener_short * params.short_bps * decay
+                + formula.steepener_long * params.long_bps * (1.0 - decay)
         }
         ShockScenario::Flattener => {
-            0.8 * params.short_bps * decay - 0.6 * params.long_bps * (1.0 - decay)
+            formula.flattener_short * params.short_bps * decay
+                - formula.flattener_long * params.long_bps * (1.0 - decay)
         }
         ShockScenario::ShortUp => params.short_bps * decay,
         ShockScenario::ShortDown => -params.short_bps * decay,
@@ -257,14 +417,26 @@ pub fn post_shock_rate(
     (r0 + delta).max(floor)
 }
 
+/// [`post_shock_rate`] using a configuration's shock formula and floor.
+pub fn post_shock_rate_with(
+    config: &IrrbbConfig,
+    r0: f64,
+    scenario: ShockScenario,
+    params: ShockParams,
+    t_years: f64,
+) -> f64 {
+    let delta = shock_delta_bps_with(&config.shock_formula, scenario, params, t_years) / 10_000.0;
+    (r0 + delta).max(config.floor)
+}
+
 // ---------------------------------------------------------------------------
 // Time bands
 // ---------------------------------------------------------------------------
 
 /// One prescribed time bucket (IR-1 §5.1.1 / d368 Table 1).
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TimeBand {
-    pub label: &'static str,
+    pub label: String,
     pub start_years: f64,
     pub end_years: f64,
     /// Midpoint in years used for discounting (`t_k`).
@@ -280,8 +452,8 @@ impl TimeBand {
 
 /// The 19 standardised time buckets and their midpoints (d368 Table 1).
 pub fn standard_time_bands() -> Vec<TimeBand> {
-    let b = |label, start_years, end_years, midpoint_years| TimeBand {
-        label,
+    let b = |label: &str, start_years, end_years, midpoint_years| TimeBand {
+        label: label.to_string(),
         start_years,
         end_years,
         midpoint_years,
@@ -370,6 +542,43 @@ pub fn standardised_eve_scenario(
     })
 }
 
+/// [`standardised_eve_scenario`] with the floor and shock formula taken from a
+/// [`IrrbbConfig`].
+#[allow(clippy::too_many_arguments)]
+pub fn standardised_eve_scenario_with(
+    config: &IrrbbConfig,
+    bands: &[TimeBand],
+    cf0: &[f64],
+    cf_shocked: &[f64],
+    base_zero: impl Fn(f64) -> f64,
+    scenario: ShockScenario,
+    params: ShockParams,
+    option_risk: f64,
+) -> Result<EveScenarioResult, IrrbbError> {
+    if cf0.len() != bands.len() || cf_shocked.len() != bands.len() {
+        return Err(IrrbbError::ShapeMismatch {
+            expected: bands.len(),
+            got: cf0.len().max(cf_shocked.len()),
+        });
+    }
+    let mut per_band = Vec::with_capacity(bands.len());
+    let mut total = 0.0;
+    for (k, band) in bands.iter().enumerate() {
+        let t = band.midpoint_years;
+        let r0 = base_zero(t);
+        let ri = post_shock_rate_with(config, r0, scenario, params, t);
+        let de = cf0[k] * (-r0 * t).exp() - cf_shocked[k] * (-ri * t).exp();
+        per_band.push(de);
+        total += de;
+    }
+    Ok(EveScenarioResult {
+        scenario,
+        per_band,
+        option_risk,
+        delta_eve: (total + option_risk).max(0.0),
+    })
+}
+
 /// The aggregate standardised EVE risk measure across the six scenarios:
 /// `max_i (Σ_c ΔE_i,c)` (IR-1 §5.1.1).
 pub fn aggregate_eve(per_scenario_currency_totals: &[f64]) -> f64 {
@@ -384,7 +593,7 @@ pub fn aggregate_eve(per_scenario_currency_totals: &[f64]) -> f64 {
 // ---------------------------------------------------------------------------
 
 /// NMD segmentation (IR-1 §5.3.1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum NmdCategory {
     RetailTransactional,
     RetailNonTransactional,
@@ -392,6 +601,27 @@ pub enum NmdCategory {
 }
 
 impl NmdCategory {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NmdCategory::RetailTransactional => "retail_transactional",
+            NmdCategory::RetailNonTransactional => "retail_non_transactional",
+            NmdCategory::NonRetail => "non_retail",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().replace([' ', '-'], "_").as_str() {
+            "retail_transactional" | "retail_transact" | "transactional" => {
+                Some(NmdCategory::RetailTransactional)
+            }
+            "retail_non_transactional" | "retail_nontransactional" | "non_transactional" => {
+                Some(NmdCategory::RetailNonTransactional)
+            }
+            "non_retail" | "nonretail" => Some(NmdCategory::NonRetail),
+            _ => None,
+        }
+    }
+
     /// `(cap on core proportion, cap on average maturity of core in years)`.
     pub fn caps(self) -> (f64, f64) {
         match self {
@@ -418,15 +648,25 @@ pub struct NmdSplit {
 /// deposits are treated as overnight; core deposits are slotted by their
 /// average behavioural maturity (≤ the category cap).
 pub fn split_nmd(total: f64, observed_core_ratio: f64, category: NmdCategory) -> NmdSplit {
-    let (cap_ratio, cap_maturity) = category.caps();
-    let core_ratio = observed_core_ratio.clamp(0.0, cap_ratio);
+    split_nmd_with(&IrrbbConfig::default(), total, observed_core_ratio, category)
+}
+
+/// [`split_nmd`] with the caps taken from a [`IrrbbConfig`].
+pub fn split_nmd_with(
+    config: &IrrbbConfig,
+    total: f64,
+    observed_core_ratio: f64,
+    category: NmdCategory,
+) -> NmdSplit {
+    let caps = config.nmd_caps(category);
+    let core_ratio = observed_core_ratio.clamp(0.0, caps.core_ratio_cap);
     let core = total * core_ratio;
     NmdSplit {
         total,
         core_ratio,
         core,
         non_core: total - core,
-        max_core_maturity_years: cap_maturity,
+        max_core_maturity_years: caps.maturity_cap_years,
     }
 }
 
@@ -446,7 +686,12 @@ pub fn prepayment_multiplier(scenario: ShockScenario) -> f64 {
 
 /// Scenario CPR: `min(1, γ_i · CPR_0)` (IR-1 §5.2.1).
 pub fn cpr(scenario: ShockScenario, baseline_cpr: f64) -> f64 {
-    (prepayment_multiplier(scenario) * baseline_cpr).min(1.0)
+    cpr_with(&IrrbbConfig::default(), scenario, baseline_cpr)
+}
+
+/// [`cpr`] with the `γ` multiplier taken from a [`IrrbbConfig`].
+pub fn cpr_with(config: &IrrbbConfig, scenario: ShockScenario, baseline_cpr: f64) -> f64 {
+    (config.cpr_multiplier(scenario) * baseline_cpr).min(1.0)
 }
 
 /// Term-deposit redemption-ratio multiplier `u_i` (IR-1 §5.2.2): 1.2 for
@@ -461,7 +706,12 @@ pub fn tdrr_multiplier(scenario: ShockScenario) -> f64 {
 
 /// Scenario TDRR: `min(1, u_i · TDRR_0)` (IR-1 §5.2.2).
 pub fn tdrr(scenario: ShockScenario, baseline_tdrr: f64) -> f64 {
-    (tdrr_multiplier(scenario) * baseline_tdrr).min(1.0)
+    tdrr_with(&IrrbbConfig::default(), scenario, baseline_tdrr)
+}
+
+/// [`tdrr`] with the `u` multiplier taken from a [`IrrbbConfig`].
+pub fn tdrr_with(config: &IrrbbConfig, scenario: ShockScenario, baseline_tdrr: f64) -> f64 {
+    (config.tdrr_multiplier(scenario) * baseline_tdrr).min(1.0)
 }
 
 /// Convenience: the current risk-free zero rate from a [`DiscountCurve`].
@@ -652,6 +902,43 @@ pub fn standardised_irrbb(
     })
 }
 
+/// [`standardised_irrbb`] with the time bands and floor taken from a
+/// [`IrrbbConfig`].
+#[allow(clippy::too_many_arguments)]
+pub fn standardised_irrbb_with(
+    config: &IrrbbConfig,
+    cube: &AlmCube,
+    filter: &AlmFilter,
+    base_zero: impl Fn(f64) -> f64,
+    table: &ShockTable,
+    currency: &str,
+    option_risk: f64,
+) -> Result<IrrbbResult, IrrbbError> {
+    let bands = &config.time_bands;
+    let cf = cube_bands(cube, bands, filter);
+    let params = table.params(currency);
+    let mut per_scenario = Vec::with_capacity(6);
+    for scenario in ShockScenario::ALL {
+        per_scenario.push(standardised_eve_scenario_with(
+            config,
+            bands,
+            &cf,
+            &cf,
+            &base_zero,
+            scenario,
+            params,
+            option_risk,
+        )?);
+    }
+    let totals: Vec<f64> = per_scenario.iter().map(|r| r.delta_eve).collect();
+    Ok(IrrbbResult {
+        aggregate: aggregate_eve(&totals),
+        per_scenario,
+        cf0: cf,
+        bands: bands.to_vec(),
+    })
+}
+
 // ---------------------------------------------------------------------------
 // NMD slotting
 // ---------------------------------------------------------------------------
@@ -673,7 +960,17 @@ pub struct NmdPortfolio {
 /// the band whose midpoint is closest to the (capped) average behavioural
 /// maturity (IR-1 §5.3.1).
 pub fn nmd_bands(portfolio: &NmdPortfolio, bands: &[TimeBand]) -> Vec<f64> {
-    let split = split_nmd(
+    nmd_bands_with(&IrrbbConfig::default(), portfolio, bands)
+}
+
+/// [`nmd_bands`] with the caps taken from a [`IrrbbConfig`].
+pub fn nmd_bands_with(
+    config: &IrrbbConfig,
+    portfolio: &NmdPortfolio,
+    bands: &[TimeBand],
+) -> Vec<f64> {
+    let split = split_nmd_with(
+        config,
         portfolio.total,
         portfolio.observed_core_ratio,
         portfolio.category,
@@ -708,7 +1005,22 @@ pub fn prepayment_bands(
     baseline_cpr: f64,
     scenario: ShockScenario,
 ) -> Vec<f64> {
-    let rate = cpr(scenario, baseline_cpr);
+    prepayment_bands_with(
+        &IrrbbConfig::default(),
+        scheduled_principal,
+        baseline_cpr,
+        scenario,
+    )
+}
+
+/// [`prepayment_bands`] with the `γ` multiplier taken from a [`IrrbbConfig`].
+pub fn prepayment_bands_with(
+    config: &IrrbbConfig,
+    scheduled_principal: &[f64],
+    baseline_cpr: f64,
+    scenario: ShockScenario,
+) -> Vec<f64> {
+    let rate = cpr_with(config, scenario, baseline_cpr);
     let mut out = vec![0.0; scheduled_principal.len()];
     let mut outstanding: f64 = scheduled_principal.iter().sum();
     for k in 0..scheduled_principal.len() {
@@ -728,7 +1040,17 @@ pub fn tdrr_bands(
     baseline_tdrr: f64,
     scenario: ShockScenario,
 ) -> Vec<f64> {
-    let rate = tdrr(scenario, baseline_tdrr);
+    tdrr_bands_with(&IrrbbConfig::default(), term_deposits, baseline_tdrr, scenario)
+}
+
+/// [`tdrr_bands`] with the `u` multiplier taken from a [`IrrbbConfig`].
+pub fn tdrr_bands_with(
+    config: &IrrbbConfig,
+    term_deposits: &[f64],
+    baseline_tdrr: f64,
+    scenario: ShockScenario,
+) -> Vec<f64> {
+    let rate = tdrr_with(config, scenario, baseline_tdrr);
     let mut out = vec![0.0; term_deposits.len()];
     for (k, td) in term_deposits.iter().enumerate() {
         if k == 0 {
@@ -962,6 +1284,24 @@ pub fn shift_curve(
     DiscountCurve::from_zero_rates(points).map_err(|e| IrrbbError::Curve(e.to_string()))
 }
 
+/// [`shift_curve`] using a configuration's shock formula and floor.
+pub fn shift_curve_with(
+    config: &IrrbbConfig,
+    base: &DiscountCurve,
+    scenario: ShockScenario,
+    params: ShockParams,
+) -> Result<DiscountCurve, IrrbbError> {
+    let points: Vec<(i64, f64)> = base
+        .points()
+        .iter()
+        .map(|(days, rate)| {
+            let t = *days as f64 / 365.0;
+            (*days, post_shock_rate_with(config, *rate, scenario, params, t))
+        })
+        .collect();
+    DiscountCurve::from_zero_rates(points).map_err(|e| IrrbbError::Curve(e.to_string()))
+}
+
 /// The automatic interest-rate option risk measure for one scenario
 /// (IR-1 §5.1.1):
 ///
@@ -982,6 +1322,21 @@ pub fn option_risk_measure(
     let value_0 = portfolio.value(base, 1.0);
     let shocked = shift_curve(base, scenario, params, floor)?;
     let value_i = portfolio.value(&shocked, 1.25);
+    Ok(value_0 - value_i)
+}
+
+/// [`option_risk_measure`] with the volatility bump, shock formula and floor
+/// taken from a [`IrrbbConfig`].
+pub fn option_risk_measure_with(
+    config: &IrrbbConfig,
+    portfolio: &OptionPortfolio,
+    base: &DiscountCurve,
+    scenario: ShockScenario,
+    params: ShockParams,
+) -> Result<f64, IrrbbError> {
+    let value_0 = portfolio.value(base, 1.0);
+    let shocked = shift_curve_with(config, base, scenario, params)?;
+    let value_i = portfolio.value(&shocked, config.vol_bump);
     Ok(value_0 - value_i)
 }
 
@@ -1449,5 +1804,108 @@ mod tests {
         let v = portfolio.value(&curve, 1.0);
         assert!(v > 0.0);
         assert_eq!(v, portfolio.value(&curve, 1.0));
+    }
+
+    #[test]
+    fn irrbb_config_defaults_match_regulatory_values() {
+        let c = IrrbbConfig::default();
+        assert_eq!(c.floor, DEFAULT_RATE_FLOOR);
+        assert_eq!(c.vol_bump, 1.25);
+        assert_eq!(c.shock_formula, ShockFormula::default());
+        assert_eq!(c.shock_formula.decay_divisor, 4.0);
+        assert_eq!(
+            c.nmd_caps(NmdCategory::RetailTransactional).core_ratio_cap,
+            0.90
+        );
+        assert_eq!(c.nmd_caps(NmdCategory::NonRetail).maturity_cap_years, 4.0);
+        assert_eq!(c.cpr_multiplier(ShockScenario::ParallelUp), 0.8);
+        assert_eq!(c.tdrr_multiplier(ShockScenario::ParallelUp), 1.2);
+        assert_eq!(c.time_bands.len(), 19);
+        // config wrappers reproduce the plain functions
+        let p = ShockParams::new(100.0, 100.0, 100.0);
+        assert_eq!(
+            shock_delta_bps_with(&c.shock_formula, ShockScenario::Steepener, p, 3.5),
+            shock_delta_bps(ShockScenario::Steepener, p, 3.5)
+        );
+    }
+
+    #[test]
+    fn irrbb_config_overrides_flow_through() {
+        let mut c = IrrbbConfig {
+            floor: -0.05,
+            vol_bump: 1.5,
+            ..Default::default()
+        };
+        c.shock_formula.steepener_short = 1.0;
+        c.nmd_caps.insert(
+            NmdCategory::NonRetail,
+            NmdCaps {
+                core_ratio_cap: 0.8,
+                maturity_cap_years: 2.0,
+            },
+        );
+        c.cpr_multipliers.insert(ShockScenario::ParallelUp, 0.5);
+
+        // floor override: -0.06 would be floored to -0.05
+        let p = ShockParams::new(600.0, 700.0, 300.0);
+        let r = post_shock_rate_with(&c, 0.0, ShockScenario::ParallelDown, p, 1.0);
+        assert!(approx(r, -0.05, 1e-12));
+        // formula override
+        let d = shock_delta_bps_with(
+            &c.shock_formula,
+            ShockScenario::Steepener,
+            ShockParams::new(100.0, 100.0, 100.0),
+            3.5,
+        );
+        assert!(approx(d, 10.8, 0.1));
+        // NMD caps override
+        let s = split_nmd_with(&c, 100.0, 0.9, NmdCategory::NonRetail);
+        assert!(approx(s.core_ratio, 0.8, 1e-12));
+        assert_eq!(s.max_core_maturity_years, 2.0);
+        // CPR multiplier override
+        assert!(approx(cpr_with(&c, ShockScenario::ParallelUp, 0.1), 0.05, 1e-12));
+        // volatility-bump override changes KAO
+        let curve = DiscountCurve::flat(0.05);
+        let mut pf = OptionPortfolio::new();
+        pf.caplets.push(Caplet::new(
+            OptionKind::Cap,
+            1_000_000.0,
+            0.05,
+            1.0,
+            2.0,
+            0.20,
+        ));
+        let kao_default = option_risk_measure_with(
+            &IrrbbConfig::default(),
+            &pf,
+            &curve,
+            ShockScenario::ParallelUp,
+            ShockParams::new(200.0, 300.0, 150.0),
+        )
+        .unwrap();
+        let kao_bumped = option_risk_measure_with(
+            &c,
+            &pf,
+            &curve,
+            ShockScenario::ParallelUp,
+            ShockParams::new(200.0, 300.0, 150.0),
+        )
+        .unwrap();
+        assert!((kao_default - kao_bumped).abs() > 1e-9);
+    }
+
+    #[test]
+    fn shock_table_from_params_and_scenario_parsing() {
+        let mut rows = std::collections::BTreeMap::new();
+        rows.insert("HKD".to_string(), ShockParams::new(225.0, 375.0, 200.0));
+        let table = ShockTable::from_params(ShockTableVersion::Recalibrated2026, rows);
+        assert_eq!(table.params("hkd").parallel_bps, 225.0);
+        assert_eq!(table.params("MOP").short_bps, 375.0);
+        assert_eq!(table.params("ZZZ").parallel_bps, 400.0); // default
+
+        assert_eq!(ShockScenario::parse("parallel up"), Some(ShockScenario::ParallelUp));
+        assert_eq!(ShockScenario::parse("Short-Down"), Some(ShockScenario::ShortDown));
+        assert_eq!(NmdCategory::parse("retail non-transactional"), Some(NmdCategory::RetailNonTransactional));
+        assert_eq!(NmdCategory::parse("non_retail"), Some(NmdCategory::NonRetail));
     }
 }

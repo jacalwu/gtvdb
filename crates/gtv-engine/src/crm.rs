@@ -46,7 +46,7 @@
 //! `method`): `seq, stage (specified | greedy | lp), source_kind, source_id,
 //! loan_id, amount, source_remaining, loan_remaining`.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, RwLock};
 
 use arrow::array::{
@@ -209,7 +209,7 @@ fn col_str(batches: &[RecordBatch], name: &str) -> DfResult<Option<Vec<String>>>
 /// scenario was requested) and `valid_from <= T < valid_to` (when the temporal
 /// columns exist and `T >= 0`).
 fn row_mask(batches: &[RecordBatch], scenario: &str, asof: i64) -> DfResult<Vec<bool>> {
-    let scenario_filter = scenario != "" && scenario != "*";
+    let scenario_filter = !scenario.is_empty() && scenario != "*";
     let sc = if scenario_filter {
         col_str(batches, "scenario_id")?
     } else {
@@ -266,60 +266,151 @@ fn u64_ids(ids: &[i64], what: &str) -> DfResult<Vec<u64>> {
 }
 
 // ---------------------------------------------------------------------------
-// Default priority mappings (overridable with a `priority` column)
+// Configurable rating maps (externalised; regulatory defaults built in)
 // ---------------------------------------------------------------------------
 
-/// Standardised (Basel corporate) risk weight by rating — ordering key of the
-/// `haircut_efficiency` method (larger = covered first). `rw` on the loan table
-/// overrides this map.
-fn loan_rating_rw(rating: &str) -> f64 {
-    match rating.to_ascii_uppercase().as_str() {
-        "AAA" | "AA" => 0.2,
-        "A" => 0.5,
-        "BBB" | "BB" => 1.0,
-        "B" => 1.5,
-        _ => 1.0,
+/// Rating / type → ordering-value maps used by the allocator.
+///
+/// These were previously hardcoded (prod_p4 audit §2.5). They can now be
+/// loaded from a configuration table via [`load_rating_maps`]; the regulatory
+/// defaults match the previous hardcoded values so behaviour is unchanged
+/// until a table overrides them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CrmRatingMaps {
+    maps: BTreeMap<String, BTreeMap<String, f64>>,
+}
+
+impl Default for CrmRatingMaps {
+    fn default() -> Self {
+        Self::regulatory_defaults()
     }
 }
 
-/// Larger = loan covered first (higher default risk).
-fn loan_rating_risk_priority(rating: &str) -> f64 {
-    match rating.to_ascii_uppercase().as_str() {
-        "BB" => 3.0,
-        "BBB" => 2.0,
-        "A" => 1.0,
-        "AA" => 0.5,
-        "AAA" => 0.0,
-        _ => 0.0,
+impl CrmRatingMaps {
+    pub fn new() -> Self {
+        Self {
+            maps: BTreeMap::new(),
+        }
+    }
+
+    /// The built-in Basel-style defaults (previously hardcoded).
+    pub fn regulatory_defaults() -> Self {
+        let mut maps: BTreeMap<String, BTreeMap<String, f64>> = BTreeMap::new();
+        let mut put = |map: &str, rows: &[(&str, f64)]| {
+            let entry = maps.entry(map.to_string()).or_default();
+            for (k, v) in rows {
+                entry.insert(k.to_uppercase(), *v);
+            }
+        };
+        // loan risk weight (ordering key of `haircut_efficiency`)
+        put(
+            "loan_rw",
+            &[
+                ("AAA", 0.2),
+                ("AA", 0.2),
+                ("A", 0.5),
+                ("BBB", 1.0),
+                ("BB", 1.0),
+                ("B", 1.5),
+            ],
+        );
+        // loan default-risk priority (plain greedy)
+        put(
+            "loan_priority",
+            &[
+                ("BB", 3.0),
+                ("BBB", 2.0),
+                ("A", 1.0),
+                ("AA", 0.5),
+                ("AAA", 0.0),
+            ],
+        );
+        // collateral type quality (larger = consumed first)
+        put(
+            "collateral_priority",
+            &[("CASH", 3.0), ("BOND", 2.0), ("EQUITY", 1.0)],
+        );
+        // guarantor rating strength (larger = consumed first)
+        put(
+            "guarantor_priority",
+            &[
+                ("AAA", 3.0),
+                ("AA", 2.0),
+                ("A", 1.0),
+                ("BBB", 0.5),
+                ("BB", 0.0),
+            ],
+        );
+        Self { maps }
+    }
+
+    /// Look up `key` (case-insensitive) in `map`.
+    pub fn get(&self, map: &str, key: &str) -> Option<f64> {
+        self.maps
+            .get(map)
+            .and_then(|m| m.get(&key.to_uppercase()))
+            .copied()
+    }
+
+    pub fn insert(&mut self, map: impl Into<String>, key: impl Into<String>, value: f64) {
+        self.maps
+            .entry(map.into())
+            .or_default()
+            .insert(key.into().to_uppercase(), value);
+    }
+
+    pub fn map(&self, name: &str) -> Option<&BTreeMap<String, f64>> {
+        self.maps.get(name)
+    }
+
+    pub fn names(&self) -> Vec<&str> {
+        self.maps.keys().map(String::as_str).collect()
     }
 }
 
-/// Larger = consumed first (higher-quality collateral allocated first).
-fn collateral_type_priority(ty: &str) -> f64 {
-    match ty.to_ascii_uppercase().as_str() {
-        "CASH" => 3.0,
-        "BOND" => 2.0,
-        "EQUITY" => 1.0,
-        _ => 0.0,
+/// Load rating maps from a config table with columns
+/// `map_name, key, value`.
+///
+/// Loading starts from [`CrmRatingMaps::regulatory_defaults`] and overrides /
+/// adds the table's rows, so a partial table keeps the regulatory value for
+/// unspecified keys (default = regulator, table = override).
+pub fn load_rating_maps(batches: &[RecordBatch]) -> Result<CrmRatingMaps, String> {
+    let mut maps = CrmRatingMaps::regulatory_defaults();
+    let names = col_str(batches, "map_name")
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "crm_rating_load: missing `map_name` column".to_string())?;
+    let keys = col_str(batches, "key")
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "crm_rating_load: missing `key` column".to_string())?;
+    let values = col_f64(batches, "value")
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "crm_rating_load: missing `value` column".to_string())?;
+    if names.len() != values.len() || keys.len() != values.len() {
+        return Err(format!(
+            "crm_rating_load: column length mismatch (map_name={}, key={}, value={})",
+            names.len(),
+            keys.len(),
+            values.len()
+        ));
     }
+    for i in 0..values.len() {
+        if !values[i].is_finite() {
+            return Err(format!("crm_rating_load: row {i} has a non-finite value"));
+        }
+        maps.insert(names[i].clone(), keys[i].clone(), values[i]);
+    }
+    Ok(maps)
 }
 
-/// Larger = consumed first (stronger guarantors allocated first).
-fn guarantor_rating_priority(rating: &str) -> f64 {
-    match rating.to_ascii_uppercase().as_str() {
-        "AAA" => 3.0,
-        "AA" => 2.0,
-        "A" => 1.0,
-        "BBB" => 0.5,
-        "BB" => 0.0,
-        _ => 0.0,
-    }
-}
+// ---------------------------------------------------------------------------
+// Default priority mappings (overridable with a `priority` column)
+// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // Snapshot builder: table batches -> allocator inputs
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn snapshot_from_batches(
     loans_b: &[RecordBatch],
     collateral_b: &[RecordBatch],
@@ -330,6 +421,7 @@ pub(crate) fn snapshot_from_batches(
     asof: i64,
     exposure_col: &str,
     method: &str,
+    maps: &CrmRatingMaps,
 ) -> DfResult<CrmSnapshot> {
     // `haircut_efficiency` (Phase 2 variant): collateral sources are ordered by
     // haircut-adjusted effective value (largest first) and loans by risk weight
@@ -367,14 +459,14 @@ pub(crate) fn snapshot_from_batches(
                 return v[i];
             }
             if let Some(v) = rating.as_ref() {
-                return loan_rating_rw(&v[i]);
+                return maps.get("loan_rw", &v[i]).unwrap_or(1.0);
             }
         }
         if let Some(v) = pd.as_ref() {
             return v[i];
         }
         if let Some(v) = rating.as_ref() {
-            return loan_rating_risk_priority(&v[i]);
+            return maps.get("loan_priority", &v[i]).unwrap_or(0.0);
         }
         0.0
     };
@@ -424,7 +516,7 @@ pub(crate) fn snapshot_from_batches(
             eff
         } else {
             ty.as_ref()
-                .map(|v| collateral_type_priority(&v[i]))
+                .and_then(|v| maps.get("collateral_priority", &v[i]))
                 .unwrap_or(0.0)
         }
     };
@@ -462,7 +554,11 @@ pub(crate) fn snapshot_from_batches(
             priority: explicit_prio
                 .as_ref()
                 .map(|v| v[i])
-                .or_else(|| rating.as_ref().map(|v| guarantor_rating_priority(&v[i])))
+                .or_else(|| {
+                    rating
+                        .as_ref()
+                        .and_then(|v| maps.get("guarantor_priority", &v[i]))
+                })
                 .unwrap_or(0.0),
         })
         .collect();
@@ -742,7 +838,11 @@ fn parse_args(exprs: &[Expr]) -> DfResult<CrmArgs> {
     })
 }
 
-fn snapshot_and_run(reg: &HftRegistry, args: &CrmArgs) -> DfResult<CrmResult> {
+fn snapshot_and_run(
+    reg: &HftRegistry,
+    args: &CrmArgs,
+    maps: &CrmRatingMaps,
+) -> DfResult<CrmResult> {
     let table = |name: &str| -> DfResult<&Vec<RecordBatch>> {
         reg.tables.get(name).map(|b| b.as_ref()).ok_or_else(|| {
             DataFusionError::Execution(format!(
@@ -765,6 +865,7 @@ fn snapshot_and_run(reg: &HftRegistry, args: &CrmArgs) -> DfResult<CrmResult> {
         args.asof,
         &args.exposure_col,
         &args.method,
+        maps,
     )?;
     match args.method.as_str() {
         // `greedy`: collateral by type quality, loans by pd/rating-risk.
@@ -817,11 +918,12 @@ fn snapshot_and_run(reg: &HftRegistry, args: &CrmArgs) -> DfResult<CrmResult> {
 #[derive(Debug)]
 pub struct CrmAllocTableFunction {
     registry: Arc<RwLock<HftRegistry>>,
+    maps: Arc<RwLock<CrmRatingMaps>>,
 }
 
 impl CrmAllocTableFunction {
-    pub fn new(registry: Arc<RwLock<HftRegistry>>) -> Self {
-        Self { registry }
+    pub fn new(registry: Arc<RwLock<HftRegistry>>, maps: Arc<RwLock<CrmRatingMaps>>) -> Self {
+        Self { registry, maps }
     }
 }
 
@@ -832,7 +934,11 @@ impl TableFunctionImpl for CrmAllocTableFunction {
             .registry
             .read()
             .map_err(|_| DataFusionError::Execution("hft registry poisoned".into()))?;
-        let res = snapshot_and_run(&reg, &crm_args)?;
+        let maps = self
+            .maps
+            .read()
+            .map_err(|_| DataFusionError::Execution("crm rating maps poisoned".into()))?;
+        let res = snapshot_and_run(&reg, &crm_args, &maps)?;
         let batch = alloc_batch(&res)?;
         Ok(Arc::new(MemTable::try_new(
             alloc_schema(),
@@ -847,11 +953,12 @@ impl TableFunctionImpl for CrmAllocTableFunction {
 #[derive(Debug)]
 pub struct CrmAuditTableFunction {
     registry: Arc<RwLock<HftRegistry>>,
+    maps: Arc<RwLock<CrmRatingMaps>>,
 }
 
 impl CrmAuditTableFunction {
-    pub fn new(registry: Arc<RwLock<HftRegistry>>) -> Self {
-        Self { registry }
+    pub fn new(registry: Arc<RwLock<HftRegistry>>, maps: Arc<RwLock<CrmRatingMaps>>) -> Self {
+        Self { registry, maps }
     }
 }
 
@@ -862,12 +969,68 @@ impl TableFunctionImpl for CrmAuditTableFunction {
             .registry
             .read()
             .map_err(|_| DataFusionError::Execution("hft registry poisoned".into()))?;
-        let res = snapshot_and_run(&reg, &crm_args)?;
+        let maps = self
+            .maps
+            .read()
+            .map_err(|_| DataFusionError::Execution("crm rating maps poisoned".into()))?;
+        let res = snapshot_and_run(&reg, &crm_args, &maps)?;
         let batch = audit_batch(&res.allocations)?;
         Ok(Arc::new(MemTable::try_new(
             audit_schema(),
             vec![vec![batch]],
         )?))
+    }
+}
+
+/// `crm_rating_map()` — the effective rating / type → value maps (one row per
+/// entry), so the configured parameters are inspectable / auditable.
+#[derive(Debug)]
+pub struct CrmRatingMapTableFunction {
+    maps: Arc<RwLock<CrmRatingMaps>>,
+}
+
+impl CrmRatingMapTableFunction {
+    pub fn new(maps: Arc<RwLock<CrmRatingMaps>>) -> Self {
+        Self { maps }
+    }
+
+    fn schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("map_name", DataType::Utf8, false),
+            Field::new("key", DataType::Utf8, false),
+            Field::new("value", DataType::Float64, false),
+        ]))
+    }
+}
+
+impl TableFunctionImpl for CrmRatingMapTableFunction {
+    fn call_with_args(&self, _args: TableFunctionArgs) -> DfResult<Arc<dyn TableProvider>> {
+        let maps = self
+            .maps
+            .read()
+            .map_err(|_| DataFusionError::Execution("crm rating maps poisoned".into()))?;
+        let schema = Self::schema();
+        let mut names = Vec::new();
+        let mut keys = Vec::new();
+        let mut values = Vec::new();
+        for map_name in maps.names() {
+            if let Some(m) = maps.map(map_name) {
+                for (k, v) in m {
+                    names.push(map_name.to_string());
+                    keys.push(k.clone());
+                    values.push(*v);
+                }
+            }
+        }
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(names)) as ArrayRef,
+                Arc::new(StringArray::from(keys)) as ArrayRef,
+                Arc::new(Float64Array::from(values)) as ArrayRef,
+            ],
+        )?;
+        Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
     }
 }
 
@@ -1002,6 +1165,7 @@ mod tests {
             asof,
             "ead",
             "greedy",
+            &CrmRatingMaps::regulatory_defaults(),
         )
         .unwrap();
         gtv_array::crm::crm_alloc_greedy(
@@ -1110,6 +1274,7 @@ mod tests {
             asof,
             "ead",
             "greedy",
+            &CrmRatingMaps::regulatory_defaults(),
         )
         .unwrap();
         // STRESS row excluded by scenario + window; only the BASE row of loan 1
@@ -1137,6 +1302,7 @@ mod tests {
             asof,
             "ead",
             "greedy",
+            &CrmRatingMaps::regulatory_defaults(),
         )
         .unwrap();
         assert!(snap.loans.is_empty());
@@ -1181,6 +1347,7 @@ mod tests {
             asof,
             "ead",
             "greedy",
+            &CrmRatingMaps::regulatory_defaults(),
         )
         .unwrap_err();
         assert!(
@@ -1206,6 +1373,7 @@ mod tests {
             asof,
             "ead",
             "greedy",
+            &CrmRatingMaps::regulatory_defaults(),
         )
         .unwrap();
         let greedy = gtv_array::crm::crm_alloc_greedy(
@@ -1289,6 +1457,7 @@ mod tests {
             -1,
             "ead",
             method,
+            &CrmRatingMaps::regulatory_defaults(),
         )
         .unwrap();
         gtv_array::crm::crm_alloc_greedy(
@@ -1415,5 +1584,41 @@ mod tests {
             eff_first, 2,
             "efficiency consumes the larger effective value first"
         );
+    }
+
+    #[test]
+    fn rating_maps_load_from_config_table_and_override_defaults() {
+        // Regulatory defaults match the previously hardcoded values.
+        let defaults = CrmRatingMaps::regulatory_defaults();
+        assert_eq!(defaults.get("loan_priority", "A"), Some(1.0));
+        assert_eq!(defaults.get("loan_rw", "AAA"), Some(0.2));
+        assert_eq!(defaults.get("collateral_priority", "cash"), Some(3.0)); // case-insensitive
+        assert_eq!(defaults.get("guarantor_priority", "BBB"), Some(0.5));
+        assert_eq!(defaults.get("loan_priority", "UNKNOWN"), None);
+
+        // A config table overrides one key and keeps the rest.
+        let cfg = batches(
+            schema(vec![
+                ("map_name", DataType::Utf8),
+                ("key", DataType::Utf8),
+                ("value", DataType::Float64),
+            ]),
+            vec![
+                Arc::new(StringArray::from(vec!["loan_priority"])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["A"])) as ArrayRef,
+                Arc::new(Float64Array::from(vec![99.0])) as ArrayRef,
+            ],
+        );
+        let maps = load_rating_maps(&cfg).unwrap();
+        assert_eq!(maps.get("loan_priority", "A"), Some(99.0));
+        assert_eq!(maps.get("loan_priority", "BB"), Some(3.0)); // kept
+        assert_eq!(maps.names().len(), 4);
+
+        // Missing columns are an explicit error.
+        let bad = batches(
+            schema(vec![("key", DataType::Utf8)]),
+            vec![Arc::new(StringArray::from(vec!["A"])) as ArrayRef],
+        );
+        assert!(load_rating_maps(&bad).is_err());
     }
 }

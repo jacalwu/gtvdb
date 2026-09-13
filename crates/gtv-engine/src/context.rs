@@ -70,6 +70,8 @@ pub struct GtvContext {
     cbo: crate::cbo::CboRegistry,
     /// Workload admission / isolation manager (B3-6).
     workload: Arc<crate::workload::WorkloadManager>,
+    /// Configurable CRM rating / type maps (prod_p4 audit P0).
+    crm_maps: Arc<RwLock<crate::crm::CrmRatingMaps>>,
     /// Registered tables mapped to the catalog snapshot they were loaded from.
     table_sources: Arc<RwLock<HashMap<String, TableRef>>>,
     hft_reg: Arc<RwLock<HftRegistry>>,
@@ -174,7 +176,12 @@ impl GtvContext {
         ctx.register_udtf("relative_strength", Arc::new(crate::quant::RelativeStrengthTableFunction));
         ctx.register_udtf("read_tickdata", Arc::new(crate::tickdata::ReadTickdataTableFunction));
         crate::market::register_udtfs(&ctx);
-        let hft_reg = Arc::new(RwLock::new(HftRegistry::default()));        {
+        let hft_reg = Arc::new(RwLock::new(HftRegistry::default()));
+        // Configurable CRM rating maps — regulatory defaults, overridable from
+        // a configuration table via `GtvContext::set_crm_rating_maps`.
+        let crm_maps: Arc<RwLock<crate::crm::CrmRatingMaps>> =
+            Arc::new(RwLock::new(crate::crm::CrmRatingMaps::regulatory_defaults()));
+        {
             let tt = Arc::new(crate::hft_tf::TickToTradeTableFunction::new(hft_reg.clone()));
             ctx.register_udtf("tick_to_trade", tt.clone());
             ctx.register_udtf("ttrade", tt);
@@ -198,11 +205,21 @@ impl GtvContext {
                 "align",
                 Arc::new(crate::quant::AlignTableFunction::new(hft_reg.clone())),
             );
-            let crm_alloc = Arc::new(crate::crm::CrmAllocTableFunction::new(hft_reg.clone()));
+            let crm_alloc = Arc::new(crate::crm::CrmAllocTableFunction::new(
+                hft_reg.clone(),
+                crm_maps.clone(),
+            ));
             ctx.register_udtf("crm_alloc", crm_alloc);
             ctx.register_udtf(
                 "crm_audit",
-                Arc::new(crate::crm::CrmAuditTableFunction::new(hft_reg.clone())),
+                Arc::new(crate::crm::CrmAuditTableFunction::new(
+                    hft_reg.clone(),
+                    crm_maps.clone(),
+                )),
+            );
+            ctx.register_udtf(
+                "crm_rating_map",
+                Arc::new(crate::crm::CrmRatingMapTableFunction::new(crm_maps.clone())),
             );
             ctx.register_udtf(
                 "backtest",
@@ -261,6 +278,7 @@ impl GtvContext {
             bitemporal,
             cbo,
             workload,
+            crm_maps,
             table_sources: Arc::new(RwLock::new(HashMap::new())),
             hft_reg,
         }
@@ -633,6 +651,28 @@ impl GtvContext {
     /// Shared workload manager (B3-6).
     pub fn workload(&self) -> Arc<crate::workload::WorkloadManager> {
         self.workload.clone()
+    }
+
+    /// Replace the CRM rating / type maps (prod_p4 audit P0). Loading from a
+    /// configuration table keeps the regulatory defaults for unspecified keys.
+    pub fn set_crm_rating_maps(
+        &self,
+        maps: crate::crm::CrmRatingMaps,
+    ) -> Result<()> {
+        *self
+            .crm_maps
+            .write()
+            .map_err(|_| {
+                datafusion::error::DataFusionError::Execution(
+                    "crm rating maps poisoned".into(),
+                )
+            })? = maps;
+        Ok(())
+    }
+
+    /// Shared handle to the CRM rating maps.
+    pub fn crm_rating_maps(&self) -> Arc<RwLock<crate::crm::CrmRatingMaps>> {
+        self.crm_maps.clone()
     }
 
     /// Execute `query` under a workload class, with admission control.

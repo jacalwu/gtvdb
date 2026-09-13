@@ -12,7 +12,10 @@ use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 use datafusion::error::{DataFusionError, Result};
 use gtv_refdata::{EffectiveRange, HierarchyEdge, HierarchyKind, MasterKind, MasterRecord};
-use gtv_scenario::{Dimension, Scenario, ScenarioKind, ScenarioStatus, Shock};
+use gtv_scenario::{
+    Dimension, IrrbbConfig, NmdCaps, NmdCategory, Scenario, ScenarioKind, ScenarioStatus, Shock,
+    ShockParams, ShockScenario, ShockTable, ShockTableVersion, TimeBand,
+};
 
 use crate::registry::Registry;
 
@@ -107,6 +110,141 @@ fn optional_i64(batch: &RecordBatch, name: &str, default: i64) -> Result<Vec<i64
 
 fn effective(from: i64, to: i64) -> Result<EffectiveRange> {
     EffectiveRange::new(from, to).map_err(err)
+}
+
+// ---------------------------------------------------------------------------
+// IRRBB configuration loaders (prod_p4 audit P0)
+// ---------------------------------------------------------------------------
+
+/// `irrbb_scalars(key, value)` — override scalar IRRBB parameters. Recognised
+/// keys: `floor`, `vol_bump`, `steepener_short`, `steepener_long`,
+/// `flattener_short`, `flattener_long`, `decay_divisor`.
+pub fn load_irrbb_scalars(config: &mut IrrbbConfig, batches: &[RecordBatch]) -> Result<usize> {
+    let mut n = 0;
+    for batch in batches {
+        let keys = required_strings(batch, "key")?;
+        let values = f64_from(column(batch, "value")?)?;
+        for i in 0..keys.len() {
+            match keys[i].as_str() {
+                "floor" => config.floor = values[i],
+                "vol_bump" => config.vol_bump = values[i],
+                "steepener_short" => config.shock_formula.steepener_short = values[i],
+                "steepener_long" => config.shock_formula.steepener_long = values[i],
+                "flattener_short" => config.shock_formula.flattener_short = values[i],
+                "flattener_long" => config.shock_formula.flattener_long = values[i],
+                "decay_divisor" => config.shock_formula.decay_divisor = values[i],
+                other => {
+                    return Err(err(format!("load_irrbb_scalars: unknown key `{other}`")))
+                }
+            }
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
+/// `irrbb_nmd_caps(category, core_ratio_cap, maturity_cap_years)`.
+pub fn load_irrbb_nmd_caps(config: &mut IrrbbConfig, batches: &[RecordBatch]) -> Result<usize> {
+    let mut n = 0;
+    for batch in batches {
+        let categories = required_strings(batch, "category")?;
+        let ratios = f64_from(column(batch, "core_ratio_cap")?)?;
+        let maturities = f64_from(column(batch, "maturity_cap_years")?)?;
+        for i in 0..categories.len() {
+            let category = NmdCategory::parse(&categories[i]).ok_or_else(|| {
+                err(format!(
+                    "load_irrbb_nmd_caps: unknown NMD category `{}`",
+                    categories[i]
+                ))
+            })?;
+            config.nmd_caps.insert(
+                category,
+                NmdCaps {
+                    core_ratio_cap: ratios[i],
+                    maturity_cap_years: maturities[i],
+                },
+            );
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
+/// `irrbb_scenario_multipliers(scenario, cpr_gamma, tdrr_u)`.
+pub fn load_irrbb_scenario_multipliers(
+    config: &mut IrrbbConfig,
+    batches: &[RecordBatch],
+) -> Result<usize> {
+    let mut n = 0;
+    for batch in batches {
+        let scenarios = required_strings(batch, "scenario")?;
+        let cpr = f64_from(column(batch, "cpr_gamma")?)?;
+        let tdrr = f64_from(column(batch, "tdrr_u")?)?;
+        for i in 0..scenarios.len() {
+            let scenario = ShockScenario::parse(&scenarios[i]).ok_or_else(|| {
+                err(format!(
+                    "load_irrbb_scenario_multipliers: unknown scenario `{}`",
+                    scenarios[i]
+                ))
+            })?;
+            config.cpr_multipliers.insert(scenario, cpr[i]);
+            config.tdrr_multipliers.insert(scenario, tdrr[i]);
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
+/// `irrbb_time_bands(label, start_years, end_years, midpoint_years)`.
+pub fn load_irrbb_time_bands(config: &mut IrrbbConfig, batches: &[RecordBatch]) -> Result<usize> {
+    let mut bands = Vec::new();
+    for batch in batches {
+        let labels = required_strings(batch, "label")?;
+        let starts = f64_from(column(batch, "start_years")?)?;
+        let ends = f64_from(column(batch, "end_years")?)?;
+        let midpoints = f64_from(column(batch, "midpoint_years")?)?;
+        for i in 0..labels.len() {
+            bands.push(TimeBand {
+                label: labels[i].clone(),
+                start_years: starts[i],
+                end_years: ends[i],
+                midpoint_years: midpoints[i],
+            });
+        }
+    }
+    if bands.is_empty() {
+        return Err(err("load_irrbb_time_bands: no rows"));
+    }
+    bands.sort_by(|a, b| {
+        a.midpoint_years
+            .partial_cmp(&b.midpoint_years)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let n = bands.len();
+    config.time_bands = bands;
+    Ok(n)
+}
+
+/// `irrbb_shock_params(currency, parallel_bps, short_bps, long_bps)` — build a
+/// [`ShockTable`] of the given version.
+pub fn load_shock_table(
+    version: ShockTableVersion,
+    batches: &[RecordBatch],
+) -> Result<ShockTable> {
+    let mut params: BTreeMap<String, ShockParams> = BTreeMap::new();
+    for batch in batches {
+        let currencies = required_strings(batch, "currency")?;
+        let parallel = f64_from(column(batch, "parallel_bps")?)?;
+        let short = f64_from(column(batch, "short_bps")?)?;
+        let long = f64_from(column(batch, "long_bps")?)?;
+        for i in 0..currencies.len() {
+            params.insert(
+                currencies[i].to_ascii_uppercase(),
+                ShockParams::new(parallel[i], short[i], long[i]),
+            );
+        }
+    }
+    Ok(ShockTable::from_params(version, params))
 }
 
 /// Load scenario versions from a flat table.

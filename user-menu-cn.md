@@ -352,6 +352,7 @@ scenario_load <table>                    # 載入版本化 scenario（§20）
 hierarchy_load <kind> <table>            # 載入 effective-dated hierarchy 邊
 refdata_load <table>                     # 載入 effective-dated reference 值
 master_load <kind> <table>               # 載入 master data（master_get）
+crm_rating_load <table>                  # 載入 CRM 評級對照表（map_name, key, value）
 ```
 
 行情/趨勢分析函數（provider 只是第一個參數，見 §7）：
@@ -379,6 +380,7 @@ hierarchy_ancestors(kind, node, as_of)         # 生效日期階層祖先（§20
 hierarchy_descendants(kind, node, as_of)       # 生效日期階層後代
 refdata_get(domain, key, as_of)                # effective-dated reference 值
 master_get(kind, id, as_of)                    # master 屬性（每 attribute 一行）
+crm_rating_map()                               # CRM 評級 / 類型對照表（map_name, key, value）
 metrics                                        # 引擎計數器
 ```
 

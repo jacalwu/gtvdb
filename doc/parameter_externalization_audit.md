@@ -17,10 +17,10 @@
 | 模組 | 參數外部化程度 | 主要問題 |
 |---|---|---|
 | ALM 現金流（`alm.rs`） | 🟡 | 壓力 / decay 內建 default、day-count 寫死、無 table loader |
-| IRRBB（`irrbb.rs`） | 🟡 | 監管常數（caps、γ/u、vol bump、shock 表、time bands、floor）寫死 |
+| IRRBB（`irrbb.rs`） | ✅ | `IrrbbConfig` + `ShockTable::from_params` + `load_irrbb_*` |
 | FTP（`ftp.rs`） | ✅ 資料層好，❌ 缺 loader | curve / policy 全部 data，但只能 Rust API 建 |
 | CRM 治理（`gtv-governance`） | ✅ 資料層好，❌ 缺 loader | `RuleSet` / `GovernedInputs` data，但只能 Rust API 建 |
-| CRM kernel（`gtv-array` + `gtv-engine/crm.rs`） | 🟡 / ❌ | 評級→風險權重 / 優先級對照表寫死；實際 haircut 由 table 欄位提供 |
+| CRM kernel（`gtv-array` + `gtv-engine/crm.rs`） | ✅ | `CrmRatingMaps` + `load_rating_maps` + `crm_rating_map()` |
 | AML case（`gtv-governance/aml.rs`） | 🟡 | `HybridWeights::default` 寫死 |
 | CLI / SQL surface | ❌ | 冇 `alm` / `ftp` / `irrbb` 命令；`crm_alloc` 用寫死對照表 |
 
@@ -161,7 +161,24 @@ crm_inputs_*(...)                              # exposures / collateral / guaran
 
 ---
 
-## 5. 注意
+## 6. 執行進度
+
+**P0 已完成**（commit 見 repo 記錄）：
+- **CRM 評級對照表外部化**：`gtv_engine::crm::{CrmRatingMaps, load_rating_maps}`；
+  `GtvContext::set_crm_rating_maps`；SQL `crm_rating_map()`；CLI `crm_rating_load <table>`。
+  預設 = 原寫死值（零回歸），table 只覆蓋提供嘅 key。
+- **IRRBB 監管常數外部化**：`gtv_scenario::irrbb::{IrrbbConfig, ShockFormula, NmdCaps}`
+  （floor / vol_bump / shock 公式係數 / NMD caps / γ / u / time bands，預設 = 法規值）；
+  config-aware API（`*_with`）；`ShockTable::from_params`；loader
+  `load_irrbb_scalars` / `load_irrbb_nmd_caps` / `load_irrbb_scenario_multipliers` /
+  `load_irrbb_time_bands` / `load_shock_table`（`gtv-enterprise-sql::load`）。
+
+**仍未做**：P1（FTP / CRM 治理規則 loader）、P2（ALM 參數表 + day-count）、
+P3（CLI / SQL surface，例如 `irrbb_eve` / `ftp_price`）。
+
+---
+
+## 7. 注意
 
 - IRRBB 監管常數（shock 公式係數、NMD caps、γ/u）係**法規規定**，外部化時應保留
   「default = 法規值」並記錄 override 來源，避免配置錯誤令報表不合規。

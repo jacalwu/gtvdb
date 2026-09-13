@@ -2082,6 +2082,13 @@ async fn run(
             println!("loaded {n} master record(s) [{}] from `{table}`", kind.as_str());
             println!("query: SELECT * FROM master_get('{}', '<id>', <as_of>)", kind.as_str());
         }
+        "crm_rating_load" => {
+            let table = require_arg(&tokens, 1, "crm_rating_load <table>")?;
+            let batches = ctx.sql(&format!("SELECT * FROM {table}")).await?;
+            let maps = gtv_engine::crm::load_rating_maps(&batches).map_err(|e| anyhow!("{e}"))?;
+            ctx.set_crm_rating_maps(maps).map_err(|e| anyhow!("{e}"))?;
+            println!("loaded CRM rating maps from `{table}` (inspect with crm_rating_map())");
+        }
         "workload" => {
             let out = ctx
                 .sql(
@@ -2562,6 +2569,7 @@ fn print_help() {
          \x20 hierarchy_load <kind> <table>  load effective-dated hierarchy edges\n\
          \x20 refdata_load <table>  load effective-dated reference values\n\
          \x20 master_load <kind> <table>  load master data for master_get(...)\n\
+         \x20 crm_rating_load <table>  load CRM rating maps (map_name, key, value) for crm_alloc\n\
          \x20 drop table <name>     drop a table from memory [+ persisted catalog]\n\
          \x20 remote <host:port> <sql>  execute SQL on a remote gtv-server\n\
          \x20 workload              workload admission / isolation status (per class)\n\

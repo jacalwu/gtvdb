@@ -27,14 +27,17 @@ pub use ftp::{
     LiquidityPremium, OptionalityCharge,
 };
 pub use irrbb::{
-    aggregate_eve, black_caplet, black_swaption, cpr, cube_bands, curve_zero, forward_rate,
-    nearest_band, nmd_bands, norm_cdf, option_risk_measure, post_shock_rate, prepayment_bands,
-    prepayment_multiplier, shift_curve, shock_delta_bps, slot_cells, split_nmd,
-    standard_time_bands, standardised_eve_from_cube, standardised_eve_scenario, standardised_irrbb,
-    tdrr, tdrr_bands, tdrr_multiplier, Caplet, EveScenarioResult, IrrbbError, IrrbbResult,
-    NmdCategory, NmdPortfolio, NmdSplit, OptionKind, OptionPortfolio, Regulator, ShockParams,
-    ShockScenario, ShockTable, ShockTableVersion, SlotDate, Swaption, SwaptionKind, TimeBand,
-    DEFAULT_RATE_FLOOR,
+    aggregate_eve, black_caplet, black_swaption, cpr, cpr_with, cube_bands, curve_zero,
+    forward_rate, nearest_band, nmd_bands, nmd_bands_with, norm_cdf, option_risk_measure,
+    option_risk_measure_with, post_shock_rate, post_shock_rate_with, prepayment_bands,
+    prepayment_bands_with, prepayment_multiplier, shift_curve, shift_curve_with, shock_delta_bps,
+    shock_delta_bps_with, slot_cells, split_nmd, split_nmd_with, standard_time_bands,
+    standardised_eve_from_cube, standardised_eve_scenario, standardised_eve_scenario_with,
+    standardised_irrbb, standardised_irrbb_with, tdrr, tdrr_bands, tdrr_bands_with, tdrr_multiplier,
+    tdrr_with, Caplet, EveScenarioResult, IrrbbConfig, IrrbbError, IrrbbResult, NmdCaps,
+    NmdCategory, NmdPortfolio, NmdSplit, OptionKind, OptionPortfolio, Regulator, ShockFormula,
+    ShockParams, ShockScenario, ShockTable, ShockTableVersion, SlotDate, Swaption, SwaptionKind,
+    TimeBand, DEFAULT_RATE_FLOOR,
 };
 pub use scenario::{
     Change, Dimension, Provenance, ResolvedScenario, ResolvedShock, Scenario, ScenarioDiff,

@@ -357,6 +357,7 @@ scenario_load <table>                    # load versioned scenarios (§20)
 hierarchy_load <kind> <table>            # load effective-dated hierarchy edges
 refdata_load <table>                     # load effective-dated reference values
 master_load <kind> <table>               # load master data for master_get(...)
+crm_rating_load <table>                  # load CRM rating maps (map_name, key, value)
 ```
 
 Market/trend functions (provider is just the first argument, see §7):
@@ -385,6 +386,7 @@ hierarchy_ancestors(kind, node, as_of)      # effective-dated ancestors (§20)
 hierarchy_descendants(kind, node, as_of)    # effective-dated descendants
 refdata_get(domain, key, as_of)      # effective-dated reference value
 master_get(kind, id, as_of)          # master attributes (one row each)
+crm_rating_map()                     # CRM rating / type maps (map_name, key, value)
 metrics                              # engine counters (see above)
 ```
 
