@@ -684,3 +684,24 @@ reconciliation（source/target row count 同 amount sum）。
 
 > Override 以 `rule` kind 為單位（同一個 target + rule 豁免該類全部 failure）。
 > 現有 `dq_report` / `dq_check` / `health_check` 保留為純診斷，唔會 block。
+
+---
+
+## 14. IVF k-means 粗量化器（prod_p3 B3-4）
+
+`IvfIndex` 嘅 coarse quantizer 由「均勻取樣」升級為 **k-means++ / Lloyd**：
+
+- `KMeansConfig { nlist, max_iters(25), restarts(3), sample, seed, split_oversized,
+  split_threshold_k }`；大 corpus 預設抽 50k 訓練；**相同 seed + 資料 → 完全相同 centroids**。
+- **空 cell**：重指派「最遠點」令每個 cell 都非空；**oversized cell**
+  （count > μ + kσ，`split_oversized = true`）會自動切分並重新 refine。
+- `KMeansConfig::for_nlist(n)` 為保守預設（不切分、用全部資料）；
+  `IvfIndex::with_metric` 用 k-means，`IvfIndex::with_uniform` 保留舊均勻取樣做
+  baseline / fallback。
+- 訓練 metadata（`kmeans` / `seed` / `restarts` / `iters` / `sample` / `inertia`）寫入
+  `GIVFv2` payload；舊 `GIVFv1` 仍可載入（零格式回歸）。
+- `CellStats` / `RetrainTrigger::PopulationImbalance` 可偵測 cell 人口失衡並提示 retrain。
+- **`index_tune <table> [target_recall] [k]`**：對 `(nlist, nprobe)` 網格量度 Recall@K
+  同掃描成本（probed rows），印出 recall/cost 曲線並揀出符合 target 嘅**最低成本**組合。
+  table 需有 `id` + `v0..v{d-1}` 欄位（同 `index_save` 一致）。
+- API：`gtv_index::{kmeans_train, tune_ivf, tune_ivf_curve, select_tuned}`。

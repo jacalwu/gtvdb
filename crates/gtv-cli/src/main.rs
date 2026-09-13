@@ -1027,6 +1027,68 @@ async fn run(
             );
             ctx.register_any_index(name, loaded.index);
         }
+        "index_tune" => {
+            // index_tune <table> [target_recall] [k]
+            let usage = "index_tune <table> [target_recall] [k]";
+            let table = require_arg(&tokens, 1, usage)?;
+            let target = optional_arg(&tokens, 2)
+                .map(|s| s.parse::<f64>())
+                .transpose()?
+                .unwrap_or(0.9);
+            let k = optional_arg(&tokens, 3)
+                .map(|s| s.parse::<usize>())
+                .transpose()?
+                .unwrap_or(10);
+
+            let batches = ctx.sql(&format!("SELECT * FROM {table}")).await?;
+            let ids = extract_u64(&batches, "id")?;
+            let dim = infer_vec_dim(&batches)?;
+            let n = ids.len();
+            let mut data = vec![0.0f32; n * dim];
+            for d in 0..dim {
+                let vals = extract_f64(&batches, &format!("v{d}"))?;
+                for (i, v) in vals.iter().enumerate() {
+                    data[i * dim + d] = *v as f32;
+                }
+            }
+
+            let mut candidates = Vec::new();
+            for nlist in [8usize, 16, 32, 64] {
+                if nlist > n {
+                    continue;
+                }
+                for nprobe in [1usize, 2, 4, 8] {
+                    if nprobe <= nlist {
+                        candidates.push((nlist, nprobe));
+                    }
+                }
+            }
+            if candidates.is_empty() {
+                candidates.push((1, 1));
+            }
+            let cfg = gtv_index::TuneConfig {
+                target_recall: target,
+                k,
+                candidates,
+                queries: 50.min(n),
+                seed: 0x5EED,
+            };
+            let curve = gtv_index::tune_ivf_curve(&ids, &data, dim, Metric::L2, &cfg)?;
+            println!("nlist nprobe   recall  probed_rows");
+            for r in &curve {
+                println!(
+                    "{:>5} {:>6}   {:.4}  {:>9.1}",
+                    r.nlist, r.nprobe, r.recall, r.probed_rows
+                );
+            }
+            match gtv_index::select_tuned(&curve, target) {
+                Some(b) => println!(
+                    "best: nlist={} nprobe={} recall={:.4} (target {target}, k={k})",
+                    b.nlist, b.nprobe, b.recall
+                ),
+                None => println!("index_tune: no candidate met the target"),
+            }
+        }
         "embedding_register" => {
             // embedding_register <name> <table>
             let name = require_arg(&tokens, 1, "embedding_register <name> <table>")?;
@@ -2375,6 +2437,7 @@ fn print_help() {
          \x20 knn_from <name> <t> [d] [metric]  register a vector collection (id, v0..v{{d-1}}); metric=l2|cosine|dot\n\
          \x20 index_save <name> <root> <t> [type] [metric]  build+persist an index (flat|ivf|hnsw)\n\
          \x20 index_load <name> <root> [version]  load a persisted index for SQL `ann(...)`\n\
+         \x20 index_tune <table> [target_recall] [k]  IVF k-means nlist/nprobe recall-cost curve\n\
          \x20 embedding_register <name> <table>  register a standard embedding table for embedding_search(...)\n\
          \x20 embedding_build <name> <root> <table> [type] [metric]  build a governed index (flat|ivf|hnsw)\n\
          \x20 catalog               list persisted tables (GTV_HOME catalog)\n\

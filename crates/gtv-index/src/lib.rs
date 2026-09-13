@@ -15,4 +15,7 @@ pub mod ivf;
 pub use flat::FlatIndex;
 pub use hnsw::HnswIndex;
 pub use index::{AnyIndex, BuildOptions, IndexType, PersistableIndex};
-pub use ivf::IvfIndex;
+pub use ivf::{
+    kmeans_train, select_tuned, tune_ivf, tune_ivf_curve, CellStats, IvfIndex, IvfTrainingMeta,
+    KMeansConfig, RetrainTrigger, TuneConfig, TuneResult,
+};

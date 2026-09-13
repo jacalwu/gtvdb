@@ -171,11 +171,11 @@ late event、去重、replay、DLQ、backpressure。
 
 **驗收條件**
 
-- [ ] 對不均衡 corpus，k-means 版 Recall@K 明顯高於均勻取樣版（量度）。
-- [ ] 相同 seed + 資料 → 完全相同 centroids（可重現）。
-- [ ] 無空 cell；oversized cell 可自動切分。
-- [ ] `nlist`/`nprobe` 調優可輸出 recall/latency 曲線。
-- [ ] 現有 IVF 測試零回歸。
+- [x] 對不均衡 corpus，k-means 版 Recall@K 明顯高於均勻取樣版（量度）。
+- [x] 相同 seed + 資料 → 完全相同 centroids（可重現）。
+- [x] 無空 cell；oversized cell 可自動切分。
+- [x] `nlist`/`nprobe` 調優可輸出 recall/latency 曲線。
+- [x] 現有 IVF 測試零回歸。
 
 **風險**
 

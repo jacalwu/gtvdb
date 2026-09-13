@@ -723,3 +723,30 @@ Example rules JSON:
 > Overrides are keyed by rule kind (one target + rule waives every failure of
 > that kind). The existing `dq_report` / `dq_check` / `health_check` stay
 > diagnostic and never block.
+
+---
+
+## 14. IVF k-means coarse quantizer (prod_p3 B3-4)
+
+The `IvfIndex` coarse quantizer is upgraded from evenly-spaced sampling to
+**k-means++ / Lloyd**:
+
+- `KMeansConfig { nlist, max_iters(25), restarts(3), sample, seed, split_oversized,
+  split_threshold_k }`; large corpora train on a 50k sample by default; **the same
+  seed + data yields identical centroids**.
+- **Empty cells** are reseeded to the farthest point so every cell is dense;
+  **oversized cells** (count > μ + kσ, `split_oversized = true`) are split and
+  refined automatically.
+- `KMeansConfig::for_nlist(n)` is the conservative default (no split, full
+  corpus); `IvfIndex::with_metric` uses k-means while `IvfIndex::with_uniform`
+  keeps the old uniform sampling as a baseline / fallback.
+- Training metadata (`kmeans` / `seed` / `restarts` / `iters` / `sample` /
+  `inertia`) is persisted in the `GIVFv2` payload; legacy `GIVFv1` still loads
+  (no format regression).
+- `CellStats` / `RetrainTrigger::PopulationImbalance` detect unbalanced cell
+  populations and flag a retrain.
+- **`index_tune <table> [target_recall] [k]`** measures Recall@K and scan cost
+  (probed rows) over an `(nlist, nprobe)` grid, prints the recall/cost curve and
+  picks the **cheapest** combination meeting the target. The table needs
+  `id` + `v0..v{d-1}` columns (same shape as `index_save`).
+- API: `gtv_index::{kmeans_train, tune_ivf, tune_ivf_curve, select_tuned}`.
