@@ -181,7 +181,7 @@ impl AlmFilter {
         self
     }
 
-    fn matches(&self, c: &AlmCell) -> bool {
+    pub(crate) fn matches(&self, c: &AlmCell) -> bool {
         self.scenario_id.as_ref().is_none_or(|v| &c.scenario_id == v)
             && self.legal_entity.as_ref().is_none_or(|v| &c.legal_entity == v)
             && self.currency.as_ref().is_none_or(|v| &c.currency == v)

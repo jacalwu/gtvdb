@@ -32,15 +32,16 @@ CPR/TDRR 乘數），並以 BCBS 官方 worked example 做單元測試。餘下�
 | §5.1.1 | `ΔE(k)=CF0·exp(−r0·t_k) − CFi·exp(−ri·t_k)` | ✅ `standardised_eve_scenario` |
 | §5.1.1 | `ΔE_i,c=max(0, Σ_kΔE(k)+KAO)`、`ΔE=max_i Σ_c` | ✅ `aggregate_eve` |
 | §5.1.1 | KAO 期權風險（+25% 隱含波動） | ❌ 只有 `option_risk` 輸入參數，未接期權定價模型 |
+| §5.1.2 | 按**最早重定價日** slot（本金＋coupon） | ✅ `cube_bands` / `slot_cells` / `nearest_band`（principal 按 repricing、coupon 按現金流日） |
 | §5.2.1 | 零售定息貸款 CPR：`min(1, γ_i·CPR_0)` | ✅ `cpr`（γ 乘數表） |
-| §5.2.1 | `CF_i(k)=CF_S(k)+CPR_i·NO_i(k−1)` | ❌ 未接 notional-outstanding 滾動 |
-| §5.2.2 | 零售定期存款 TDRR：`min(1, u_i·TDRR_0)`、早贖入 O/N 帶 | ✅ 乘數/TDRR；🟡 slot 入帶未接 |
-| §5.3.1 | NMD 零售/非零售、core/non-core、caps 90/5、70/4.5、50/4 | ✅ `split_nmd`；🟡 behavioural maturity slot 未接 |
-| §5.1.2 | 按**最早重定價日** slot（本金＋coupon） | ❌ 現有 `eve()` 用 `time_bucket`，非 `repricing_date`，亦無中點/netting |
+| §5.2.1 | `CF_i(k)=CF_S(k)+CPR_i·NO_i(k−1)` | ✅ `prepayment_bands`（notional-outstanding 滾動） |
+| §5.2.2 | 零售定期存款 TDRR：`min(1, u_i·TDRR_0)`、早贖入 O/N 帶 | ✅ `tdrr` + `tdrr_bands` |
+| §5.3.1 | NMD 零售/非零售、core/non-core、caps 90/5、70/4.5、50/4 | ✅ `split_nmd` + `nmd_bands`（non-core 入 O/N、core 按平均行為期限） |
 | §4.4.3 | NII 兩個標準 shock（parallel up/down） | ❌ `nii()` 只係利息現金流求和，未 apply shock |
 | §4.4.4 | Basis-risk 兩個假設情景 | ❌ 未實現 |
 | §4.5.4 | Outlier 測試（ΔEVE > 15% Tier 1） | ❌ 未實現 |
-| §5.34.2 | 風險無關折現曲線（swap curve） | 🟡 `DiscountCurve` 為連續複利；但 `eve()` 允許顯式 `discount_factor` 可繞過風險無關要求 |
+| §5.34.2 | 風險無關折現曲線（swap curve） | 🟡 `DiscountCurve` 為連續複利；標準化路徑 `cube_bands` 唔讀 `discount_factor`（已避開 credit-spread 污染） |
+| — | HKMA / MAS 雙監管切換 | ✅ `Regulator::{Hkma,Mas}` + `shock_table(reporting_year)` |
 
 ---
 
@@ -64,11 +65,10 @@ slot 入時間帶，計 net position `CF_0,c(k)` 及每個 shock 情景下嘅 `C
 **已用 BCBS 官方例子驗證**（d578 SRP31.92）：t_k=3.5Y、R=100bp →
 short +41.7bp、steepener +25.4bp、flattener −1.6bp，測試全部通過。
 
-**缺口**：`standardised_eve_scenario` 只接收**已 slot 好**嘅 `cf0` / `cf_shocked`。
-現有 `AlmCube::eve()` 係 `Σ amount·df(time_bucket)`，**冇**按 `repricing_date`
-slot、**冇**時間帶中點、**冇**逐情景重算，故不能直接用於監管報表。需要新嘅
-`slot_notional_bands()` 將 `AlmCell`（Principals 按 `repricing_date`、coupons 按
-`time_bucket`）映射到 19 帶（取最近中點）並帶內 netting。
+**已補**：`cube_bands()`（`AlmCube` → 19 帶：`Principal` 按 `repricing_date`、
+`Interest`/`Fee`/`Other` 按 `time_bucket`、取最近中點）及 `standardised_eve_from_cube` /
+`standardised_irrbb`（六情景 + aggregate）。現有 `AlmCube::eve()` 仍係通用現值，
+**唔應**用於監管報表；標準化路徑請用 `irrbb` API。
 
 ---
 
@@ -94,10 +94,10 @@ slot、**冇**時間帶中點、**冇**逐情景重算，故不能直接用於�
 
 `CF_i,c,p(k) = CF_i,c,S(k) + CPR_i,c,p·NO_i,c,p(k−1)`（NO = 上期期末名義餘額）。
 
-**實作**：`irrbb::prepayment_multiplier` / `cpr` 已完全對應上表（測試覆蓋）。
-`AlmCube::prepayment()` 則係「`smm` 比例提前 `shift_days`」嘅通用模型，
-**唔等於**監管公式：無 γ 情景、無 rolling notional outstanding、無 `CF_S + CPR·NO(k−1)`。
-需以 `irrbb::cpr` 為基礎重寫 / 新增監管版 prepayment schedule。
+**實作**：`irrbb::prepayment_multiplier` / `cpr` 已完全對應上表，
+`irrbb::prepayment_bands` 實現 `CF_i(k)=CF_S(k)+CPR_i·NO(k−1)`（含 notional
+outstanding 滾動）並測試。`AlmCube::prepayment()` 則係「`smm` 比例提前
+`shift_days`」嘅通用模型，**唔應**用於監管報表。
 
 ---
 
@@ -111,10 +111,9 @@ slot、**冇**時間帶中點、**冇**逐情景重算，故不能直接用於�
 
 早贖名義 `CF_i,c,p(1) = TD_0,c,p·TDRR_i,c,p`，**slot 入隔夜帶 k=1**。
 
-**實作**：`irrbb::tdrr_multiplier` / `tdrr` 已對應（測試覆蓋）。
-`AlmCube::deposit_decay()` 係通用 survival 曲線，**唔係** TDRR；早贖 slot 入 O/N 帶
-亦未接。注意 `deposit_decay` / `liquidity_stress` 屬**內部**資金風險工具，
-唔應與監管標準化 TDRR 混用。
+**實作**：`irrbb::tdrr_multiplier` / `tdrr` 已對應，`irrbb::tdrr_bands` 將早贖
+`TD_0·TDRR_i` 移入隔夜帶（測試覆蓋總額守恆）。`AlmCube::deposit_decay()` 係通用
+survival 曲線，**唔應**與監管標準化 TDRR 混用。
 
 ---
 
@@ -134,9 +133,8 @@ slot、**冇**時間帶中點、**冇**逐情景重算，故不能直接用於�
 
 core 按平均行為期限 slot；**non-core 視為隔夜**。
 
-**實作**：`irrbb::split_nmd` + `NmdCategory::caps` 已完整編碼 caps 並測試
-（例如 observed 95% transactional → 截 90%）。**未接**：core 部分按平均行為期限
-分佈到時間帶（需 caller 提供 behavioural maturity profile）。
+**實作**：`irrbb::split_nmd` + `NmdCategory::caps` 已完整編碼 caps 並測試；
+`irrbb::nmd_bands` 將 non-core 放 O/N、core 按（caps 內）平均行為期限放入最近中點帶。
 
 ---
 
@@ -161,9 +159,20 @@ USD = 200/300/225），第二張為現行 d368（HKD = **200/250/100**、USD = 2
 
 > 註：IR-1 §5.34.3：MOP 跟 HKD；未列幣種 default 400/500/300 bps。已測試。
 
-**缺口**：現行 `alm.rs` 完全冇 shock 情景，`eve()` 只計現時 EVE。需把
-`ShockTable` + `post_shock_rate` 接上 cube，並在報表日 ≥ 2026-01-01 時切換到
-重校準表。
+### 6.1 MAS（新加坡）
+
+MAS 的 IRRBB 要求見 **MAS Notice 653**（“Interest Rate Risk in the Banking Book”），
+採用 BCBS 標準化方法，因此衝擊參數即 BCBS Table 2（SGD：現行 `150/200/100`、
+重校準 `175/250/225` bps）。HKMA IR-1 的兩張表本身就是 BCBS 表，所以同一
+`ShockTable` 可直接支援 SGD。
+
+> ⚠️ **取不到 MAS 原文**：`mas.gov.sg` 現時回 “Maintenance” / 404（2026-09-14 嘗試）。
+> 程式碼以 `Regulator::Mas` 暴露 MAS 選項（`shock_table(2026)` 選重校準表），
+> 但**未經 MAS Notice 653 原文核對**是否有本地 overlay（例如 floor / 生效日）。
+> 待官網恢復後應重新下載並補核。
+
+**缺口**：現行 `alm.rs` 完全冇 shock 情景，`eve()` 只計現時 EVE。`irrbb::Regulator`
++ `standardised_irrbb` 已可接上。
 
 ---
 
@@ -232,26 +241,37 @@ USD = 200/300/225），第二張為現行 d368（HKD = **200/250/100**、USD = 2
 - `NmdCategory` / `NmdSplit` / `split_nmd`（caps 90/5、70/4.5、50/4）。
 - `prepayment_multiplier` / `cpr`、`tdrr_multiplier` / `tdrr`（γ / u 乘數）。
 - `curve_zero`（`DiscountCurve` → `Fn(t_years)`）。
-- **9 個單元測試**，包括 BCBS d578 worked examples、HKD/USD 兩版 shock 表、
-  19 帶中點、ΔE 公式手算對比、floor、NMD caps、γ/u 乘數。
+- **Slotting 引擎**：`SlotDate`、`nearest_band`、`slot_cells`、`cube_bands`（principal 按
+  `repricing_date`、coupon 按 `time_bucket`、排除情景依賴項）。
+- **高階 EVE**：`standardised_eve_from_cube`、`standardised_irrbb`（六情景 + aggregate）。
+- **NMD / 行為現金流**：`NmdPortfolio` / `nmd_bands`、`prepayment_bands`、`tdrr_bands`。
+- **監管切換**：`Regulator::{Hkma,Mas}` + `shock_table(reporting_year)`（2026-01-01 前用
+  d368 表、其後用 d578 重校準表）。
+- **16 個單元測試**，包括 BCBS d578 worked examples、HKD/USD/SGD 兩版 shock 表、
+  19 帶中點、ΔE 公式手算對比、floor、NMD caps 及 slotting、γ/u 乘數、
+  prepayment/TDRR schedule、HKMA vs MAS 平行衝擊大小比較。
 
-`cargo test -p gtv-scenario`：**36 passed / 0 failed**（原 27 → +9）。
+`cargo test -p gtv-scenario`：**43 passed / 0 failed**（IRRBB 前 27 → +16）。
 
 ---
 
-## 12. 建議後續（完成 IR-1 合規）
+## 12. 建議後續（完成 IR-1 / MAS 合規）
 
-1. **Slotting 引擎**：`AlmCube → [f64; 19]`，Principal 按 `repricing_date`、
-   coupon 按 `time_bucket`，取最近中點；帶內 positive/negative netting。
-2. **情景化現金流**：接 `irrbb::cpr`（含 `NO_i(k−1)` 滾動）及 `irrbb::tdrr`
-   （早贖入 O/N 帶）；NMD core 依平均行為期限分佈、non-core 入 O/N。
-3. **KAO 期權定價**：用 D5 `DiscountCurve` + Black 模型，shock 曲線 + 隱含波動 +25%。
-4. **NII 情景**：parallel up/down 對重定價頭寸計 12 個月 ΔNII；加 §4.4.4 basis 情景。
-5. **報表版本切換**：依報表日自動選 `Current2018` / `Recalibrated2026`（2026-01-01）。
-6. **Outlier 測試**：`ΔEVE > 15% × Tier1`。
-7. **風險無關折現**：標準化路徑禁止 `discount_factor` override。
-8. 新增 CLI / SQL surface（例如 `irrbb_eve(...)`、`irrbb_shocks(<currency>)`）並更新
-   user menu。
+已於本輪完成（見 §11）：
+1. ✅ **Slotting 引擎**：`cube_bands` / `slot_cells` / `nearest_band`。
+2. ✅ **情景化現金流**：`prepayment_bands`（CPR + `NO(k−1)`）及 `tdrr_bands`。
+3. ✅ **NMD slotting**：`nmd_bands`（non-core O/N、core 按 caps 內平均行為期限）。
+4. ✅ **監管切換**：`Regulator::{Hkma,Mas}` + 2026 表切換。
+
+尚未完成：
+5. **KAO 期權定價**：用 D5 `DiscountCurve` + Black 模型，shock 曲線 + 隱含波動 +25%。
+6. **NII 情景**：parallel up/down 對重定價頭寸計 12 個月 ΔNII；加 §4.4.4 basis 情景。
+7. **Outlier 測試**：`ΔEVE > 15% × Tier1`。
+8. **風險無關折現**：`cube_bands` 已不讀 `discount_factor`；標準化 API 應在 doc/
+   code 明確禁止 caller 傳入含 spread 的曲線。
+9. **MAS 原文核對**：官網恢復後下載 Notice 653，確認 SGD 參數 / floor / 生效日。
+10. 新增 CLI / SQL surface（例如 `irrbb_eve('HKD')`、`irrbb_shocks('SGD', 2026)`）並更新
+    user menu。
 
 ---
 

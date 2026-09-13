@@ -26,7 +26,7 @@ use std::collections::BTreeMap;
 
 use thiserror::Error;
 
-use crate::alm::DiscountCurve;
+use crate::alm::{AlmCell, AlmCube, AlmFilter, CashflowType, DiscountCurve};
 
 /// Errors from the standardised IRRBB computations.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -467,9 +467,282 @@ pub fn curve_zero(curve: &DiscountCurve) -> impl Fn(f64) -> f64 + '_ {
     move |t_years: f64| curve.zero_rate((t_years * 365.0).round() as i64)
 }
 
+// ---------------------------------------------------------------------------
+// Regulator selection
+// ---------------------------------------------------------------------------
+
+/// The supervisory regime whose standardised parameters are applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Regulator {
+    /// Hong Kong Monetary Authority — SPM IR-1.
+    Hkma,
+    /// Monetary Authority of Singapore — Notice 653.
+    Mas,
+}
+
+impl Regulator {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Regulator::Hkma => "HKMA",
+            Regulator::Mas => "MAS",
+        }
+    }
+
+    /// The specified-shock table for a reporting year.
+    ///
+    /// Both HKMA and MAS follow the BCBS d578 recalibration timetable
+    /// (implementation by 1 January 2026); before that the BCBS d368 table
+    /// applies. MAS Notice 653 adopts the BCBS standardised approach, so the
+    /// same BCBS tables apply (SGD included) pending any local overlay.
+    pub fn shock_table(self, reporting_year: i32) -> ShockTable {
+        if reporting_year >= 2026 {
+            ShockTable::recalibrated_2026()
+        } else {
+            ShockTable::current()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Slotting notional repricing cash flows into the 19 time bands
+// ---------------------------------------------------------------------------
+
+/// Which date of an [`AlmCell`] is used to choose the time band.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotDate {
+    /// Earliest interest-rate repricing date (notional principal).
+    RepricingDate,
+    /// Cash-flow / payment date (coupons, fees).
+    CashflowDate,
+}
+
+/// Index of the band whose midpoint is closest to `date_years` (ties resolve
+/// to the earlier band).
+pub fn nearest_band(bands: &[TimeBand], date_years: f64) -> usize {
+    let mut best = 0usize;
+    let mut best_d = f64::INFINITY;
+    for (i, b) in bands.iter().enumerate() {
+        let d = (b.midpoint_years - date_years).abs();
+        if d < best_d - 1e-12 {
+            best_d = d;
+            best = i;
+        }
+    }
+    best
+}
+
+fn slot_into(out: &mut [f64], bands: &[TimeBand], days: i64, amount: f64) {
+    let idx = nearest_band(bands, days as f64 / 365.0);
+    out[idx] += amount;
+}
+
+/// Slot cells into the bands using an explicit date selector.
+pub fn slot_cells(
+    cells: &[AlmCell],
+    bands: &[TimeBand],
+    filter: &AlmFilter,
+    selector: SlotDate,
+) -> Vec<f64> {
+    let mut out = vec![0.0; bands.len()];
+    for c in cells.iter().filter(|c| filter.matches(c)) {
+        let days = match selector {
+            SlotDate::RepricingDate => c.repricing_date,
+            SlotDate::CashflowDate => c.time_bucket,
+        };
+        slot_into(&mut out, bands, days, c.amount);
+    }
+    out
+}
+
+/// Net notional repricing cash flows `CF_0(k)` for the standardised framework:
+/// * `Principal` is slotted by its earliest repricing date;
+/// * `Interest` / `Fee` / `Other` and plain `Deposit` cash flows are slotted by
+///   their payment date;
+/// * `Prepayment` / `Optionality` cells are excluded (they are scenario- or
+///   option-dependent and are handled by [`prepayment_bands`] / the option
+///   risk measure `KAO`).
+///
+/// NMDs should normally be supplied separately via [`NmdPortfolio`] /
+/// [`nmd_bands`] rather than as plain `Deposit` cells.
+pub fn cube_bands(cube: &AlmCube, bands: &[TimeBand], filter: &AlmFilter) -> Vec<f64> {
+    let mut out = vec![0.0; bands.len()];
+    for c in cube.cells() {
+        if !filter.matches(c) {
+            continue;
+        }
+        let days = match c.cashflow_type {
+            CashflowType::Principal => c.repricing_date,
+            CashflowType::Interest | CashflowType::Fee | CashflowType::Other => c.time_bucket,
+            CashflowType::Deposit => c.time_bucket,
+            CashflowType::Prepayment | CashflowType::Optionality => continue,
+        };
+        slot_into(&mut out, bands, days, c.amount);
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// High-level standardised EVE on an AlmCube
+// ---------------------------------------------------------------------------
+
+/// Standardised EVE for one scenario, slotting `cube` into the bands.
+#[allow(clippy::too_many_arguments)]
+pub fn standardised_eve_from_cube(
+    cube: &AlmCube,
+    bands: &[TimeBand],
+    filter: &AlmFilter,
+    base_zero: impl Fn(f64) -> f64,
+    scenario: ShockScenario,
+    params: ShockParams,
+    option_risk: f64,
+    floor: f64,
+) -> Result<EveScenarioResult, IrrbbError> {
+    let cf = cube_bands(cube, bands, filter);
+    standardised_eve_scenario(bands, &cf, &cf, base_zero, scenario, params, option_risk, floor)
+}
+
+/// The full six-scenario standardised EVE measure for one currency.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IrrbbResult {
+    pub per_scenario: Vec<EveScenarioResult>,
+    /// `max_i ΔE_i` across the six scenarios.
+    pub aggregate: f64,
+    pub cf0: Vec<f64>,
+    pub bands: Vec<TimeBand>,
+}
+
+/// Compute all six scenarios and the aggregate for one currency. TODO: the
+/// shocked cash flows currently equal the base cash flows; scenario-dependent
+/// products (CPR/NMD) must be folded into `cf` by the caller via
+/// [`prepayment_bands`] / [`nmd_bands`].
+#[allow(clippy::too_many_arguments)]
+pub fn standardised_irrbb(
+    cube: &AlmCube,
+    bands: &[TimeBand],
+    filter: &AlmFilter,
+    base_zero: impl Fn(f64) -> f64,
+    table: &ShockTable,
+    currency: &str,
+    option_risk: f64,
+    floor: f64,
+) -> Result<IrrbbResult, IrrbbError> {
+    let cf = cube_bands(cube, bands, filter);
+    let params = table.params(currency);
+    let mut per_scenario = Vec::with_capacity(6);
+    for scenario in ShockScenario::ALL {
+        per_scenario.push(standardised_eve_scenario(
+            bands,
+            &cf,
+            &cf,
+            &base_zero,
+            scenario,
+            params,
+            option_risk,
+            floor,
+        )?);
+    }
+    let totals: Vec<f64> = per_scenario.iter().map(|r| r.delta_eve).collect();
+    Ok(IrrbbResult {
+        aggregate: aggregate_eve(&totals),
+        per_scenario,
+        cf0: cf,
+        bands: bands.to_vec(),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// NMD slotting
+// ---------------------------------------------------------------------------
+
+/// One NMD portfolio to be slotted under the behavioural-maturity approach.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NmdPortfolio {
+    /// Signed balance (positive = inflow; negative = liability).
+    pub total: f64,
+    pub observed_core_ratio: f64,
+    pub category: NmdCategory,
+    /// AI-estimated average behavioural maturity of the core portion (years),
+    /// capped at the category cap.
+    pub average_core_maturity_years: f64,
+    pub currency: String,
+}
+
+/// Slot an NMD portfolio: non-core is placed in the overnight band and core in
+/// the band whose midpoint is closest to the (capped) average behavioural
+/// maturity (IR-1 §5.3.1).
+pub fn nmd_bands(portfolio: &NmdPortfolio, bands: &[TimeBand]) -> Vec<f64> {
+    let split = split_nmd(
+        portfolio.total,
+        portfolio.observed_core_ratio,
+        portfolio.category,
+    );
+    let mut out = vec![0.0; bands.len()];
+    if !out.is_empty() {
+        // Non-core deposits are overnight.
+        out[0] += split.non_core;
+    }
+    let maturity = portfolio
+        .average_core_maturity_years
+        .clamp(0.0, split.max_core_maturity_years);
+    let idx = nearest_band(bands, maturity);
+    out[idx] += split.core;
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Scenario-dependent behavioural cash flows
+// ---------------------------------------------------------------------------
+
+/// Scenario prepayment schedule for retail fixed-rate loans (IR-1 §5.2.1):
+///
+/// ```text
+/// CF_i(k) = CF_S(k) + CPR_i · NO(k-1)
+/// ```
+///
+/// `scheduled_principal[k]` is the scheduled principal repayment in band `k`;
+/// `NO(k-1)` is the notional still outstanding after band `k-1`.
+pub fn prepayment_bands(
+    scheduled_principal: &[f64],
+    baseline_cpr: f64,
+    scenario: ShockScenario,
+) -> Vec<f64> {
+    let rate = cpr(scenario, baseline_cpr);
+    let mut out = vec![0.0; scheduled_principal.len()];
+    let mut outstanding: f64 = scheduled_principal.iter().sum();
+    for k in 0..scheduled_principal.len() {
+        let scheduled = scheduled_principal[k];
+        let prepay = rate * outstanding;
+        out[k] = scheduled + prepay;
+        outstanding = (outstanding - scheduled - prepay).max(0.0);
+    }
+    out
+}
+
+/// Scenario cash flows for retail term deposits subject to early redemption
+/// risk (IR-1 §5.2.2): `TD_0·TDRR_i` is withdrawn early and slotted into the
+/// overnight band, the remainder stays at its contractual band.
+pub fn tdrr_bands(
+    term_deposits: &[f64],
+    baseline_tdrr: f64,
+    scenario: ShockScenario,
+) -> Vec<f64> {
+    let rate = tdrr(scenario, baseline_tdrr);
+    let mut out = vec![0.0; term_deposits.len()];
+    for (k, td) in term_deposits.iter().enumerate() {
+        if k == 0 {
+            out[0] += td;
+        } else {
+            out[0] += td * rate;
+            out[k] += td * (1.0 - rate);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::alm::{AlmCell, AlmCube, AlmFilter, CashflowType};
 
     fn approx(a: f64, b: f64, eps: f64) -> bool {
         (a - b).abs() <= eps
@@ -679,5 +952,133 @@ mod tests {
         let f = curve_zero(&curve);
         assert!(approx(f(0.0), 0.01, 1e-12));
         assert!(approx(f(1.0), 0.03, 1e-12));
+    }
+
+    #[test]
+    fn nearest_band_selects_the_closest_midpoint() {
+        let bands = standard_time_bands();
+        assert_eq!(nearest_band(&bands, 0.0), 0);
+        assert_eq!(nearest_band(&bands, 0.9), 5); // 1Y midpoint 0.875
+        assert_eq!(nearest_band(&bands, 3.5), 9); // 4Y band (BCBS example)
+        assert_eq!(nearest_band(&bands, 30.0), 18);
+    }
+
+    #[test]
+    fn cube_bands_slot_principal_by_repricing_and_coupon_by_cashflow() {
+        let bands = standard_time_bands();
+        let mut cube = AlmCube::new();
+        // fixed-rate loan: principal reprices (matures) at 365d, coupon paid at 365d
+        cube.push(
+            AlmCell::new("s", "LE", "HKD", "Loan", 365, CashflowType::Principal, 100.0)
+                .with_repricing(365),
+        );
+        cube.push(
+            AlmCell::new("s", "LE", "HKD", "Loan", 365, CashflowType::Interest, 5.0)
+                .with_repricing(365),
+        );
+        // floating: notional reprices at 90d even though the cash flow lands at 365d
+        cube.push(
+            AlmCell::new("s", "LE", "HKD", "Floater", 365, CashflowType::Principal, 50.0)
+                .with_repricing(90),
+        );
+        let cf = cube_bands(&cube, &bands, &AlmFilter::default());
+        assert!(approx(cf[5], 105.0, 1e-9)); // 1Y band: principal + coupon
+        assert!(approx(cf[2], 50.0, 1e-9)); // 3M band: floating notional
+    }
+
+    #[test]
+    fn regulator_selects_the_table_by_reporting_year() {
+        assert_eq!(Regulator::Hkma.as_str(), "HKMA");
+        assert_eq!(Regulator::Mas.as_str(), "MAS");
+        assert_eq!(Regulator::Hkma.shock_table(2025).params("HKD").parallel_bps, 200.0);
+        assert_eq!(Regulator::Hkma.shock_table(2026).params("HKD").parallel_bps, 225.0);
+        // MAS adopts the BCBS standard: SGD current 150, recalibrated 175.
+        assert_eq!(Regulator::Mas.shock_table(2025).params("SGD").parallel_bps, 150.0);
+        assert_eq!(Regulator::Mas.shock_table(2026).params("SGD").parallel_bps, 175.0);
+    }
+
+    #[test]
+    fn standardised_irrbb_runs_six_scenarios_for_hkma_and_mas() {
+        let bands = standard_time_bands();
+        let mut cube = AlmCube::new();
+        cube.push(
+            AlmCell::new("s", "LE", "HKD", "Loan", 365, CashflowType::Principal, 1000.0)
+                .with_repricing(365),
+        );
+        let base = |_t: f64| 0.03;
+        let hk = Regulator::Hkma.shock_table(2025);
+        let r_hk = standardised_irrbb(
+            &cube,
+            &bands,
+            &AlmFilter::default(),
+            base,
+            &hk,
+            "HKD",
+            0.0,
+            DEFAULT_RATE_FLOOR,
+        )
+        .unwrap();
+        assert_eq!(r_hk.per_scenario.len(), 6);
+        assert!(r_hk.aggregate > 0.0);
+        assert!(approx(r_hk.cf0[5], 1000.0, 1e-9));
+
+        // Same cube, SGD + MAS table: 150bp parallel vs HKD 200bp -> smaller loss.
+        let sg = Regulator::Mas.shock_table(2025);
+        let r_sg = standardised_irrbb(
+            &cube,
+            &bands,
+            &AlmFilter::default(),
+            base,
+            &sg,
+            "SGD",
+            0.0,
+            DEFAULT_RATE_FLOOR,
+        )
+        .unwrap();
+        assert!(
+            r_hk.per_scenario[0].delta_eve > r_sg.per_scenario[0].delta_eve,
+            "HKD 200bp parallel loss should exceed SGD 150bp"
+        );
+    }
+
+    #[test]
+    fn nmd_bands_place_noncore_overnight_and_core_at_capped_maturity() {
+        let bands = standard_time_bands();
+        let p = NmdPortfolio {
+            total: 1000.0,
+            observed_core_ratio: 0.95, // capped to 90% for transactional
+            category: NmdCategory::RetailTransactional,
+            average_core_maturity_years: 10.0, // capped to 5y
+            currency: "HKD".into(),
+        };
+        let b = nmd_bands(&p, &bands);
+        assert!(approx(b[0], 100.0, 1e-9)); // non-core overnight
+        assert!(approx(b[10], 900.0, 1e-9)); // core at the 5Y band
+        assert!(approx(b.iter().sum::<f64>(), 1000.0, 1e-9));
+    }
+
+    #[test]
+    fn prepayment_bands_front_load_and_follow_the_scenario_multiplier() {
+        let scheduled = vec![0.0, 0.0, 0.0, 100.0, 0.0];
+        assert_eq!(
+            prepayment_bands(&scheduled, 0.0, ShockScenario::ParallelUp),
+            scheduled
+        );
+        let up = prepayment_bands(&scheduled, 0.1, ShockScenario::ParallelUp); // γ=0.8
+        let down = prepayment_bands(&scheduled, 0.1, ShockScenario::ParallelDown); // γ=1.2
+        assert!(up[0] > 0.0 && up[1] > 0.0 && up[2] > 0.0, "prepayments move earlier");
+        assert!(up.iter().sum::<f64>() >= 100.0);
+        assert!(down.iter().sum::<f64>() > up.iter().sum::<f64>());
+    }
+
+    #[test]
+    fn tdrr_bands_conserve_total_and_move_early_redemptions_overnight() {
+        let td = vec![0.0, 100.0, 0.0];
+        let up = tdrr_bands(&td, 0.1, ShockScenario::ParallelUp); // u=1.2 -> 12%
+        assert!(approx(up.iter().sum::<f64>(), 100.0, 1e-9));
+        assert!(approx(up[0], 12.0, 1e-9));
+        assert!(approx(up[1], 88.0, 1e-9));
+        let down = tdrr_bands(&td, 0.1, ShockScenario::ParallelDown); // u=0.8 -> 8%
+        assert!(approx(down[0], 8.0, 1e-9));
     }
 }
