@@ -163,13 +163,18 @@ graph+vector hybrid score、alert explanation subgraph、case snapshot / feedbac
 > cycle-safe、ultimate-owner threshold）；`cosine_similarity` + `hybrid_score`
 > （graph/vector 加權融合）；`CaseSnapshot`（execution_id + 確定性重演）；
 > `FeedbackLedger`（TP/FP/inconclusive、FPR、threshold 建議）。9 個 unit tests。
-> **待做**：`gtv-pattern` 嘅 rolling-window motif DSL / sequence constraint
-> （屬唯讀擴充，未接）。
+>
+> **已交付（唯讀擴充）**：`crates/gtv-pattern` — `WindowedMotif`（`pattern` +
+> `max_event_span` rolling window + `sequence` 有序 edge-type 約束）、
+> `find_windowed` / `find_windowed_from`。純加法：`Pattern` / `find` /
+> `find_from` / `find_bounded` / ring / path / diamond 行為不變。5 個新 tests
+>（gtv-pattern 6 → 11）。
 
 **驗收條件**
 
-- [x] 現有 `pattern` ring / path / diamond 零回歸（gtv-pattern 未改，workspace 全綠）。
-- [ ] rolling-window motif + sequence constraint 正確性對 oracle（待做）。
+- [x] 現有 `pattern` ring / path / diamond 零回歸（原有 6 個 tests 全過）。
+- [x] rolling-window motif + sequence constraint 正確性對 oracle
+      （window span 過濾、sequence 排序過濾、組合約束、無約束等於 `find`）。
 - [x] alert explanation subgraph 可輸出且只含相關節點 / 邊。
 - [x] case snapshot 可完整重演（同輸入 → 逐位元一致）。
 - [x] hybrid score 可量度（graph risk + embedding cosine，加權融合並 clamp）。

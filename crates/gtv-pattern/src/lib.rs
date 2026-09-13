@@ -31,7 +31,7 @@ pub struct EventOrder {
 }
 
 /// A temporal graph pattern.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Pattern {
     pub num_vars: usize,
     pub edges: Vec<PatternEdge>,
@@ -106,6 +106,78 @@ impl Pattern {
     }
 }
 
+/// A [`Pattern`] plus the AML motif constraints added by prod_p4 D3:
+///
+/// * **rolling window** — every matched edge's event time must fall inside a
+///   window of at most `max_event_span` units
+///   (`max(valid_from) - min(valid_from) <= span`);
+/// * **sequence** — when `sequence` is non-empty it must have exactly one edge
+///   type per pattern edge, and the matched edge types, ordered by event time
+///   (ties broken by edge declaration order), must equal it.
+///
+/// This is a purely additive wrapper: [`Pattern`], [`find`], [`find_from`],
+/// [`find_bounded`] and the built-in ring / path / diamond constructors are
+/// unchanged.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WindowedMotif {
+    pub pattern: Pattern,
+    pub max_event_span: Option<i64>,
+    pub sequence: Vec<u16>,
+}
+
+impl WindowedMotif {
+    pub fn new(pattern: Pattern) -> Self {
+        Self {
+            pattern,
+            max_event_span: None,
+            sequence: Vec::new(),
+        }
+    }
+
+    /// Require all matched edges to occur within `span` event-time units.
+    pub fn with_window(mut self, span: i64) -> Self {
+        self.max_event_span = Some(span);
+        self
+    }
+
+    /// Require the matched edges, in event-time order, to follow this edge-type
+    /// sequence (one entry per pattern edge).
+    pub fn with_sequence(mut self, sequence: Vec<u16>) -> Self {
+        self.sequence = sequence;
+        self
+    }
+
+    /// True when a fully bound DFS state satisfies the motif constraints.
+    fn accepts(&self, state: &DfsState) -> bool {
+        if let Some(span) = self.max_event_span {
+            let min = state.valid_from.iter().copied().min().unwrap_or(0);
+            let max = state.valid_from.iter().copied().max().unwrap_or(0);
+            if max - min > span {
+                return false;
+            }
+        }
+        if !self.sequence.is_empty() {
+            if self.sequence.len() != state.edge_type.len() {
+                return false;
+            }
+            let mut order: Vec<usize> = (0..state.valid_from.len()).collect();
+            order.sort_by(|a, b| {
+                state.valid_from[*a]
+                    .cmp(&state.valid_from[*b])
+                    .then(a.cmp(b))
+            });
+            if order
+                .iter()
+                .enumerate()
+                .any(|(rank, &i)| state.edge_type[i] != self.sequence[rank])
+            {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 /// One matched edge within a [`Match`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MatchedEdge {
@@ -117,7 +189,7 @@ pub struct MatchedEdge {
 }
 
 /// A complete pattern match: node bindings per variable plus the matched edges.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Match {
     /// `nodes[var]` is the bound node id for variable `var`.
     pub nodes: Vec<u64>,
@@ -138,7 +210,46 @@ pub fn find_from(
     let mut state = DfsState::new(pattern);
     state.nodes[0] = start;
     let mut matches = Vec::new();
-    dfs(csr, pattern, valid_at, 0, &mut state, &mut matches, limit, None)?;
+    dfs(
+        csr,
+        pattern,
+        valid_at,
+        0,
+        &mut state,
+        &mut matches,
+        limit,
+        None,
+        None,
+    )?;
+    Ok(matches)
+}
+
+/// Find up to `limit` windowed-motif matches anchoring variable 0 at `start`.
+pub fn find_windowed_from(
+    csr: &TemporalCSR,
+    motif: &WindowedMotif,
+    start: u64,
+    valid_at: i64,
+    limit: usize,
+) -> Result<Vec<Match>> {
+    let pattern = &motif.pattern;
+    if limit == 0 || pattern.num_vars == 0 {
+        return Ok(Vec::new());
+    }
+    let mut state = DfsState::new(pattern);
+    state.nodes[0] = start;
+    let mut matches = Vec::new();
+    dfs(
+        csr,
+        pattern,
+        valid_at,
+        0,
+        &mut state,
+        &mut matches,
+        limit,
+        None,
+        Some(motif),
+    )?;
     Ok(matches)
 }
 
@@ -308,7 +419,53 @@ pub fn find(
             break;
         }
         state.nodes[0] = start;
-        dfs(csr, pattern, valid_at, 0, &mut state, &mut out, limit, None)?;
+        dfs(
+            csr,
+            pattern,
+            valid_at,
+            0,
+            &mut state,
+            &mut out,
+            limit,
+            None,
+            None,
+        )?;
+    }
+    Ok(out)
+}
+
+/// Find up to `limit` windowed-motif matches over all start nodes.
+///
+/// The optimized 3-cycle fast path is intentionally bypassed so the window /
+/// sequence constraints are always enforced.
+pub fn find_windowed(
+    csr: &TemporalCSR,
+    motif: &WindowedMotif,
+    valid_at: i64,
+    limit: usize,
+) -> Result<Vec<Match>> {
+    let pattern = &motif.pattern;
+    if limit == 0 || pattern.num_vars == 0 {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    let mut state = DfsState::new(pattern);
+    for start in 0..csr.node_count() as u64 {
+        if out.len() >= limit {
+            break;
+        }
+        state.nodes[0] = start;
+        dfs(
+            csr,
+            pattern,
+            valid_at,
+            0,
+            &mut state,
+            &mut out,
+            limit,
+            None,
+            Some(motif),
+        )?;
     }
     Ok(out)
 }
@@ -350,6 +507,7 @@ pub fn find_bounded(
             &mut out,
             limit,
             Some(&tracker),
+            None,
         )?;
         tracker.add_rows(out.len() as u64)?;
     }
@@ -400,6 +558,7 @@ impl DfsState {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dfs(
     csr: &TemporalCSR,
     pattern: &Pattern,
@@ -409,12 +568,15 @@ fn dfs(
     matches: &mut Vec<Match>,
     limit: usize,
     tracker: Option<&BudgetTracker>,
+    motif: Option<&WindowedMotif>,
 ) -> Result<()> {
     if matches.len() >= limit {
         return Ok(());
     }
     if ei == pattern.edges.len() {
-        if state.event_orders_satisfied(pattern) {
+        if state.event_orders_satisfied(pattern)
+            && motif.is_none_or(|m| m.accepts(state))
+        {
             matches.push(state.to_match(pattern));
         }
         return Ok(());
@@ -457,7 +619,17 @@ fn dfs(
             state.valid_from[ei] = vf_i;
             state.valid_to[ei] = vt[idx];
             state.edge_type[ei] = et[idx];
-            dfs(csr, pattern, valid_at, ei + 1, state, matches, limit, tracker)?;
+            dfs(
+                csr,
+                pattern,
+                valid_at,
+                ei + 1,
+                state,
+                matches,
+                limit,
+                tracker,
+                motif,
+            )?;
         } else {
             // Bind a fresh variable: keep node assignments distinct.
             let mut dup = false;
@@ -474,7 +646,17 @@ fn dfs(
             state.valid_from[ei] = vf_i;
             state.valid_to[ei] = vt[idx];
             state.edge_type[ei] = et[idx];
-            dfs(csr, pattern, valid_at, ei + 1, state, matches, limit, tracker)?;
+            dfs(
+                csr,
+                pattern,
+                valid_at,
+                ei + 1,
+                state,
+                matches,
+                limit,
+                tracker,
+                motif,
+            )?;
             state.nodes[e.to] = u64::MAX;
         }
     }
@@ -616,5 +798,89 @@ mod tests {
             Some(&token),
         );
         assert!(matches!(got, Err(gtv_core::GtvError::Cancelled)));
+    }
+
+    /// Two chains with distinct edge types:
+    ///   0 ->(7) 1 ->(8) 2 ->(9) 3   @10, 20, 30
+    ///   0 ->(9) 4 ->(8) 5 ->(7) 6   @10, 20, 30
+    fn sequenced_graph() -> TemporalGraph {
+        let nodes = NodeTable::new(
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new("id", DataType::UInt64, false)])),
+                vec![Arc::new(UInt64Array::from(vec![0u64, 1, 2, 3, 4, 5, 6])) as _],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let edges = EdgeTable::from_vecs(
+            vec![0, 1, 2, 0, 4, 5],
+            vec![1, 2, 3, 4, 5, 6],
+            vec![7u16, 8, 9, 9, 8, 7],
+            vec![10, 20, 30, 10, 20, 30],
+            vec![1000, 1000, 1000, 1000, 1000, 1000],
+        )
+        .unwrap();
+        TemporalGraph::new(nodes, edges).unwrap()
+    }
+
+    #[test]
+    fn sequence_constraint_selects_matching_order() {
+        let g = sequenced_graph();
+        let base = Pattern::temporal_path(3);
+
+        // Both chains match without a sequence constraint.
+        assert_eq!(find_from(g.csr(), &base, 0, 500, 10).unwrap().len(), 2);
+
+        let motif = WindowedMotif::new(base.clone()).with_sequence(vec![7, 8, 9]);
+        let m = find_windowed_from(g.csr(), &motif, 0, 500, 10).unwrap();
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].nodes, vec![0, 1, 2, 3]);
+
+        let reversed = WindowedMotif::new(base).with_sequence(vec![9, 8, 7]);
+        let m = find_windowed_from(g.csr(), &reversed, 0, 500, 10).unwrap();
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].nodes, vec![0, 4, 5, 6]);
+    }
+
+    #[test]
+    fn rolling_window_filters_by_event_span() {
+        let g = sequenced_graph();
+        let base = Pattern::temporal_path(3);
+        // span = 30 - 10 = 20
+        let wide = WindowedMotif::new(base.clone()).with_window(20);
+        assert_eq!(find_windowed_from(g.csr(), &wide, 0, 500, 10).unwrap().len(), 2);
+        let tight = WindowedMotif::new(base).with_window(15);
+        assert!(find_windowed_from(g.csr(), &tight, 0, 500, 10)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn windowed_motif_combines_window_and_sequence() {
+        let g = sequenced_graph();
+        let motif = WindowedMotif::new(Pattern::temporal_path(3))
+            .with_window(20)
+            .with_sequence(vec![7, 8, 9]);
+        let m = find_windowed(g.csr(), &motif, 500, 10).unwrap();
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].nodes, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn windowed_without_constraints_matches_plain_find() {
+        let g = sequenced_graph();
+        let plain = find_from(g.csr(), &Pattern::temporal_path(3), 0, 500, 10).unwrap();
+        let motif = WindowedMotif::new(Pattern::temporal_path(3));
+        let windowed = find_windowed_from(g.csr(), &motif, 0, 500, 10).unwrap();
+        assert_eq!(plain, windowed);
+    }
+
+    #[test]
+    fn wrong_sequence_length_matches_nothing() {
+        let g = sequenced_graph();
+        let motif = WindowedMotif::new(Pattern::temporal_path(3)).with_sequence(vec![7, 8]);
+        assert!(find_windowed_from(g.csr(), &motif, 0, 500, 10)
+            .unwrap()
+            .is_empty());
     }
 }
