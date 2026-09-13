@@ -199,13 +199,19 @@ graph+vector hybrid score、alert explanation subgraph、case snapshot / feedbac
 3. curve / calendar / currency / jurisdiction reference data。
 4. 歷史版本查詢（`as_of`）。
 
+> **已交付（首增量）**：`crates/gtv-refdata` — `EffectiveRange`（`gtv_core::BitemporalRange`
+> business axis 投影）、`Hierarchy`（effective-dated edges、同時段循環拒絕、
+> parents/children/ancestors/descendants/roots/leaves、deterministic `rollup`）、
+> `MasterData`（`(kind, id)` 時間唯一鍵、referential constraints + 檢查）、
+> `ReferenceData`（`(domain, key)` effective-dated 值）。14 個 unit tests。
+
 **驗收條件**
 
-- [ ] hierarchy 查詢（祖先 / 後代 / roll-up）對 oracle 一致。
-- [ ] effective dating 正確：`as_of(t)` 回當時版本。
-- [ ] master / reference data 有唯一鍵與 referential 檢查。
-- [ ] 循環 hierarchy 被拒絕。
-- [ ] 重算確定性 + 零回歸。
+- [x] hierarchy 查詢（祖先 / 後代 / roll-up）對 oracle 一致。
+- [x] effective dating 正確：`as_of(t)` 回當時版本。
+- [x] master / reference data 有唯一鍵與 referential 檢查。
+- [x] 循環 hierarchy 被拒絕（含時段重疊循環；非重疊重組允許）。
+- [x] 重算確定性 + 零回歸。
 
 ---
 

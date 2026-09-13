@@ -2095,6 +2095,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "gtv-refdata"
+version = "0.1.0"
+dependencies = [
+ "gtv-core",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "gtv-scenario"
 version = "0.1.0"
 dependencies = [
