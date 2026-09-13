@@ -13,6 +13,7 @@
 pub mod alm;
 pub mod catalog;
 pub mod ftp;
+pub mod irrbb;
 pub mod scenario;
 
 pub use alm::{
@@ -24,6 +25,12 @@ pub use ftp::{
     reconcile, BasisSpread, BehaviouralAdjustment, FtpBreakdown, FtpCurve, FtpCurveCatalog,
     FtpEngine, FtpError, FtpPolicy, FtpPolicyCatalog, FtpReconciliation, FtpRequest, FtpStep,
     LiquidityPremium, OptionalityCharge,
+};
+pub use irrbb::{
+    aggregate_eve, cpr, post_shock_rate, prepayment_multiplier, shock_delta_bps, split_nmd,
+    standard_time_bands, standardised_eve_scenario, tdrr, tdrr_multiplier, curve_zero,
+    EveScenarioResult, IrrbbError, NmdCategory, NmdSplit, ShockParams, ShockScenario, ShockTable,
+    ShockTableVersion, TimeBand, DEFAULT_RATE_FLOOR,
 };
 pub use scenario::{
     Change, Dimension, Provenance, ResolvedScenario, ResolvedShock, Scenario, ScenarioDiff,
