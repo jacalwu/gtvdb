@@ -348,6 +348,10 @@ udf [x ...]                remote <host:port> <sql>
 metrics                                  # 引擎計數器 + SQL 延遲直方圖 + workload telemetry（Prometheus 文字）
 workload                                 # 每 class workload admission / 隔離狀態（§19）
 cbo [on|off|recall R]                    # 多模態 cost-based optimizer 狀態 / 設定（§18）
+scenario_load <table>                    # 載入版本化 scenario（§20）
+hierarchy_load <kind> <table>            # 載入 effective-dated hierarchy 邊
+refdata_load <table>                     # 載入 effective-dated reference 值
+master_load <kind> <table>               # 載入 master data（master_get）
 ```
 
 行情/趨勢分析函數（provider 只是第一個參數，見 §7）：
@@ -370,6 +374,11 @@ crm_audit('loan_exposure','collateral','guarantee','collateral_edges','guarantee
 embedding_search(name, q, k [, tenant [, as_of]])  # 受治理向量檢索：provenance + 租戶 + 過期過濾（§12）
 cbo_explain(name, query, k [, metric [, filter [, strategy]]])  # CBO 選路 + 估算成本（§18）
 workload_status()                              # 每 class admission / 資源 telemetry（§19）
+resolve_scenario(name [, version])             # 解析 scenario 繼承 / override + provenance（§20）
+hierarchy_ancestors(kind, node, as_of)         # 生效日期階層祖先（§20）
+hierarchy_descendants(kind, node, as_of)       # 生效日期階層後代
+refdata_get(domain, key, as_of)                # effective-dated reference 值
+master_get(kind, id, as_of)                    # master 屬性（每 attribute 一行）
 metrics                                        # 引擎計數器
 ```
 
@@ -914,3 +923,62 @@ corpus_size, max_degree, reason`
   下 interactive admission p99 ≈ 8.6µs、0 timeout（見 `doc/b3_mixed_load_slo.md`）。
   注意呢個係 **admission 控制面**延遲，未包含查詢執行時間；單 process in-memory
   架構下真正 CPU / memory 硬隔離要留待企業批 compute-storage 分離。
+
+---
+
+## 20. 企業批 SQL Surface：Scenario / Hierarchy / Reference（prod_p4 D1 + D6）
+
+企業批（Milestone D/E）以**獨立 crate** 實作，engine kernel 唔會依賴它們；
+composition root（CLI / server）持有 `EnterpriseRegistry` 並喺 DataFusion session
+註冊以下函式。先用 `*_load` 命令由 session 表載入資料，再用 SQL 查詢。
+
+### 20.1 載入命令
+
+```text
+scenario_load <table>          # 每個 (scenario_id, version) 一組，多行 = 多個 shock
+hierarchy_load <kind> <table>  # kind = legal_entity | organisation | product
+refdata_load <table>           # domain / key / valid_from / valid_to / value
+master_load <kind> <table>     # kind = account | customer | instrument | counterparty
+```
+
+**scenario 表欄位**：`scenario_id, version, kind, factor, value`（必填）；
+`parent_id, parent_version, source_cutoff, model_version, status,
+dim_legal_entity, dim_portfolio, dim_product, dim_currency`（選填）。
+`kind` = `baseline | stress | adverse | reverse_stress`。
+
+**hierarchy 表欄位**：`parent, child, valid_from`（必填）、`valid_to`（選填，預設無限期）。
+
+**refdata 表欄位**：`domain, key, valid_from, value`（必填）、`valid_to`（選填）。
+
+**master 表欄位**：`id, valid_from`（必填）、`valid_to`（選填）；其餘欄位全部當作
+字串 attribute。
+
+### 20.2 查詢函式
+
+```sql
+-- 解析 scenario（繼承 + override），每行一個 resolved shock，附 provenance
+SELECT factor, value, source_scenario, source_version, chain
+FROM resolve_scenario('stress', 1);        -- 省略 version = 最新版本
+
+-- 生效日期階層
+SELECT related FROM hierarchy_ancestors('legal_entity', 'a1', 0);
+SELECT related FROM hierarchy_descendants('legal_entity', 'root', 0);
+
+-- effective-dated reference 值（唔存在回 NULL）
+SELECT refdata_get('curve', 'USD.5Y', 50) AS rate;
+
+-- master 屬性（每 attribute 一行；唔存在回空結果）
+SELECT attr_key, attr_value FROM master_get('account', 'A1', 0);
+```
+
+`resolve_scenario` 回傳欄位：`scenario_id, version, kind, chain, source_cutoff,
+model_version, factor, legal_entity, portfolio, product, currency, value,
+source_scenario, source_version`。
+
+### 20.3 邊界
+
+- 領域 crate `gtv-scenario` / `gtv-refdata` 係**純資料層**，唔依賴 DataFusion；
+  `gtv-enterprise-sql` 係 SQL 轉接層。
+- `gtv-core` / `gtv-engine` / `gtv-index` / `gtv-pattern` 等 kernel crate **唔准**
+  依賴任何企業批 crate（CI：`testcase/check_boundary.sh`）。CLI / server 係
+  composition root，容許依賴。

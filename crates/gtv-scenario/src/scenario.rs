@@ -52,6 +52,15 @@ impl ScenarioStatus {
             ScenarioStatus::Retired => "retired",
         }
     }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "draft" => Some(ScenarioStatus::Draft),
+            "approved" => Some(ScenarioStatus::Approved),
+            "retired" => Some(ScenarioStatus::Retired),
+            _ => None,
+        }
+    }
 }
 
 /// The four orthogonal risk dimensions (P2.1). `None` means "all".

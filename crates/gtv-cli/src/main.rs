@@ -92,6 +92,12 @@ async fn main() -> Result<()> {
     let ctx = GtvContext::new();
     register_tables(&ctx, &demo)?;
 
+    // Enterprise batch (prod_p4): the composition root owns the scenario /
+    // hierarchy / reference registry and registers its SQL surface on the
+    // DataFusion session. The analysis engine never depends on these crates.
+    let enterprise = gtv_enterprise_sql::EnterpriseRegistry::handle();
+    gtv_enterprise_sql::register(ctx.session(), enterprise.clone())?;
+
     // Optional table persistence: when GTV_HOME points at a directory, tables
     // registered via `loadcsv` / `load` / `CREATE TABLE … AS SELECT` survive
     // restarts (see catalog.rs).
@@ -133,7 +139,7 @@ async fn main() -> Result<()> {
                 }
                 let _ = rl.add_history_entry(&line);
                 let result =
-                    run(&demo, &ctx, &line, &mut mode, &mut timing, &mut cache, &mut catalog)
+                    run(&demo, &ctx, &line, &mut mode, &mut timing, &mut cache, &mut catalog, &enterprise)
                         .await;
                 match result {
                     Ok(Action::Continue) => {}
@@ -634,6 +640,7 @@ async fn run(
     timing: &mut bool,
     cache: &mut HashMap<String, KernelPlan>,
     catalog: &mut Option<Catalog>,
+    enterprise: &gtv_enterprise_sql::Registry,
 ) -> Result<Action> {
     let tokens: Vec<&str> = line.split_whitespace().collect();
     let Some(cmd) = tokens.first().copied() else {
@@ -2031,6 +2038,50 @@ async fn run(
         "metrics" => {
             print!("{}", ctx.prometheus());
         }
+        "scenario_load" => {
+            let table = require_arg(&tokens, 1, "scenario_load <table>")?;
+            let batches = ctx.sql(&format!("SELECT * FROM {table}")).await?;
+            let n = gtv_enterprise_sql::load::load_scenarios(enterprise, &batches)
+                .map_err(|e| anyhow!("{e}"))?;
+            println!("loaded {n} scenario version(s) from `{table}`");
+            println!("query: SELECT * FROM resolve_scenario('<name>' [, <version>])");
+        }
+        "hierarchy_load" => {
+            let kind_raw = require_arg(&tokens, 1, "hierarchy_load <kind> <table>")?;
+            let table = require_arg(&tokens, 2, "hierarchy_load <kind> <table>")?;
+            let kind = gtv_enterprise_sql::HierarchyKind::parse(kind_raw).ok_or_else(|| {
+                anyhow!(
+                    "unknown hierarchy kind `{kind_raw}` (legal_entity | organisation | product)"
+                )
+            })?;
+            let batches = ctx.sql(&format!("SELECT * FROM {table}")).await?;
+            let n = gtv_enterprise_sql::load::load_hierarchy(enterprise, kind, &batches)
+                .map_err(|e| anyhow!("{e}"))?;
+            println!("loaded {n} hierarchy edge(s) [{}] from `{table}`", kind.as_str());
+            println!("query: SELECT * FROM hierarchy_ancestors('{}', '<node>', <as_of>)", kind.as_str());
+        }
+        "refdata_load" => {
+            let table = require_arg(&tokens, 1, "refdata_load <table>")?;
+            let batches = ctx.sql(&format!("SELECT * FROM {table}")).await?;
+            let n = gtv_enterprise_sql::load::load_reference(enterprise, &batches)
+                .map_err(|e| anyhow!("{e}"))?;
+            println!("loaded {n} reference value(s) from `{table}`");
+            println!("query: SELECT refdata_get('<domain>', '<key>', <as_of>)");
+        }
+        "master_load" => {
+            let kind_raw = require_arg(&tokens, 1, "master_load <kind> <table>")?;
+            let table = require_arg(&tokens, 2, "master_load <kind> <table>")?;
+            let kind = gtv_enterprise_sql::MasterKind::parse(kind_raw).ok_or_else(|| {
+                anyhow!(
+                    "unknown master kind `{kind_raw}` (account | customer | instrument | counterparty)"
+                )
+            })?;
+            let batches = ctx.sql(&format!("SELECT * FROM {table}")).await?;
+            let n = gtv_enterprise_sql::load::load_master(enterprise, kind, &batches)
+                .map_err(|e| anyhow!("{e}"))?;
+            println!("loaded {n} master record(s) [{}] from `{table}`", kind.as_str());
+            println!("query: SELECT * FROM master_get('{}', '<id>', <as_of>)", kind.as_str());
+        }
         "workload" => {
             let out = ctx
                 .sql(
@@ -2507,6 +2558,10 @@ fn print_help() {
          \x20 dq_override <table> <rule> <approver> <reason...>  waive a failing rule (audited)\n\
          \x20 dq_audit              list gate decisions and overrides (GTV_HOME)\n\
          \x20 publish <table> <rules> [exec_id]  gate-check then persist to catalog\n\
+         \x20 scenario_load <table>  load versioned scenarios for resolve_scenario(...)\n\
+         \x20 hierarchy_load <kind> <table>  load effective-dated hierarchy edges\n\
+         \x20 refdata_load <table>  load effective-dated reference values\n\
+         \x20 master_load <kind> <table>  load master data for master_get(...)\n\
          \x20 drop table <name>     drop a table from memory [+ persisted catalog]\n\
          \x20 remote <host:port> <sql>  execute SQL on a remote gtv-server\n\
          \x20 workload              workload admission / isolation status (per class)\n\

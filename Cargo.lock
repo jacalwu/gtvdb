@@ -1977,6 +1977,7 @@ dependencies = [
  "gtv-core",
  "gtv-delta",
  "gtv-engine",
+ "gtv-enterprise-sql",
  "gtv-index",
  "gtv-index-store",
  "gtv-pattern",
@@ -2029,6 +2030,18 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "ureq",
+]
+
+[[package]]
+name = "gtv-enterprise-sql"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "datafusion",
+ "gtv-refdata",
+ "gtv-scenario",
+ "thiserror 2.0.20",
+ "tokio",
 ]
 
 [[package]]

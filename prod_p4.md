@@ -75,7 +75,7 @@ filtered ANN / IVF k-means / CBO / workload 隔離。企業批在此之上疊加
 **問題**：現時冇 scenario catalog、冇版本、冇 baseline / stress / adverse / reverse
 stress，亦冇 source cutoff / model version / inheritance / override / deterministic rerun。
 
-**交付物**（`gtv-scenario`）
+**交付物**（`gtv-scenario` + `gtv-enterprise-sql`）
 
 1. `ScenarioCatalog`：版本化 catalog，支援 `Scenario { id, version, kind, parent,
    dimensions, shocks, source_cutoff, model_version, status }`。
@@ -89,14 +89,18 @@ stress，亦冇 source cutoff / model version / inheritance / override / determi
 7. **Reconciliation / explainability**：輸出 scenario diff（parent vs child）、
    每格來源、版本鏈。
 
+> **已交付**：核心 `gtv-scenario`（9 unit tests）＋ SQL surface
+> `resolve_scenario(name [, version])` 由 `gtv-enterprise-sql` 提供，
+> CLI 用 `scenario_load <table>` 載入（user menu §20）。
+
 **驗收條件**
 
-- [ ] 同一 scenario + cutoff + model，多次 resolve 逐位元一致。
-- [ ] child override 正確覆蓋父 shock；未 override 嘅繼承父值，provenance 指回父版本。
-- [ ] 四個維度可獨立 filter / aggregate。
-- [ ] baseline / stress / adverse / reverse stress 四類均可建立並解析。
-- [ ] reversed / 循環 parent 鏈被拒絕，回明確錯誤。
-- [ ] 每次 resolution 記錄 source cutoff 同 model version，可經 SQL 查詢。
+- [x] 同一 scenario + cutoff + model，多次 resolve 逐位元一致。
+- [x] child override 正確覆蓋父 shock；未 override 嘅繼承父值，provenance 指回父版本。
+- [x] 四個維度可獨立 filter / aggregate（SQL 可直接篩 dimension 欄位）。
+- [x] baseline / stress / adverse / reverse stress 四類均可建立並解析。
+- [x] reversed / 循環 parent 鏈被拒絕，回明確錯誤。
+- [x] 每次 resolution 記錄 source cutoff 同 model version，可經 SQL 查詢。
 
 ---
 

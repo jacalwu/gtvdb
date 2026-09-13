@@ -1,0 +1,23 @@
+[package]
+name = "gtv-enterprise-sql"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# prod_p4 D1/D6 SQL surface: DataFusion UDF / table-function adapters for the
+# enterprise domain crates (gtv-scenario, gtv-refdata).
+#
+# This is the *plug-in* layer described in doc/prod_p4_design.md §3: it depends
+# on the domain crates and DataFusion, but the analysis engine (gtv-engine /
+# gtv-index / gtv-pattern) must never depend on it. It is registered from the
+# composition roots (gtv-cli / gtv-server), not from the engine.
+
+[dependencies]
+arrow.workspace = true
+datafusion.workspace = true
+thiserror.workspace = true
+gtv-scenario = { path = "../gtv-scenario" }
+gtv-refdata = { path = "../gtv-refdata" }
+
+[dev-dependencies]
+tokio.workspace = true

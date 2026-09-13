@@ -353,6 +353,10 @@ udf [x ...]                remote <host:port> <sql>
 metrics                                  # engine counters + SQL latency histogram + workload telemetry (Prometheus text)
 workload                                 # per-class workload admission / isolation status (§19)
 cbo [on|off|recall R]                    # multimodal cost-based optimizer status / config (§18)
+scenario_load <table>                    # load versioned scenarios (§20)
+hierarchy_load <kind> <table>            # load effective-dated hierarchy edges
+refdata_load <table>                     # load effective-dated reference values
+master_load <kind> <table>               # load master data for master_get(...)
 ```
 
 Market/trend functions (provider is just the first argument, see §7):
@@ -376,6 +380,11 @@ crm_audit('loan_exposure','collateral','guarantee','collateral_edges','guarantee
 embedding_search(name, q, k [, tenant [, as_of]])  # governed vector search: provenance + tenant + expiry (§12)
 cbo_explain(name, query, k [, metric [, filter [, strategy]]])  # CBO plan choice + estimated cost (§18)
 workload_status()                    # per-class admission / resource telemetry (§19)
+resolve_scenario(name [, version])   # resolve inheritance / override with provenance (§20)
+hierarchy_ancestors(kind, node, as_of)      # effective-dated ancestors (§20)
+hierarchy_descendants(kind, node, as_of)    # effective-dated descendants
+refdata_get(domain, key, as_of)      # effective-dated reference value
+master_get(kind, id, as_of)          # master attributes (one row each)
 metrics                              # engine counters (see above)
 ```
 
@@ -980,3 +989,65 @@ Global defaults: `global_max_active = 8`, `max_queue = 256`.
   the **admission control plane** latency, not query execution; real CPU/memory
   enforcement in a single-process in-memory architecture requires the enterprise
   batch's compute-storage separation.
+
+---
+
+## 20. Enterprise SQL surface: scenario / hierarchy / reference (prod_p4 D1 + D6)
+
+The enterprise batch (Milestone D/E) lives in **separate crates**; the engine
+kernel never depends on them. The composition root (CLI / server) owns an
+`EnterpriseRegistry` and registers these functions on the DataFusion session.
+Load tables with the `*_load` commands, then query with SQL.
+
+### 20.1 Load commands
+
+```text
+scenario_load <table>          # one row per shock; rows sharing (scenario_id, version) group
+hierarchy_load <kind> <table>  # kind = legal_entity | organisation | product
+refdata_load <table>           # domain / key / valid_from / valid_to / value
+master_load <kind> <table>     # kind = account | customer | instrument | counterparty
+```
+
+**scenario columns**: `scenario_id, version, kind, factor, value` (required);
+`parent_id, parent_version, source_cutoff, model_version, status,
+dim_legal_entity, dim_portfolio, dim_product, dim_currency` (optional).
+`kind` = `baseline | stress | adverse | reverse_stress`.
+
+**hierarchy columns**: `parent, child, valid_from` (required), `valid_to`
+(optional, default open-ended).
+
+**reference columns**: `domain, key, valid_from, value` (required), `valid_to`
+(optional).
+
+**master columns**: `id, valid_from` (required), `valid_to` (optional); every
+other column becomes a string attribute.
+
+### 20.2 Query functions
+
+```sql
+-- resolve a scenario (inheritance + override); one row per shock with provenance
+SELECT factor, value, source_scenario, source_version, chain
+FROM resolve_scenario('stress', 1);        -- omit version for the latest
+
+-- effective-dated hierarchies
+SELECT related FROM hierarchy_ancestors('legal_entity', 'a1', 0);
+SELECT related FROM hierarchy_descendants('legal_entity', 'root', 0);
+
+-- effective-dated reference value (NULL when absent)
+SELECT refdata_get('curve', 'USD.5Y', 50) AS rate;
+
+-- master attributes (one row each; empty result when absent)
+SELECT attr_key, attr_value FROM master_get('account', 'A1', 0);
+```
+
+`resolve_scenario` columns: `scenario_id, version, kind, chain, source_cutoff,
+model_version, factor, legal_entity, portfolio, product, currency, value,
+source_scenario, source_version`.
+
+### 20.3 Boundary
+
+- Domain crates `gtv-scenario` / `gtv-refdata` are **pure data layers** with no
+  DataFusion dependency; `gtv-enterprise-sql` is the SQL adapter.
+- Kernel crates (`gtv-core`, `gtv-engine`, `gtv-index`, `gtv-pattern`, …) must
+  **never** depend on an enterprise crate (CI: `testcase/check_boundary.sh`).
+  CLI / server are composition roots and are exempt.
