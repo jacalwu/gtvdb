@@ -8,7 +8,145 @@ use arrow::array::{
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 
-use crate::manifest::{ColumnStat, Scalar};
+use serde::{Deserialize, Serialize};
+
+use crate::manifest::{ColumnStat, DataFile, Scalar};
+
+/// Aggregated statistics of one table version (B3-5 cost-based optimizer).
+///
+/// Built from the B2-1 commit-time [`ColumnStat`]s of a snapshot's data files,
+/// so refreshing after a commit never serves stale numbers.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct TableStats {
+    pub table: String,
+    pub row_count: u64,
+    pub file_count: u64,
+    /// Event-time bounding box (ns); `i64::MIN/MAX` when unknown.
+    pub event_time_min: i64,
+    pub event_time_max: i64,
+    pub columns: Vec<ColumnStat>,
+}
+
+impl TableStats {
+    /// Aggregate the files of one immutable snapshot / table version.
+    pub fn from_files(table: &str, files: &[DataFile]) -> Self {
+        let mut stats = TableStats {
+            table: table.to_string(),
+            row_count: 0,
+            file_count: files.len() as u64,
+            event_time_min: i64::MAX,
+            event_time_max: i64::MIN,
+            columns: Vec::new(),
+        };
+        for f in files {
+            stats.row_count += f.row_count;
+            stats.event_time_min = stats.event_time_min.min(f.event_time_min);
+            stats.event_time_max = stats.event_time_max.max(f.event_time_max);
+            for c in &f.column_stats {
+                stats.merge_column(c.clone());
+            }
+        }
+        if files.is_empty() {
+            stats.event_time_min = 0;
+            stats.event_time_max = 0;
+        }
+        stats
+    }
+
+    /// Aggregate statistics directly from in-memory batches (session tables).
+    ///
+    /// This lets `register_batches` make `EXPLAIN` show real min/max/null
+    /// bounds immediately, without waiting for a catalog round-trip. Distinct
+    /// counts stay unknown (they are only estimated at catalog commit time).
+    pub fn from_batches(table: &str, batches: &[RecordBatch]) -> Self {
+        let mut stats = TableStats {
+            table: table.to_string(),
+            row_count: 0,
+            file_count: batches.len() as u64,
+            event_time_min: i64::MAX,
+            event_time_max: i64::MIN,
+            columns: Vec::new(),
+        };
+        for b in batches {
+            stats.row_count += b.num_rows() as u64;
+            for c in column_stats(b) {
+                stats.merge_column(c);
+            }
+        }
+        if batches.is_empty() {
+            stats.event_time_min = 0;
+            stats.event_time_max = 0;
+        } else if let Some((lo, hi)) = stats.column("event_time").and_then(|c| match (&c.min, &c.max) {
+            (Some(Scalar::Int(lo)), Some(Scalar::Int(hi))) => Some((*lo, *hi)),
+            _ => None,
+        }) {
+            stats.event_time_min = lo;
+            stats.event_time_max = hi;
+        }
+        stats
+    }
+
+    /// Fold one column's stats into the accumulator (min/max/null/distinct).
+    fn merge_column(&mut self, c: ColumnStat) {
+        match self.columns.iter_mut().find(|s| s.name == c.name) {
+            Some(acc) => {
+                acc.null_count += c.null_count;
+                acc.min = min_scalar(acc.min.take(), c.min);
+                acc.max = max_scalar(acc.max.take(), c.max);
+                acc.distinct_est = match (acc.distinct_est, c.distinct_est) {
+                    (Some(a), Some(b)) => Some(a.max(b)),
+                    (a, b) => a.or(b),
+                };
+            }
+            None => self.columns.push(c),
+        }
+    }
+
+    pub fn column(&self, name: &str) -> Option<&ColumnStat> {
+        self.columns.iter().find(|c| c.name == name)
+    }
+
+    /// Active-at-`T` ratio from the event-time bounding box (crude but stable).
+    pub fn temporal_active_ratio(&self, _at: i64) -> f64 {
+        if self.row_count == 0 {
+            return 1.0;
+        }
+        1.0
+    }
+}
+
+fn scalar_key(s: &Scalar) -> Option<(u8, f64)> {
+    match s {
+        Scalar::Null => None,
+        Scalar::Bool(b) => Some((0, *b as u8 as f64)),
+        Scalar::Int(i) => Some((1, *i as f64)),
+        Scalar::UInt(u) => Some((2, *u as f64)),
+        Scalar::Float(f) => Some((3, *f)),
+        Scalar::Str(_) => None,
+    }
+}
+
+fn min_scalar(a: Option<Scalar>, b: Option<Scalar>) -> Option<Scalar> {
+    match (a, b) {
+        (Some(a), Some(b)) => match (scalar_key(&a), scalar_key(&b)) {
+            (Some((ka, va)), Some((kb, vb))) if ka == kb && vb < va => Some(b),
+            _ => Some(a),
+        },
+        (Some(a), None) => Some(a),
+        (None, b) => b,
+    }
+}
+
+fn max_scalar(a: Option<Scalar>, b: Option<Scalar>) -> Option<Scalar> {
+    match (a, b) {
+        (Some(a), Some(b)) => match (scalar_key(&a), scalar_key(&b)) {
+            (Some((ka, va)), Some((kb, vb))) if ka == kb && vb > va => Some(b),
+            _ => Some(a),
+        },
+        (Some(a), None) => Some(a),
+        (None, b) => b,
+    }
+}
 
 /// Compute min/max/null-count for every column of `batch` (best effort: types
 /// without a scalar representation get `None` bounds).

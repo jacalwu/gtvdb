@@ -504,6 +504,25 @@ impl FsCatalog {
             .collect())
     }
 
+    /// Aggregated statistics of the latest committed version (B3-5).
+    ///
+    /// Reads the current snapshot's data files, so calling this after a commit
+    /// yields fresh numbers (no cached / stale stats).
+    pub fn table_stats(&self, table: TableId) -> Result<crate::stats::TableStats> {
+        let name = self.table_by_id(table)?.name;
+        let files = match self.latest(table)? {
+            Some(snap) => self.files(table, snap)?,
+            None => Vec::new(),
+        };
+        Ok(crate::stats::TableStats::from_files(&name, &files))
+    }
+
+    /// Convenience wrapper over [`Self::table_stats`] by table name.
+    pub fn table_stats_by_name(&self, name: &str) -> Result<crate::stats::TableStats> {
+        let meta = self.table(name)?;
+        self.table_stats(meta.table_id)
+    }
+
     /// All committed snapshots of a table, oldest first (append-only log order).
     pub fn snapshots(&self, table: TableId) -> Result<Vec<Snapshot>> {
         self.read_jsonl(&self.snapshots_path(table))

@@ -77,7 +77,7 @@ fn parse_filter(filter: Option<&str>) -> Option<HashSet<u64>> {
 }
 
 /// Build the positional `BooleanArray` mask for an id allow-list.
-fn build_mask(index: &AnyIndex, allowed: Option<&HashSet<u64>>) -> Option<BooleanArray> {
+pub(crate) fn build_mask(index: &AnyIndex, allowed: Option<&HashSet<u64>>) -> Option<BooleanArray> {
     let allowed = allowed?;
     let ids = index.ids();
     Some(BooleanArray::from(
@@ -102,17 +102,20 @@ fn config_for(strategy_hint: Option<&str>) -> Result<AnnConfig> {
     Ok(cfg)
 }
 
-/// The argument bundle shared by `ann` and `ann_explain`.
-struct AnnArgs {
-    name: String,
-    query: Vec<f32>,
-    k: usize,
-    requested_metric: Option<String>,
-    allowed: Option<HashSet<u64>>,
-    cfg: AnnConfig,
+/// The argument bundle shared by `ann`, `ann_explain` and `cbo_explain`.
+pub(crate) struct AnnArgs {
+    pub(crate) name: String,
+    pub(crate) query: Vec<f32>,
+    pub(crate) k: usize,
+    pub(crate) requested_metric: Option<String>,
+    pub(crate) allowed: Option<HashSet<u64>>,
+    pub(crate) cfg: AnnConfig,
 }
 
-fn parse_ann_args(exprs: &[datafusion::logical_expr::Expr], usage: &str) -> Result<AnnArgs> {
+pub(crate) fn parse_ann_args(
+    exprs: &[datafusion::logical_expr::Expr],
+    usage: &str,
+) -> Result<AnnArgs> {
     let name = expr_to_string(
         exprs
             .first()

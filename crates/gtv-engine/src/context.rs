@@ -1,15 +1,17 @@
 //! A DataFusion [`SessionContext`] wrapper for the gtv engine.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
-use datafusion::datasource::MemTable;
 use datafusion::error::Result;
+use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
+use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::logical_expr::LogicalPlan;
-use datafusion::prelude::SessionContext;
+use datafusion::prelude::{SessionConfig, SessionContext};
 use gtv_catalog::{ExecutionRecord, IndexRef, ModelRef, TableRef};
 use gtv_core::TemporalCSR;
 use gtv_index::AnyIndex;
@@ -26,6 +28,17 @@ pub struct ExecutionOptions {
     pub scenario_version: Option<String>,
     pub business_cutoff: Option<i64>,
     pub runtime_params: serde_json::Value,
+}
+
+/// Directory DataFusion uses for sort/join spill files (B3-6 §7.5).
+///
+/// `GTV_SPILL_DIR` overrides the default of `<system temp>/gtv-spill`.
+/// Production deployments should point this at the catalog volume so spill
+/// bytes are accounted for next to the data they came from.
+pub fn spill_dir() -> PathBuf {
+    std::env::var_os("GTV_SPILL_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("gtv-spill"))
 }
 
 /// blake3 (hex) of the Arrow IPC encoding of the output batches.
@@ -53,6 +66,10 @@ pub struct GtvContext {
     embedding_collections: EmbeddingRegistry,
     /// Bitemporal system-time versions for `as_of` (B3-2).
     bitemporal: crate::bitemporal::BitemporalRegistry,
+    /// Multimodal cost-based optimizer state (B3-5).
+    cbo: crate::cbo::CboRegistry,
+    /// Workload admission / isolation manager (B3-6).
+    workload: Arc<crate::workload::WorkloadManager>,
     /// Registered tables mapped to the catalog snapshot they were loaded from.
     table_sources: Arc<RwLock<HashMap<String, TableRef>>>,
     hft_reg: Arc<RwLock<HftRegistry>>,
@@ -60,7 +77,23 @@ pub struct GtvContext {
 
 impl GtvContext {
     pub fn new() -> Self {
-        let ctx = SessionContext::new();
+        // B3-5: EXPLAIN should surface the estimated statistics that the
+        // `StatsTable` provider exposes (num_rows / min / max / null_count).
+        let mut config = SessionConfig::new();
+        config.options_mut().explain.show_statistics = true;
+
+        // B3-6 spill-to-disk: large sorts / joins land under the configured
+        // spill directory (default `<tmp>/gtv-spill`) instead of the process
+        // temp dir, so operations can account for and cap spill usage.
+        let spill = spill_dir();
+        let _ = std::fs::create_dir_all(&spill);
+        let disk = DiskManagerBuilder::default()
+            .with_mode(DiskManagerMode::Directories(vec![spill]));
+        let runtime = RuntimeEnvBuilder::new()
+            .with_disk_manager_builder(disk)
+            .build()
+            .expect("gtv: build DataFusion runtime env");
+        let ctx = SessionContext::new_with_config_rt(config, Arc::new(runtime));
         for udwf in crate::udf::window_udfs() {
             ctx.register_udwf(udwf);
         }
@@ -117,6 +150,21 @@ impl GtvContext {
             "bitemporal_overlaps",
             Arc::new(crate::bitemporal::BitemporalOverlapsTableFunction::new(
                 bitemporal.clone(),
+            )),
+        );
+        let cbo: crate::cbo::CboRegistry = Arc::new(RwLock::new(crate::cbo::CboState::default()));
+        ctx.register_udtf(
+            "cbo_explain",
+            Arc::new(crate::cbo::CboExplainTableFunction::new(
+                any_indexes.clone(),
+                cbo.clone(),
+            )),
+        );
+        let workload = Arc::new(crate::workload::WorkloadManager::default());
+        ctx.register_udtf(
+            "workload_status",
+            Arc::new(crate::workload::WorkloadStatusTableFunction::new(
+                workload.clone(),
             )),
         );
         ctx.register_udtf("read_csv", Arc::new(crate::csv::ReadCsvTableFunction::new()));
@@ -211,6 +259,8 @@ impl GtvContext {
             any_indexes,
             embedding_collections,
             bitemporal,
+            cbo,
+            workload,
             table_sources: Arc::new(RwLock::new(HashMap::new())),
             hft_reg,
         }
@@ -236,8 +286,23 @@ impl GtvContext {
         batches: Vec<RecordBatch>,
     ) -> Result<()> {
         let _ = self.ctx.deregister_table(name);
-        let table = MemTable::try_new(schema.clone(), vec![batches.clone()])?;
-        self.ctx.register_table(name, Arc::new(table))?;
+        // Wrap with the B3-5 statistics provider so EXPLAIN / DataFusion's own
+        // optimizers see catalog stats (num_rows / min / max / null_count).
+        let provider = crate::cbo::StatsTable::new(
+            name,
+            schema.clone(),
+            vec![batches.clone()],
+            self.cbo.clone(),
+        );
+        self.ctx.register_table(name, Arc::new(provider))?;
+        // Seed session statistics from the actual batches so EXPLAIN shows
+        // min/max/null bounds even before a catalog refresh (B3-5).
+        if let Ok(mut cbo) = self.cbo.write() {
+            cbo.tables.insert(
+                name.to_string(),
+                gtv_catalog::TableStats::from_batches(name, &batches),
+            );
+        }
         if let Ok(mut reg) = self.hft_reg.write() {
             reg.tables.insert(name.to_string(), Arc::new(batches));
         }
@@ -494,6 +559,135 @@ impl GtvContext {
     /// Shared bitemporal store (for the CLI / catalog wiring).
     pub fn bitemporal_store(&self) -> crate::bitemporal::BitemporalRegistry {
         self.bitemporal.clone()
+    }
+
+    /// Shared multimodal cost-based optimizer state (B3-5).
+    pub fn cbo_state(&self) -> crate::cbo::CboRegistry {
+        self.cbo.clone()
+    }
+
+    /// Register relational statistics for `name` (used by `cbo_explain`).
+    pub fn set_table_stats(&self, name: &str, stats: gtv_catalog::TableStats) -> Result<()> {
+        self.cbo
+            .write()
+            .map_err(|_| {
+                datafusion::error::DataFusionError::Execution("cbo registry poisoned".into())
+            })?
+            .tables
+            .insert(name.to_string(), stats);
+        Ok(())
+    }
+
+    /// Refresh relational statistics from the catalog (never stale: reads the
+    /// current committed version).
+    pub fn refresh_table_stats(
+        &self,
+        name: &str,
+        catalog: &gtv_catalog::FsCatalog,
+        table: gtv_catalog::TableId,
+    ) -> Result<()> {
+        let stats = catalog
+            .table_stats(table)
+            .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+        self.set_table_stats(name, stats)
+    }
+
+    /// Refresh statistics for `name` from the catalog by table name (B3-5).
+    ///
+    /// Convenience wrapper that resolves the [`gtv_catalog::TableId`] first,
+    /// used by the CLI after `publish`.
+    pub fn refresh_table_stats_by_name(
+        &self,
+        name: &str,
+        catalog: &gtv_catalog::FsCatalog,
+    ) -> Result<()> {
+        let stats = catalog
+            .table_stats_by_name(name)
+            .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+        self.set_table_stats(name, stats)
+    }
+
+    /// Register graph shape statistics for `name`.
+    pub fn set_graph_stats(&self, name: &str, stats: crate::cbo::GraphStats) -> Result<()> {
+        self.cbo
+            .write()
+            .map_err(|_| {
+                datafusion::error::DataFusionError::Execution("cbo registry poisoned".into())
+            })?
+            .graphs
+            .insert(name.to_string(), stats);
+        Ok(())
+    }
+
+    /// Replace the cost model (weights / enable flag).
+    pub fn set_cost_model(&self, model: crate::cbo::CostModel) -> Result<()> {
+        self.cbo
+            .write()
+            .map_err(|_| {
+                datafusion::error::DataFusionError::Execution("cbo registry poisoned".into())
+            })?
+            .model = model;
+        Ok(())
+    }
+
+    /// Shared workload manager (B3-6).
+    pub fn workload(&self) -> Arc<crate::workload::WorkloadManager> {
+        self.workload.clone()
+    }
+
+    /// Execute `query` under a workload class, with admission control.
+    ///
+    /// This is the B3-6 integration point: the class's resource group decides
+    /// whether the query is admitted, queued or rejected; a preemption signal
+    /// arriving before collection aborts the query. Operators that observe the
+    /// returned [`gtv_core::CancelToken`] (graph traversal, index build) can be
+    /// cancelled cooperatively mid-flight via
+    /// [`crate::workload::WorkloadManager::preempt`].
+    pub async fn sql_as(
+        &self,
+        class: crate::workload::WorkloadClass,
+        query: &str,
+        timeout: std::time::Duration,
+    ) -> std::result::Result<Vec<RecordBatch>, crate::workload::WorkloadError> {
+        use crate::workload::{Admission, WorkloadError};
+        let (id, token) = match self.workload.wait_admit(class, timeout)? {
+            Admission::Admit { id, token } => (id, token),
+            Admission::Queue { .. } => {
+                return Err(WorkloadError::Rejected("unexpected queued admission".into()))
+            }
+            Admission::Reject { reason } => return Err(WorkloadError::Rejected(reason)),
+        };
+        if token.load(std::sync::atomic::Ordering::Relaxed) {
+            self.workload.release(id);
+            return Err(WorkloadError::Preempted);
+        }
+        let out = self
+            .sql(query)
+            .await
+            .map_err(|e| WorkloadError::Rejected(e.to_string()));
+        self.workload.release(id);
+        out
+    }
+
+    /// Bytes currently used by DataFusion spill files (B3-6 §7.5).
+    pub fn spill_bytes(&self) -> u64 {
+        self.ctx.runtime_env().disk_manager.used_disk_space()
+    }
+
+    /// Prometheus text: process query metrics, per-class workload telemetry and
+    /// spill usage.
+    pub fn prometheus(&self) -> String {
+        let mut s = crate::monitor::prometheus_text();
+        s.push_str(&self.workload.prometheus());
+        s.push_str("# TYPE gtv_spill_bytes gauge\n");
+        s.push_str(&format!("gtv_spill_bytes {}\n", self.spill_bytes()));
+        let progress = self.ctx.runtime_env().disk_manager.spilling_progress();
+        s.push_str("# TYPE gtv_spill_active_files gauge\n");
+        s.push_str(&format!(
+            "gtv_spill_active_files {}\n",
+            progress.active_files_count
+        ));
+        s
     }
 
     /// Record which catalog snapshot a registered table was loaded from, so a

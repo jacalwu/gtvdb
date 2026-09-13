@@ -37,5 +37,5 @@ pub use partition::{partition_dir, PartitionColumn, PartitionSpec, PartitionValu
 pub use schema::{
     apply_change, check_compatible, is_widening, SchemaChange, SchemaRecord, SchemaVersion,
 };
-pub use stats::column_stats;
+pub use stats::{column_stats, TableStats};
 pub use store::{CommitOptions, FsCatalog, NewFile, ScanFilter, TableMeta};

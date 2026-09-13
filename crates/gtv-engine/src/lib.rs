@@ -8,6 +8,7 @@ pub mod asof;
 pub mod analytics;
 pub mod bitemporal;
 pub mod bt;
+pub mod cbo;
 pub mod context;
 pub mod csv;
 pub mod crm;
@@ -27,6 +28,7 @@ pub mod market;
 pub mod quant;
 pub mod tickdata;
 pub mod udf;
+pub mod workload;
 pub mod yahoo;
 
 mod expr_util;

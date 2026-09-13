@@ -2014,6 +2014,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arrow",
+ "async-trait",
  "blake3",
  "chrono",
  "datafusion",

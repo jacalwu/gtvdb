@@ -9,7 +9,7 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 
 use gtv_catalog::{
-    CommitOp, CommitOptions, FsCatalog, NewFile, PartitionSpec, PartitionValue, ScanFilter,
+    CommitOp, CommitOptions, FsCatalog, NewFile, PartitionSpec, PartitionValue, Scalar, ScanFilter,
     SchemaChange,
 };
 
@@ -120,6 +120,39 @@ fn snapshot_as_of_replays_system_time() {
     // The old cut still resolves to the old snapshot's files.
     assert_eq!(cat.files(table, s1).unwrap().len(), 1);
     assert_eq!(cat.files(table, s2).unwrap().len(), 2);
+}
+
+#[test]
+fn table_stats_track_commits() {
+    let (cat, table) = fresh("stats");
+    cat.commit(
+        table,
+        CommitOp::Append,
+        vec![NewFile::unpartitioned(batch(&[1, 2], &[1.0, 2.0], &[10, 20]))],
+        &CommitOptions::default(),
+    )
+    .unwrap();
+    let s = cat.table_stats(table).unwrap();
+    assert_eq!(s.row_count, 2);
+    assert_eq!(s.file_count, 1);
+    assert_eq!(s.event_time_min, 10);
+    assert_eq!(s.event_time_max, 20);
+    assert_eq!(s.column("id").unwrap().min, Some(Scalar::UInt(1)));
+    assert_eq!(s.column("id").unwrap().max, Some(Scalar::UInt(2)));
+
+    // Write once more: stats must reflect the new version, not the old one.
+    cat.commit(
+        table,
+        CommitOp::Append,
+        vec![NewFile::unpartitioned(batch(&[3], &[3.0], &[30]))],
+        &CommitOptions::default(),
+    )
+    .unwrap();
+    let s2 = cat.table_stats(table).unwrap();
+    assert_eq!(s2.row_count, 3);
+    assert_eq!(s2.file_count, 2);
+    assert_eq!(s2.column("id").unwrap().max, Some(Scalar::UInt(3)));
+    assert_eq!(s2.event_time_max, 30);
 }
 
 #[test]

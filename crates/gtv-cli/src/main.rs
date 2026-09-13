@@ -1894,6 +1894,12 @@ async fn run(
                 .map(|b| b.schema())
                 .ok_or_else(|| anyhow!("table `{table}` is empty"))?;
             let rows = cat.record_snapshot(table, &schema, &batches)?;
+            // B3-5: pull the fresh commit-time stats into the optimizer so
+            // EXPLAIN / cbo_explain reflect this version (never stale).
+            match ctx.refresh_table_stats_by_name(table, cat.fs()) {
+                Ok(()) => {}
+                Err(e) => eprintln!("warning: stats refresh for `{table}` failed: {e}"),
+            }
             if overridden {
                 println!("published `{table}` ({rows} rows) with override");
             } else {
@@ -2023,7 +2029,59 @@ async fn run(
         }
         "quit" | "exit" => return Ok(Action::Quit),
         "metrics" => {
-            print!("{}", gtv_engine::monitor::prometheus_text());
+            print!("{}", ctx.prometheus());
+        }
+        "workload" => {
+            let out = ctx
+                .sql(
+                    "SELECT class, priority, active, max_concurrency, admitted, queued, \
+                     rejected, preempted, completed FROM workload_status() \
+                     ORDER BY priority DESC",
+                )
+                .await?;
+            let _ = print_batches(&out);
+        }
+        "cbo" => {
+            let state = ctx.cbo_state();
+            match tokens.get(1).copied() {
+                Some(flag @ ("on" | "off")) => {
+                    let mut model = state
+                        .read()
+                        .map_err(|_| anyhow!("cbo registry poisoned"))?
+                        .model
+                        .clone();
+                    model.enabled = flag == "on";
+                    ctx.set_cost_model(model)?;
+                    println!("multimodal optimizer: {flag}");
+                }
+                Some("recall") => {
+                    let v: f64 = require_arg(&tokens, 2, "cbo recall <0.0-1.0>")?.parse()?;
+                    let mut model = state
+                        .read()
+                        .map_err(|_| anyhow!("cbo registry poisoned"))?
+                        .model
+                        .clone();
+                    model.recall_target = v.clamp(0.0, 1.0);
+                    ctx.set_cost_model(model)?;
+                    println!("recall_target = {v}");
+                }
+                _ => {
+                    let s = state
+                        .read()
+                        .map_err(|_| anyhow!("cbo registry poisoned"))?;
+                    let m = &s.model;
+                    println!("multimodal optimizer: {}", if m.enabled { "on" } else { "off" });
+                    println!("  flat_max_rows           {}", m.flat_max_rows);
+                    println!("  prefilter_threshold     {}", m.prefilter_threshold);
+                    println!("  filtered_threshold      {}", m.filtered_threshold);
+                    println!("  temporal_bitmap_thresh  {}", m.temporal_bitmap_threshold);
+                    println!("  high_degree_threshold   {}", m.high_degree_threshold);
+                    println!("  recall_target           {}", m.recall_target);
+                    println!("  stats tables            {}", s.tables.len());
+                    println!("  stats graphs            {}", s.graphs.len());
+                    println!("usage: cbo [on|off|recall <0.0-1.0>]");
+                }
+            }
         }
         "sql" => {
             let q = line.get(3..).unwrap_or("").trim();
@@ -2451,6 +2509,8 @@ fn print_help() {
          \x20 publish <table> <rules> [exec_id]  gate-check then persist to catalog\n\
          \x20 drop table <name>     drop a table from memory [+ persisted catalog]\n\
          \x20 remote <host:port> <sql>  execute SQL on a remote gtv-server\n\
+         \x20 workload              workload admission / isolation status (per class)\n\
+         \x20 cbo [on|off|recall R]  multimodal cost-based optimizer status / config\n\
          \x20 quit | exit\n\
          \n\
          session:\n\
