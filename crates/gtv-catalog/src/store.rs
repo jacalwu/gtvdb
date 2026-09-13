@@ -34,6 +34,7 @@ use serde::{Deserialize, Serialize};
 
 use gtv_storage::{write_atomic, write_batch_atomic};
 
+use crate::dq::{GateDecisionRecord, OverrideRecord};
 use crate::error::{CatalogError, Result};
 use crate::id::{CommitId, DataFileId, SnapshotId, TableId};
 use crate::lineage::{ExecutionId, ExecutionRecord};
@@ -155,6 +156,12 @@ impl FsCatalog {
     }
     fn lineage_path(&self) -> PathBuf {
         self.root.join("metadata/lineage.jsonl")
+    }
+    fn dq_decisions_path(&self) -> PathBuf {
+        self.root.join("metadata/dq_decisions.jsonl")
+    }
+    fn dq_overrides_path(&self) -> PathBuf {
+        self.root.join("metadata/dq_overrides.jsonl")
     }
 
     // -- generic io ---------------------------------------------------------
@@ -366,6 +373,28 @@ impl FsCatalog {
     /// Every recorded execution, oldest first.
     pub fn lineage_records(&self) -> Result<Vec<ExecutionRecord>> {
         self.read_jsonl(&self.lineage_path())
+    }
+
+    // -- data-quality gate ledger -------------------------------------------
+
+    /// Append a publish-gate decision to the append-only DQ ledger.
+    pub fn append_gate_decision(&self, record: &GateDecisionRecord) -> Result<()> {
+        self.append_jsonl(&self.dq_decisions_path(), record)
+    }
+
+    /// Every recorded gate decision, oldest first.
+    pub fn gate_decisions(&self) -> Result<Vec<GateDecisionRecord>> {
+        self.read_jsonl(&self.dq_decisions_path())
+    }
+
+    /// Append an override to the append-only override ledger.
+    pub fn append_override(&self, record: &OverrideRecord) -> Result<()> {
+        self.append_jsonl(&self.dq_overrides_path(), record)
+    }
+
+    /// Every recorded override, oldest first.
+    pub fn overrides(&self) -> Result<Vec<OverrideRecord>> {
+        self.read_jsonl(&self.dq_overrides_path())
     }
 
     // -- schemas ------------------------------------------------------------

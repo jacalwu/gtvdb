@@ -11,6 +11,7 @@ pub mod context;
 pub mod csv;
 pub mod crm;
 pub mod datetime;
+pub mod dq;
 pub mod embedding;
 pub mod graph;
 pub mod hft;
@@ -30,5 +31,9 @@ pub mod yahoo;
 mod expr_util;
 
 pub use context::{ExecutionOptions, GtvContext};
+pub use dq::{
+    blocking_failures, decision_from_outcomes, evaluate, evaluate_rule, evaluate_rules,
+    DqGateTableFunction, RuleOutcome,
+};
 pub use embedding::{EmbeddingCollection, EmbeddingHit, EmbeddingRegistry, EmbeddingSearchTableFunction};
 pub use lineage::{extract_udfs, ReplayError, ENGINE_VERSION, LINEAGE_TABLE};

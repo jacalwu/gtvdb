@@ -236,11 +236,11 @@ strategy_stats`，但**只係診斷，唔會阻止結果發布**，亦冇對賬�
 
 **驗收條件**
 
-- [ ] DQ 未達門檻時，正式結果**無法發布**（唔係只出 warning）。
-- [ ] 每個 gate failure 有具體規則、欄位、實際值、門檻值。
-- [ ] 每次 override 都有原因 / 批准人 / 時間 / 對象，可事後審計。
-- [ ] 對賬報表：source vs target row count 同 amount sum 一致或列出差異。
-- [ ] gate 決策連同 B2-3 execution_id 一齊記錄。
+- [x] DQ 未達門檻時，正式結果**無法發布**（唔係只出 warning）。
+- [x] 每個 gate failure 有具體規則、欄位、實際值、門檻值。
+- [x] 每次 override 都有原因 / 批准人 / 時間 / 對象，可事後審計。
+- [x] 對賬報表：source vs target row count 同 amount sum 一致或列出差異。
+- [x] gate 決策連同 B2-3 execution_id 一齊記錄。
 
 **風險**
 

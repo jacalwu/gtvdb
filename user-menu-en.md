@@ -682,3 +682,44 @@ feature_version, tenant_id, classification
 - **Governance**: expiry, replacement and rebuild all go through the same
   validation + `filter_active` choke point; any retrieval can list `model_id` /
   `version` / `source_hash` / `feature_version` / `tenant_id`.
+
+---
+
+## 13. Data-quality & publish gate (prod_p2 B2-5)
+
+Rules are declared as JSON (inline, `@file` or a `.json` path) and cover six
+checks: completeness (non-null ratio), uniqueness (PK), freshness (event-time
+lag vs now), range (numeric bounds), referential (child → parent integrity) and
+reconciliation (source/target row count and amount sum).
+
+- **`dq_gate <table> <rules> [execution_id]`** evaluates the rules and prints
+  `rule / target / PASS|FAIL / observed / threshold / message` per rule. Any
+  failure returns an error (blocks) and records the decision (with the
+  execution id) under `GTV_HOME`.
+- **`dq_override <table> <rule> <approver> <reason...>`** waives a failing rule
+  and appends an override to the append-only ledger (approver, reason, time,
+  target).
+- **`publish <table> <rules> [execution_id]`** runs the gate first; without an
+  override for every failing rule it refuses to write to the catalog, otherwise
+  it commits the snapshot.
+- **`dq_audit`** lists every gate decision (pass / overridden / failures /
+  exec_id) and every override (rule / approver / reason).
+- **SQL**: `SELECT * FROM dq_gate('table', '<rules_json>')` returns
+  `(rule, target, passed, observed, threshold, message)`, further aggregatable in
+  SQL.
+
+Example rules JSON:
+
+```json
+[{"rule":"completeness","column":"price","min_ratio":0.99},
+ {"rule":"uniqueness","columns":["sym"]},
+ {"rule":"freshness","event_time_col":"ts","max_lag_ns":86400000000000},
+ {"rule":"range","column":"price","min":0.0,"max":1000000.0},
+ {"rule":"referential","child_col":"sym","parent":"syms","parent_col":"sym"},
+ {"rule":"reconciliation","name":"src->tgt","source_rows":10,"target_rows":10,
+  "tolerance":0.001,"source_sum":100.0,"target_sum":100.0}]
+```
+
+> Overrides are keyed by rule kind (one target + rule waives every failure of
+> that kind). The existing `dq_report` / `dq_check` / `health_check` stay
+> diagnostic and never block.

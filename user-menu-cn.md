@@ -648,3 +648,39 @@ feature_version, tenant_id, classification
 - **治理**：embedding 過期、替換、重建全部經同一條 validation + `filter_active`
   choke point；任何檢索結果都可列出 `model_id` / `version` / `source_hash` /
   `feature_version` / `tenant_id`。
+
+---
+
+## 13. 資料質量與發布閘門（prod_p2 B2-5）
+
+規則以 JSON 聲明（inline、`@file` 或 `.json` 路徑），支援六類檢查：
+completeeness（非空比例）、uniqueness（PK 唯一）、freshness（event_time 相對於
+now 嘅 lag）、range（數值上下限）、referential（child → parent 完整性）、
+reconciliation（source/target row count 同 amount sum）。
+
+- **`dq_gate <table> <rules> [execution_id]`**：評估規則，逐條印出
+  `rule / target / PASS|FAIL / observed / threshold / message`；任何一條 fail
+  會回錯誤（block），並在 `GTV_HOME` 記錄決策（連 execution_id）。
+- **`dq_override <table> <rule> <approver> <reason...>`**：豁免某條 fail 規則；
+  寫入 append-only override ledger（含批准人、原因、時間、對象）。
+- **`publish <table> <rules> [execution_id]`**：先過 gate；未達標且
+  **無** override 會拒絕寫入 catalog，通過或已 override 才 commit snapshot。
+- **`dq_audit`**：列出所有 gate 決策（pass / overridden / failures / exec_id）
+  同 override（rule / approver / reason）。
+- **SQL**：`SELECT * FROM dq_gate('table', '<rules_json>')` 回傳
+  `(rule, target, passed, observed, threshold, message)`，可再用 SQL 彙總。
+
+規則 JSON 例：
+
+```json
+[{"rule":"completeness","column":"price","min_ratio":0.99},
+ {"rule":"uniqueness","columns":["sym"]},
+ {"rule":"freshness","event_time_col":"ts","max_lag_ns":86400000000000},
+ {"rule":"range","column":"price","min":0.0,"max":1000000.0},
+ {"rule":"referential","child_col":"sym","parent":"syms","parent_col":"sym"},
+ {"rule":"reconciliation","name":"src->tgt","source_rows":10,"target_rows":10,
+  "tolerance":0.001,"source_sum":100.0,"target_sum":100.0}]
+```
+
+> Override 以 `rule` kind 為單位（同一個 target + rule 豁免該類全部 failure）。
+> 現有 `dq_report` / `dq_check` / `health_check` 保留為純診斷，唔會 block。

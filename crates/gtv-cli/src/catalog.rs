@@ -116,6 +116,28 @@ impl Catalog {
         self.fs.lineage_records().map_err(|e| anyhow!("{e}"))
     }
 
+    // -- data-quality gate ledger (B2-5) -----------------------------------
+
+    /// Append a publish-gate decision to the DQ ledger.
+    pub fn append_gate_decision(&self, rec: &gtv_catalog::GateDecisionRecord) -> Result<()> {
+        self.fs.append_gate_decision(rec).map_err(|e| anyhow!("{e}"))
+    }
+
+    /// Every recorded gate decision, oldest first.
+    pub fn gate_decisions(&self) -> Result<Vec<gtv_catalog::GateDecisionRecord>> {
+        self.fs.gate_decisions().map_err(|e| anyhow!("{e}"))
+    }
+
+    /// Append an override to the DQ override ledger.
+    pub fn append_override(&self, rec: &gtv_catalog::OverrideRecord) -> Result<()> {
+        self.fs.append_override(rec).map_err(|e| anyhow!("{e}"))
+    }
+
+    /// Every recorded override, oldest first.
+    pub fn overrides(&self) -> Result<Vec<gtv_catalog::OverrideRecord>> {
+        self.fs.overrides().map_err(|e| anyhow!("{e}"))
+    }
+
     /// The pinned catalog reference for a table's latest snapshot, if any.
     /// Used to stamp lineage records with the exact version a query read.
     pub fn table_ref(&self, name: &str) -> Result<Option<TableRef>> {

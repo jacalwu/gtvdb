@@ -6,6 +6,7 @@
 //! lineage, embedding governance, DQ gates) references `SnapshotId`s produced
 //! here.
 
+pub mod dq;
 pub mod error;
 pub mod embedding;
 pub mod id;
@@ -17,6 +18,10 @@ pub mod stats;
 pub mod store;
 
 pub use error::{CatalogError, Result};
+pub use dq::{
+    overridden_rules, parse_rules, DqFailure, DqRule, GateDecision, GateDecisionRecord,
+    OverrideRecord,
+};
 pub use embedding::{
     active_entity_ids, embedding_schema, filter_active, read_embeddings, schema_dimension,
     validate_embedding_batch, EmbeddingGovernance, EmbeddingProvenance, EMBEDDING_COLUMN,

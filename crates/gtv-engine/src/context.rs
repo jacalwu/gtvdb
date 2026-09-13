@@ -162,6 +162,10 @@ impl GtvContext {
                 Arc::new(crate::monitor::DqCheckTableFunction::new(hft_reg.clone())),
             );
             ctx.register_udtf(
+                "dq_gate",
+                Arc::new(crate::dq::DqGateTableFunction::new(hft_reg.clone())),
+            );
+            ctx.register_udtf(
                 "health_check",
                 Arc::new(crate::monitor::HealthCheckTableFunction::new(hft_reg.clone())),
             );
@@ -256,6 +260,29 @@ impl GtvContext {
         reg.tables
             .get(name)
             .map(|batches| batches.iter().map(|b| b.num_rows()).sum())
+    }
+
+    /// Cloned record batches for a registered session table, or `None` when the
+    /// table is not in the kernel registry. Used by the DQ gate.
+    pub fn table_batches(&self, name: &str) -> Option<Vec<RecordBatch>> {
+        let reg = self.hft_reg.read().ok()?;
+        reg.tables.get(name).map(|b| b.as_ref().clone())
+    }
+
+    /// Evaluate data-quality `rules` over session table `table`, resolving
+    /// referential parents from other session tables. Returns the gate decision
+    /// plus the per-rule evidence. Errors only when the target table is missing.
+    pub fn evaluate_dq(
+        &self,
+        table: &str,
+        rules: &[gtv_catalog::DqRule],
+    ) -> Result<(gtv_catalog::GateDecision, Vec<crate::dq::RuleOutcome>)> {
+        let batches = self.table_batches(table).ok_or_else(|| {
+            datafusion::error::DataFusionError::Execution(format!("unknown table `{table}`"))
+        })?;
+        let reg = self.hft_reg.clone();
+        let lookup = move |parent: &str, col: &str| crate::dq::parent_lookup(&reg, parent, col);
+        Ok(crate::dq::evaluate(&batches, rules, &lookup))
     }
 
     /// Load a CSV file from disk and register it as `name` (method 1:

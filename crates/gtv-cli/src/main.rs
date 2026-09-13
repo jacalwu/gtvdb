@@ -1679,6 +1679,165 @@ async fn run(
                 ),
             }
         }
+        "dq_gate" => {
+            // dq_gate <table> <rules.json|@file|inline-json> [execution_id]
+            let usage = "dq_gate <table> <rules> [execution_id]";
+            let table = require_arg(&tokens, 1, usage)?;
+            let rules = load_rules(require_arg(&tokens, 2, usage)?)?;
+            let exec_id = optional_arg(&tokens, 3)
+                .map(|s| s.parse::<ExecutionId>())
+                .transpose()?;
+            let (decision, outcomes) = ctx.evaluate_dq(table, &rules)?;
+            for o in &outcomes {
+                println!(
+                    "{:<14} {:<20} {:<4} observed={:<12.6} threshold={:<12.6} {}",
+                    o.rule,
+                    o.target,
+                    if o.passed { "PASS" } else { "FAIL" },
+                    o.observed,
+                    o.threshold,
+                    o.message
+                );
+            }
+            if let Some(cat) = catalog.as_ref() {
+                let rec = gtv_catalog::GateDecisionRecord {
+                    execution_id: exec_id,
+                    target: table.to_string(),
+                    snapshot_id: cat.table_ref(table)?.map(|t| t.snapshot_id),
+                    pass: decision.pass,
+                    failures: decision.failures.clone(),
+                    overridden: false,
+                    override_reason: None,
+                    override_approver: None,
+                    decided_at: gtv_catalog::schema::now_ns(),
+                };
+                cat.append_gate_decision(&rec)?;
+            }
+            if !decision.pass {
+                return Err(anyhow!(
+                    "dq_gate: {} rule(s) failed — publish blocked",
+                    decision.failures.len()
+                ));
+            }
+            println!("dq_gate: `{table}` passed ({} rule(s))", rules.len());
+        }
+        "dq_override" => {
+            // dq_override <table> <rule> <approver> <reason...>
+            let usage = "dq_override <table> <rule> <approver> <reason...>";
+            let table = require_arg(&tokens, 1, usage)?;
+            let rule = require_arg(&tokens, 2, usage)?;
+            let approver = require_arg(&tokens, 3, usage)?;
+            let reason = tokens
+                .get(4..)
+                .map(|t| t.join(" "))
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| anyhow!("missing reason; usage: {usage}"))?;
+            let cat = catalog
+                .as_ref()
+                .ok_or_else(|| anyhow!("dq_override requires GTV_HOME"))?;
+            let rec = gtv_catalog::OverrideRecord::new(table, rule, &reason, approver, None);
+            cat.append_override(&rec)?;
+            println!(
+                "override recorded: target={} rule={} approver={}",
+                rec.target, rec.rule, rec.approver
+            );
+        }
+        "dq_audit" => match catalog.as_ref() {
+            Some(cat) => {
+                let decisions = cat.gate_decisions()?;
+                println!("== gate decisions ({}) ==", decisions.len());
+                for d in &decisions {
+                    println!(
+                        "{:<22} pass={:<5} overridden={:<5} failures={} exec={}",
+                        d.target,
+                        d.pass,
+                        d.overridden,
+                        d.failures.len(),
+                        d.execution_id
+                            .map(|e| e.to_string())
+                            .unwrap_or_else(|| "-".into())
+                    );
+                }
+                let overrides = cat.overrides()?;
+                println!("== overrides ({}) ==", overrides.len());
+                for o in &overrides {
+                    println!(
+                        "{:<22} rule={:<14} approver={:<12} reason={}",
+                        o.target, o.rule, o.approver, o.reason
+                    );
+                }
+            }
+            None => println!("dq_audit: disabled — export GTV_HOME=<dir>"),
+        },
+        "publish" => {
+            // publish <table> <rules.json|@file|inline-json> [execution_id]
+            let usage = "publish <table> <rules> [execution_id]";
+            let table = require_arg(&tokens, 1, usage)?;
+            let rules = load_rules(require_arg(&tokens, 2, usage)?)?;
+            let exec_id = optional_arg(&tokens, 3)
+                .map(|s| s.parse::<ExecutionId>())
+                .transpose()?;
+            let (decision, outcomes) = ctx.evaluate_dq(table, &rules)?;
+            for o in outcomes.iter().filter(|o| !o.passed) {
+                println!("FAIL {:<14} {:<20} {}", o.rule, o.target, o.message);
+            }
+            let cat = catalog
+                .as_mut()
+                .ok_or_else(|| anyhow!("publish requires GTV_HOME"))?;
+            let existing = cat.overrides()?;
+            let blocking = gtv_engine::dq::blocking_failures(&decision, &existing, table);
+            let overridden = !decision.failures.is_empty() && blocking.is_empty();
+            let record = gtv_catalog::GateDecisionRecord {
+                execution_id: exec_id,
+                target: table.to_string(),
+                snapshot_id: cat.table_ref(table)?.map(|t| t.snapshot_id),
+                pass: decision.pass,
+                failures: decision.failures.clone(),
+                overridden,
+                override_reason: overridden.then(|| {
+                    existing
+                        .iter()
+                        .filter(|o| o.target == table)
+                        .map(|o| format!("{}: {}", o.rule, o.reason))
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                }),
+                override_approver: overridden.then(|| {
+                    existing
+                        .iter()
+                        .filter(|o| o.target == table)
+                        .map(|o| o.approver.clone())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                }),
+                decided_at: gtv_catalog::schema::now_ns(),
+            };
+            cat.append_gate_decision(&record)?;
+            if !blocking.is_empty() {
+                return Err(anyhow!(
+                    "publish blocked: {} failing rule(s) not overridden: {}",
+                    blocking.len(),
+                    blocking
+                        .iter()
+                        .map(|f| f.rule.clone())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            let batches = ctx
+                .table_batches(table)
+                .ok_or_else(|| anyhow!("unknown table `{table}`"))?;
+            let schema = batches
+                .first()
+                .map(|b| b.schema())
+                .ok_or_else(|| anyhow!("table `{table}` is empty"))?;
+            let rows = cat.record_snapshot(table, &schema, &batches)?;
+            if overridden {
+                println!("published `{table}` ({rows} rows) with override");
+            } else {
+                println!("published `{table}` ({rows} rows) to catalog");
+            }
+        }
         "lineage" | "lineage_list" => {
             match catalog.as_ref() {
                 Some(cat) => {
@@ -2223,6 +2382,10 @@ fn print_help() {
          \x20 lineage_run <sql>     execute + record lineage (execution_id, checksum)\n\
          \x20 lineage_show <id>     print one execution record as JSON\n\
          \x20 replay <id> [--force]  re-run a recorded query on pinned snapshots\n\
+         \x20 dq_gate <table> <rules> [exec_id]  evaluate DQ rules (JSON inline, @file or .json)\n\
+         \x20 dq_override <table> <rule> <approver> <reason...>  waive a failing rule (audited)\n\
+         \x20 dq_audit              list gate decisions and overrides (GTV_HOME)\n\
+         \x20 publish <table> <rules> [exec_id]  gate-check then persist to catalog\n\
          \x20 drop table <name>     drop a table from memory [+ persisted catalog]\n\
          \x20 remote <host:port> <sql>  execute SQL on a remote gtv-server\n\
          \x20 quit | exit\n\
@@ -2273,6 +2436,18 @@ fn require_arg<'a>(tokens: &'a [&'a str], idx: usize, usage: &str) -> Result<&'a
 
 fn optional_arg<'a>(tokens: &'a [&'a str], idx: usize) -> Option<&'a str> {
     tokens.get(idx).copied()
+}
+
+/// Load DQ rules from an inline JSON string, a `@path`, or a `.json` file path.
+fn load_rules(arg: &str) -> Result<Vec<gtv_catalog::DqRule>> {
+    let text = if let Some(path) = arg.strip_prefix('@') {
+        std::fs::read_to_string(path).map_err(|e| anyhow!("read rules file `{path}`: {e}"))?
+    } else if arg.ends_with(".json") && Path::new(arg).is_file() {
+        std::fs::read_to_string(arg).map_err(|e| anyhow!("read rules file `{arg}`: {e}"))?
+    } else {
+        arg.to_string()
+    };
+    gtv_catalog::parse_rules(&text).map_err(|e| anyhow!("bad DQ rules JSON: {e}"))
 }
 
 // ---------------------------------------------------------------------------
