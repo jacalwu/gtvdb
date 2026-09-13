@@ -345,7 +345,9 @@ hdb_scan <table> <start> <end> [sym] [root]  掃描 HDB 日期區間
 hdb_flush <table> [root] [secs]  背景 HDB 落盤（symbol 枚舉）
 tt <table> <T>             pattern [T]        delta
 udf [x ...]                remote <host:port> <sql>
-metrics                                  # 引擎計數器 + SQL 延遲直方圖（Prometheus 文字）
+metrics                                  # 引擎計數器 + SQL 延遲直方圖 + workload telemetry（Prometheus 文字）
+workload                                 # 每 class workload admission / 隔離狀態（§19）
+cbo [on|off|recall R]                    # 多模態 cost-based optimizer 狀態 / 設定（§18）
 ```
 
 行情/趨勢分析函數（provider 只是第一個參數，見 §7）：
@@ -366,6 +368,8 @@ khop(src, k, valid_at[, max_hops, max_edges])   # 資源受限 k-hop BFS：visit
 crm_alloc('loan_exposure','collateral','guarantee','collateral_edges','guarantee_edges','BASE',T[, 'ead'])  # 每筆貸款的 CRM 覆蓋（§8）
 crm_audit('loan_exposure','collateral','guarantee','collateral_edges','guarantee_edges','BASE',T[, 'ead'])  # 分配稽核紀錄（§8）
 embedding_search(name, q, k [, tenant [, as_of]])  # 受治理向量檢索：provenance + 租戶 + 過期過濾（§12）
+cbo_explain(name, query, k [, metric [, filter [, strategy]]])  # CBO 選路 + 估算成本（§18）
+workload_status()                              # 每 class admission / 資源 telemetry（§19）
 metrics                                        # 引擎計數器
 ```
 
@@ -829,3 +833,84 @@ let mut p = Pipeline::new(
 );
 p.run_bounded(10_000)?;
 ```
+
+---
+
+## 18. 多模態 Cost-Based Optimizer（prod_p3 B3-5）
+
+`cbo_explain(...)` 將三類統計——**關聯**（catalog commit 時嘅 column stats）、
+**圖**（TemporalCSR degree histogram / active ratio）、**向量**（ANN corpus size、
+selectivity、IVF recall curve）——合併成一個 `QueryPlanChoice`，決定「filter 先定
+ANN 先」、建議索引類型、temporal-bitmap-first、graph source pruning、exact rerank，
+並估算成本：
+
+```text
+cbo_explain(name, query, k [, metric [, filter [, strategy]]])
+```
+
+回傳一行：
+
+`table, enabled, strategy, index_type, filter_first, temporal_bitmap_first,
+prune_graph_sources, exact_rerank, estimated_rows, estimated_cost, selectivity,
+corpus_size, max_degree, reason`
+
+決策規則（`CostModel` 預設值）：
+
+| 條件 | 決定 |
+|---|---|
+| `corpus <= flat_max_rows`（10000） | 建議 `flat`，filter-first |
+| `selectivity < prefilter_threshold`（1%） | filter-first |
+| `selectivity < filtered_threshold`（20%） | corpus 大時建議 `ivf` |
+| 其他 | 建議 `hnsw`，ANN-first |
+| temporal active ratio `< temporal_bitmap_threshold`（20%） | 先建 temporal bitmap |
+| graph `max_degree > high_degree_threshold`（1000） | 先 prune source nodes |
+| strategy 非 `Exact` / `PreFilterExact` | 加精確 rerank |
+| IVF recall curve `< recall_target`（0.90） | 由 `ivf` 退回 `hnsw` |
+
+- **統計新鮮度**：`publish` 之後 CLI 會 `refresh_table_stats_by_name`，plan 一定用
+  最新 committed stats，唔會用過期數字。`EXPLAIN` 顯示 catalog 層統計；
+  `cbo_explain(...)` 顯示 CBO 層 `strategy` / `index_type` / `estimated_cost`。
+- **CLI**：`cbo` 印出成本模型參數同已註冊 stats；`cbo on|off` 開關（off 時
+  fallback 固定 B3-3 策略，`reason` 會標明 `optimizer disabled`）；
+  `cbo recall <0.0-1.0>` 調 `recall_target`。
+- **Rust API**：`gtv_engine::cbo::{CostModel, CboState, plan_multimodal,
+  QueryPlanChoice, GraphStats, VectorStats, SelectivityStats}`；
+  `GtvContext::{set_table_stats, refresh_table_stats_by_name, set_graph_stats,
+  set_cost_model, cbo_state}`。
+
+---
+
+## 19. Workload 管理與隔離（prod_p3 B3-6）
+
+六個 workload class，各有 resource group（priority 高者勝）同 admission 控制：
+
+| class | priority | max_concurrency |
+|---|---:|---:|
+| `interactive_aml` | 100 | 4 |
+| `ingestion` | 50 | 2 |
+| `risk_batch` | 40 | 2 |
+| `alm_batch` | 30 | 1 |
+| `ftp_batch` | 20 | 1 |
+| `index_build` | 10 | 1 |
+
+全域預設 `global_max_active = 8`、`max_queue = 256`。
+
+- **Admission**：`wait_admit(class, timeout)` 回 `Admit { id, token }` /
+  `Queue { position }` / `Reject { reason }`。全域預算滿但 class 未滿 → Queue；
+  queue 亦滿 → Reject（明確錯誤，唔會靜默）。
+- **Preemption**：request 嘅 priority 高於某 active query 時，會取消最低 priority
+  嘅 victim（只搶**嚴格較低** priority）；victim 嘅 `CancelToken`（B1-3）被 trip，
+  長查詢可協作式中止。`preempt(id)` / `preempt_class` 支援定向 / 整 class 取消。
+- **SQL**：`workload_status()` 每 class 一行：
+  `class, priority, cpu_quota, max_concurrency, memory_limit_bytes, io_limit_bps,
+  active, admitted, queued, rejected, preempted, completed`。
+- **CLI**：`workload` = `SELECT ... FROM workload_status() ORDER BY priority DESC`；
+  `metrics` 除咗引擎 / SQL 直方圖，亦輸出 Prometheus
+  `gtv_workload_*{class=...}`（admitted / queued / rejected / preempted /
+  completed / active）同 `gtv_spill_bytes` / `gtv_spill_active_files`（DataFusion spill）。
+- **API**：`GtvContext::sql_as(class, sql, timeout)` 走 admission 後執行；
+  `workload()` 取 `Arc<WorkloadManager>`；`configure(ResourceGroup)` 調 quota。
+- **隔離量測**：永久超載（8 條 ingestion / batch / index-build worker 搶 2 個 slot）
+  下 interactive admission p99 ≈ 8.6µs、0 timeout（見 `doc/b3_mixed_load_slo.md`）。
+  注意呢個係 **admission 控制面**延遲，未包含查詢執行時間；單 process in-memory
+  架構下真正 CPU / memory 硬隔離要留待企業批 compute-storage 分離。

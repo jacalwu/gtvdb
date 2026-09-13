@@ -350,7 +350,9 @@ hdb_scan <table> <start> <end> [sym] [root]  scan HDB date range
 hdb_flush <table> [root] [secs]  background HDB flush (sym-enumerated)
 tt <table> <T>             pattern [T]        delta
 udf [x ...]                remote <host:port> <sql>
-metrics                                  # engine counters + SQL latency histogram (Prometheus text)
+metrics                                  # engine counters + SQL latency histogram + workload telemetry (Prometheus text)
+workload                                 # per-class workload admission / isolation status (§19)
+cbo [on|off|recall R]                    # multimodal cost-based optimizer status / config (§18)
 ```
 
 Market/trend functions (provider is just the first argument, see §7):
@@ -372,6 +374,8 @@ khop(src, k, valid_at[, max_hops, max_edges])   # resource-bounded k-hop BFS: vi
 crm_alloc('loan_exposure','collateral','guarantee','collateral_edges','guarantee_edges','BASE',T[, 'ead'])  # per-loan CRM cover (§8)
 crm_audit('loan_exposure','collateral','guarantee','collateral_edges','guarantee_edges','BASE',T[, 'ead'])  # audit trail (§8)
 embedding_search(name, q, k [, tenant [, as_of]])  # governed vector search: provenance + tenant + expiry (§12)
+cbo_explain(name, query, k [, metric [, filter [, strategy]]])  # CBO plan choice + estimated cost (§18)
+workload_status()                    # per-class admission / resource telemetry (§19)
 metrics                              # engine counters (see above)
 ```
 
@@ -884,3 +888,95 @@ let mut p = Pipeline::new(
 );
 p.run_bounded(10_000)?;
 ```
+
+---
+
+## 18. Multimodal cost-based optimizer (prod_p3 B3-5)
+
+`cbo_explain(...)` combines three statistic families — **relational** (catalog
+commit-time column stats), **graph** (TemporalCSR degree histogram / active
+ratio) and **vector** (ANN corpus size, selectivity, IVF recall curve) — into a
+single `QueryPlanChoice`: filter-first vs ANN-first, recommended index type,
+temporal-bitmap-first, graph source pruning and exact rerank, plus an estimated
+cost:
+
+```text
+cbo_explain(name, query, k [, metric [, filter [, strategy]]])
+```
+
+It returns one row:
+
+`table, enabled, strategy, index_type, filter_first, temporal_bitmap_first,
+prune_graph_sources, exact_rerank, estimated_rows, estimated_cost, selectivity,
+corpus_size, max_degree, reason`
+
+Decision rules (`CostModel` defaults):
+
+| Condition | Decision |
+|---|---|
+| `corpus <= flat_max_rows` (10000) | recommend `flat`, filter-first |
+| `selectivity < prefilter_threshold` (1%) | filter-first |
+| `selectivity < filtered_threshold` (20%) | recommend `ivf` for large corpora |
+| otherwise | recommend `hnsw`, ANN-first |
+| temporal active ratio `< temporal_bitmap_threshold` (20%) | build the temporal bitmap first |
+| graph `max_degree > high_degree_threshold` (1000) | prune source nodes first |
+| strategy is not `Exact` / `PreFilterExact` | add exact rerank |
+| IVF recall curve `< recall_target` (0.90) | fall back from `ivf` to `hnsw` |
+
+- **Freshness**: after `publish` the CLI calls `refresh_table_stats_by_name`, so a
+  plan always uses the latest committed stats, never stale numbers. `EXPLAIN`
+  shows catalog-level statistics; `cbo_explain(...)` shows the CBO-level
+  `strategy` / `index_type` / `estimated_cost`.
+- **CLI**: `cbo` prints the cost-model parameters and registered stats;
+  `cbo on|off` toggles it (when off it falls back to the fixed B3-3 strategy and
+  the `reason` says `optimizer disabled`); `cbo recall <0.0-1.0>` tunes
+  `recall_target`.
+- **Rust API**: `gtv_engine::cbo::{CostModel, CboState, plan_multimodal,
+  QueryPlanChoice, GraphStats, VectorStats, SelectivityStats}`;
+  `GtvContext::{set_table_stats, refresh_table_stats_by_name, set_graph_stats,
+  set_cost_model, cbo_state}`.
+
+---
+
+## 19. Workload management & isolation (prod_p3 B3-6)
+
+Six workload classes, each with a resource group (higher priority wins) and
+admission control:
+
+| class | priority | max_concurrency |
+|---|---:|---:|
+| `interactive_aml` | 100 | 4 |
+| `ingestion` | 50 | 2 |
+| `risk_batch` | 40 | 2 |
+| `alm_batch` | 30 | 1 |
+| `ftp_batch` | 20 | 1 |
+| `index_build` | 10 | 1 |
+
+Global defaults: `global_max_active = 8`, `max_queue = 256`.
+
+- **Admission**: `wait_admit(class, timeout)` returns `Admit { id, token }` /
+  `Queue { position }` / `Reject { reason }`. If the global budget is full but
+  the class is not, the request is queued; if the queue is also full it is
+  rejected with an explicit error (never silently dropped).
+- **Preemption**: when a request has higher priority than an active query, the
+  lowest-priority victim is cancelled (only *strictly lower* priority is
+  preempted); the victim's `CancelToken` (B1-3) is tripped and long-running
+  operators cancel cooperatively. `preempt(id)` / `preempt_class` allow targeted
+  or whole-class cancellation.
+- **SQL**: `workload_status()` returns one row per class:
+  `class, priority, cpu_quota, max_concurrency, memory_limit_bytes, io_limit_bps,
+  active, admitted, queued, rejected, preempted, completed`.
+- **CLI**: `workload` = `SELECT ... FROM workload_status() ORDER BY priority DESC`;
+  `metrics` emits, besides engine / SQL histograms, Prometheus
+  `gtv_workload_*{class=...}` (admitted / queued / rejected / preempted /
+  completed / active) plus `gtv_spill_bytes` / `gtv_spill_active_files`
+  (DataFusion spill).
+- **API**: `GtvContext::sql_as(class, sql, timeout)` runs through admission;
+  `workload()` returns the `Arc<WorkloadManager>`; `configure(ResourceGroup)`
+  adjusts quotas.
+- **Isolation measurement**: under permanent overload (8 ingestion / batch /
+  index-build workers competing for 2 slots) interactive admission p99 is
+  ≈ 8.6µs with 0 timeouts (see `doc/b3_mixed_load_slo.md`). Note this measures
+  the **admission control plane** latency, not query execution; real CPU/memory
+  enforcement in a single-process in-memory architecture requires the enterprise
+  batch's compute-storage separation.
