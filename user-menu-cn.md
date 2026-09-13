@@ -779,3 +779,53 @@ planner 按 `selectivity = allowed / total` 揀五種策略之一：
 
   `as_of(table, business_ts [, system_ts])` 嘅 `system_ts` 預設為最新版本；當
   business 時點唔喺任何區間內，會回傳一個 schema 正確嘅空結果。
+
+---
+
+## 17. Streaming 攝取（prod_p3 B3-1）
+
+`gtv-ingest` 係一個 source-agnostic、at-least-once 嘅 **micro-batch** 管線，建於
+B2-1 atomic catalog commit 之上：
+
+```text
+poll ─▶ dedup(event_id) ─▶ watermark / late policy ─▶ encode Arrow
+     ─▶ Sink（atomic catalog commit；offset 記入 snapshot.summary）
+     ─▶ commit offset（offset store + 來源） ─▶ persist dedup
+```
+
+- **Envelope**：`Envelope { source, partition, offset, event_id, event_time,
+  ingest_time, schema_version, payload }`。`event_id` 係穩定嘅 16-byte dedup key
+  （來源冇 native id 時用 `Envelope::id_from_offset`）。
+- **`SourceAdapter`**：`name / poll(max) / commit(offsets) / seek(offsets) /
+  lag`。`FileReplayAdapter`（JSONL、單 partition）永遠可用；Kafka
+  （`feature = "kafka"`）/ Pulsar（`feature = "pulsar"`）係預留 seam，而
+  `decode_json_envelope` 係 protocol-agnostic 嘅 JSON decoder。
+- **`OffsetStore`**：append-only `metadata/offsets.jsonl`，per
+  `(source, partition)` 單調，重啟可續，容忍尾部被截斷嘅一行。
+- **`DedupStore`**：有界、最近見過嘅 `event_id` 集合，原子持久化；重播即 no-op。
+- **Watermark / `LatePolicy`**：`watermark = max_event_time − allowed_lateness`；
+  `Recompute` 照發布 late event、`Dlq` 送去死信隊列、`Drop` 只計數。
+- **`DeadLetterQueue`**：
+  `deadletter/<source>/<date>/<partition>-<seq>.parquet`，含 `error_code` /
+  `error_message` / `rejected_at`；`list` / `read` / `read_envelopes`（reprocess）。
+- **`Pipeline<A, S>`**：`poll_once`（含 backpressure）、`publish_once`、
+  `run_once`、`run_bounded`；`StreamMetrics` 提供 `events_polled / published /
+  duplicate / late / dropped / dlq`、`end_to_end_lag_ns`、`event_time_lag_ns`、
+  `offset_lag`。
+- **`CatalogSink`**：原子發布 — 數據 batch 同 `source_offsets` 落入同一個
+  snapshot。commit 前 crash 嘅 batch 對讀者不可見、offset 未 commit
+  （at-least-once）；dedup + catalog idempotency key 令重播 effectively-once。
+
+```rust
+let sink = CatalogSink::open("catalog_home", "events")?;
+let offsets = OffsetStore::open("catalog_home")?;
+let dlq = DeadLetterQueue::new("catalog_home");
+let dedup = DedupStore::open("catalog_home/metadata/dedup.txt", 1_000_000)?;
+let mut p = Pipeline::new(
+    FileReplayAdapter::open("events.jsonl", "feed")?,
+    sink, offsets, dlq, dedup,
+    StreamConfig::default(),
+    WatermarkConfig { allowed_lateness_ns: 5_000_000_000, policy: LatePolicy::Dlq },
+);
+p.run_bounded(10_000)?;
+```

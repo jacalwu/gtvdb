@@ -1,0 +1,29 @@
+[package]
+name = "gtv-ingest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# B3-1 streaming ingestion contract: event envelope, source adapters, offset
+# store, dedup, watermark / late policy, DLQ and a micro-batch pipeline.
+#
+# Kafka / Pulsar adapters are *feature-gated seams* (`kafka` / `pulsar`); the
+# default build stays dependency-light (see the workspace Cargo.toml build-time
+# tuning note). The always-on `FileReplayAdapter` covers tests and replay.
+[features]
+default = []
+# Placeholder for the rdkafka-backed adapter. Enabling it is a deliberate build
+# decision because rdkafka dominates compile time.
+kafka = []
+pulsar = []
+
+[dependencies]
+arrow.workspace = true
+bytes = "1"
+blake3.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+gtv-catalog = { path = "../gtv-catalog" }
+gtv-storage = { path = "../gtv-storage" }

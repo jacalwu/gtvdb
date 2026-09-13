@@ -38,7 +38,7 @@ use crate::dq::{GateDecisionRecord, OverrideRecord};
 use crate::error::{CatalogError, Result};
 use crate::id::{CommitId, DataFileId, SnapshotId, TableId};
 use crate::lineage::{ExecutionId, ExecutionRecord};
-use crate::manifest::{CommitOp, DataFile, FileFormat, Snapshot};
+use crate::manifest::{CommitOp, DataFile, FileFormat, Snapshot, SourceOffset};
 use crate::partition::{partition_dir, PartitionSpec, PartitionValue};
 use crate::schema::{
     apply_change, check_compatible, now_ns, SchemaChange, SchemaRecord, SchemaVersion,
@@ -84,6 +84,11 @@ pub struct CommitOptions {
     pub idempotency_key: Option<String>,
     /// Override the table's event-time column for this commit.
     pub event_time_column: Option<String>,
+    /// Source positions persisted on the written data files *and* the snapshot
+    /// summary (streaming / CDC exactly-once bookkeeping, B3-1).
+    pub source_offsets: Vec<SourceOffset>,
+    /// Extra snapshot `summary` entries, merged after the built-in keys.
+    pub summary: serde_json::Value,
 }
 
 /// Predicate used to prune data files by event time.
@@ -582,6 +587,16 @@ impl FsCatalog {
         if let Some(key) = &opts.idempotency_key {
             summary["idempotency_key"] = serde_json::Value::String(key.clone());
         }
+        if !opts.source_offsets.is_empty() {
+            summary["source_offsets"] = serde_json::to_value(&opts.source_offsets)?;
+        }
+        if let serde_json::Value::Object(extra) = &opts.summary {
+            if let serde_json::Value::Object(base) = &mut summary {
+                for (k, v) in extra {
+                    base.insert(k.clone(), v.clone());
+                }
+            }
+        }
         let snapshot = Snapshot {
             snapshot_id: SnapshotId::new(),
             parent,
@@ -644,7 +659,7 @@ impl FsCatalog {
             schema_version: SchemaVersion(meta.schema_version),
             partition: nf.partition.clone(),
             checksum,
-            source_offsets: Vec::new(),
+            source_offsets: opts.source_offsets.clone(),
             commit_id,
         })
     }

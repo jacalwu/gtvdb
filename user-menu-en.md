@@ -830,3 +830,57 @@ versions, so a correction appends a new version instead of overwriting history.
   `as_of(table, business_ts [, system_ts])` defaults `system_ts` to the latest
   version and returns a schema-typed empty result when the business instant is
   outside every interval.
+
+---
+
+## 17. Streaming ingestion (prod_p3 B3-1)
+
+`gtv-ingest` is a source-agnostic, at-least-once **micro-batch** pipeline on top
+of the B2-1 atomic catalog commit:
+
+```text
+poll ─▶ dedup(event_id) ─▶ watermark / late policy ─▶ encode Arrow
+     ─▶ Sink (atomic catalog commit; offsets in snapshot.summary)
+     ─▶ commit offsets (offset store + source) ─▶ persist dedup
+```
+
+- **Envelope**: `Envelope { source, partition, offset, event_id, event_time,
+  ingest_time, schema_version, payload }`. `event_id` is a stable 16-byte dedup
+  key (`Envelope::id_from_offset` when the source has no native id).
+- **`SourceAdapter`**: `name / poll(max) / commit(offsets) / seek(offsets) /
+  lag`. `FileReplayAdapter` (JSONL, single partition) is always available;
+  Kafka (`feature = "kafka"`) / Pulsar (`feature = "pulsar"`) are reserved
+  seams, and `decode_json_envelope` is the protocol-agnostic JSON decoder.
+- **`OffsetStore`**: append-only `metadata/offsets.jsonl`, monotonic per
+  `(source, partition)`, survives restart, tolerates a truncated trailing line.
+- **`DedupStore`**: bounded most-recently-seen `event_id` set, persisted
+  atomically; replays are no-ops.
+- **Watermark / `LatePolicy`**: `watermark = max_event_time −
+  allowed_lateness`; `Recompute` publishes late events, `Dlq` routes them to the
+  dead-letter queue, `Drop` counts them.
+- **`DeadLetterQueue`**:
+  `deadletter/<source>/<date>/<partition>-<seq>.parquet` with `error_code` /
+  `error_message` / `rejected_at`; `list` / `read` / `read_envelopes`
+  (reprocess).
+- **`Pipeline<A, S>`**: `poll_once` (with backpressure), `publish_once`,
+  `run_once`, `run_bounded`; `StreamMetrics` reports `events_polled /
+  published / duplicate / late / dropped / dlq`, `end_to_end_lag_ns`,
+  `event_time_lag_ns` and `offset_lag`.
+- **`CatalogSink`**: atomic publish — the data batch and `source_offsets` land
+  in the *same* snapshot. A crash before the commit leaves the batch invisible
+  and the offset uncommitted (at-least-once); dedup + the catalog idempotency
+  key make the replay effectively-once.
+
+```rust
+let sink = CatalogSink::open("catalog_home", "events")?;
+let offsets = OffsetStore::open("catalog_home")?;
+let dlq = DeadLetterQueue::new("catalog_home");
+let dedup = DedupStore::open("catalog_home/metadata/dedup.txt", 1_000_000)?;
+let mut p = Pipeline::new(
+    FileReplayAdapter::open("events.jsonl", "feed")?,
+    sink, offsets, dlq, dedup,
+    StreamConfig::default(),
+    WatermarkConfig { allowed_lateness_ns: 5_000_000_000, policy: LatePolicy::Dlq },
+);
+p.run_bounded(10_000)?;
+```

@@ -63,12 +63,12 @@ late event、去重、replay、DLQ、backpressure。
 
 **驗收條件**
 
-- [ ] 任意重啟後由最後 committed offset 繼續，唔會重複或漏。
-- [ ] 同一批資料重播不造成重複結果（冪等，靠 event_id dedup）。
-- [ ] 未完整發布嘅 batch 對讀者不可見（依賴 B2-1 atomic commit）。
-- [ ] 可量度 end-to-end lag、event-time lag、dropped events。
-- [ ] late event 有明確處理（重算或 DLQ），並可審計。
-- [ ] backpressure 生效時，來源唔會壓垮查詢路徑。
+- [x] 任意重啟後由最後 committed offset 繼續，唔會重複或漏。
+- [x] 同一批資料重播不造成重複結果（冪等，靠 event_id dedup）。
+- [x] 未完整發布嘅 batch 對讀者不可見（依賴 B2-1 atomic commit）。
+- [x] 可量度 end-to-end lag、event-time lag、dropped events。
+- [x] late event 有明確處理（重算或 DLQ），並可審計。
+- [x] backpressure 生效時，來源唔會壓垮查詢路徑。
 
 **風險**
 

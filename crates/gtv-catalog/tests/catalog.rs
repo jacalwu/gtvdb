@@ -150,7 +150,7 @@ fn idempotent_replay_returns_same_snapshot() {
     let (cat, table) = fresh("idem");
     let opts = CommitOptions {
         idempotency_key: Some("batch-1".into()),
-        event_time_column: None,
+        ..CommitOptions::default()
     };
     let a = cat
         .commit(

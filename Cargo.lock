@@ -2057,6 +2057,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "gtv-ingest"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "blake3",
+ "bytes",
+ "chrono",
+ "gtv-catalog",
+ "gtv-storage",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "gtv-pattern"
 version = "0.1.0"
 dependencies = [
