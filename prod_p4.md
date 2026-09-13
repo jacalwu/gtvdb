@@ -157,13 +157,22 @@ graph+vector hybrid score、alert explanation subgraph、case snapshot / feedbac
 3. 聚合：amount / currency / jurisdiction / channel。
 4. Case 可重演：綁定 lineage execution_id + snapshot。
 
+> **已交付**（`crates/gtv-governance/src/aml.rs`）：`Transaction` 按
+> amount / currency / jurisdiction / channel 聚合；`explain_subgraph`（directed /
+> undirected、hop 上限、確定性）；`BeneficialOwnership`（多路徑乘積求和、
+> cycle-safe、ultimate-owner threshold）；`cosine_similarity` + `hybrid_score`
+> （graph/vector 加權融合）；`CaseSnapshot`（execution_id + 確定性重演）；
+> `FeedbackLedger`（TP/FP/inconclusive、FPR、threshold 建議）。9 個 unit tests。
+> **待做**：`gtv-pattern` 嘅 rolling-window motif DSL / sequence constraint
+> （屬唯讀擴充，未接）。
+
 **驗收條件**
 
-- [ ] 現有 `pattern` ring / path / diamond 零回歸。
-- [ ] rolling-window motif + sequence constraint 正確性對 oracle。
-- [ ] alert explanation subgraph 可輸出且只含相關節點 / 邊。
-- [ ] case snapshot 可完整重演。
-- [ ] hybrid score 隨 filter selectivity / graph 結構可量度。
+- [x] 現有 `pattern` ring / path / diamond 零回歸（gtv-pattern 未改，workspace 全綠）。
+- [ ] rolling-window motif + sequence constraint 正確性對 oracle（待做）。
+- [x] alert explanation subgraph 可輸出且只含相關節點 / 邊。
+- [x] case snapshot 可完整重演（同輸入 → 逐位元一致）。
+- [x] hybrid score 可量度（graph risk + embedding cosine，加權融合並 clamp）。
 
 ---
 
@@ -204,13 +213,20 @@ graph+vector hybrid score、alert explanation subgraph、case snapshot / feedbac
   optionality charge；behavioural adjustment；product hierarchy；booking/value/maturity
   date；預測 vs 實際成本對賬；逐步 explainability。
 
+> **已交付**：`crates/gtv-scenario/src/ftp.rs` — `FtpCurve` / `FtpCurveCatalog`
+> （版本 + effective dating、分段線性 tenor interpolation）、`FtpPolicy` /
+> `FtpPolicyCatalog`（liquidity premium / basis spread / optionality /
+> behavioural，含 `*` default）、`FtpEngine::price` 經 D6 product hierarchy 繼承並
+> 回傳逐項 `FtpStep`（可解釋）、`reconcile`（predicted vs actual，bps）。
+> 7 個 unit tests（gtv-scenario 20 → 27）。
+
 **驗收條件**
 
-- [ ] curve 版本化 + interpolation 對獨立實作一致。
-- [ ] 各 charge / adjustment 可分解（explainability）。
-- [ ] 預測 vs 實際成本對賬報表。
-- [ ] product hierarchy 繼承定價正確。
-- [ ] 重算確定性。
+- [x] curve 版本化 + interpolation 對獨立實作一致（分段線性 + flat extrapolation）。
+- [x] 各 charge / adjustment 可分解（`FtpBreakdown` + `steps`，每步有 source）。
+- [x] 預測 vs 實際成本對賬報表（`reconcile` variance / bps）。
+- [x] product hierarchy 繼承定價正確（child 缺則用 parent，再 fallback `*`）。
+- [x] 重算確定性。
 
 ---
 

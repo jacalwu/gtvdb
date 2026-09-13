@@ -12,4 +12,5 @@ license.workspace = true
 # registration only (see doc/prod_p4_design.md §3).
 
 [dependencies]
+gtv-refdata = { path = "../gtv-refdata" }
 thiserror.workspace = true

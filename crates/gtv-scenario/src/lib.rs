@@ -12,6 +12,7 @@
 
 pub mod alm;
 pub mod catalog;
+pub mod ftp;
 pub mod scenario;
 
 pub use alm::{
@@ -19,6 +20,11 @@ pub use alm::{
     LiquidityStress, PrepaymentModel,
 };
 pub use catalog::ScenarioCatalog;
+pub use ftp::{
+    reconcile, BasisSpread, BehaviouralAdjustment, FtpBreakdown, FtpCurve, FtpCurveCatalog,
+    FtpEngine, FtpError, FtpPolicy, FtpPolicyCatalog, FtpReconciliation, FtpRequest, FtpStep,
+    LiquidityPremium, OptionalityCharge,
+};
 pub use scenario::{
     Change, Dimension, Provenance, ResolvedScenario, ResolvedShock, Scenario, ScenarioDiff,
     ScenarioError, ScenarioKind, ScenarioStatus, Shock,

@@ -15,10 +15,16 @@
 //! * `greedy_lp_diff` — loan-by-loan greedy vs LP reconciliation (requires the
 //!   default `crm-lp` feature).
 
+pub mod aml;
 pub mod crm;
 pub mod error;
 pub mod rules;
 
+pub use aml::{
+    cosine_similarity, explain_subgraph, hybrid_score, AlertAggregates, BeneficialOwnership,
+    CaseSnapshot, CaseVerdict, Direction, ExplainedEdge, ExplanationSubgraph, FeedbackEntry,
+    FeedbackLedger, HybridWeights, OwnershipEdge, Transaction,
+};
 pub use crm::{
     AllocationMethod, CollateralPledge, Exposure, GovernedCollateral, GovernedGuarantor,
     GovernedInputs, GovernedResult, GuaranteePledge, GreedyLpDiff, ConcentrationBreach, Exclusion,
