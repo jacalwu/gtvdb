@@ -1,7 +1,7 @@
 # gtvdb 整體測試報告
 
-- **日期**：2026-09-13 HKT
-- **代碼版本**：`677446f`（B3-1 streaming）—— 於 `f376987`（golden 測試修正）之上
+- **日期**：2026-09-14 HKT
+- **代碼版本**：`6f19984`（B3-5/B3-6）＋ 混合負載 SLO 測試
 - **環境**：`rustc 1.96.1 (31fca3adb 2026-06-26)`、`cargo 1.96.1`、`Linux 6.6.87.2-microsoft-standard-WSL2 x86_64`
 - **執行方式**：單機 debug build（`target/debug/gtv`）
 
@@ -11,13 +11,15 @@
 
 | 測試套件 | 範圍 | 結果 |
 |---|---|---|
-| `cargo test --workspace` | 14 個 crate、43 個 test target（含 doc-test） | **332 passed / 0 failed / 0 ignored** ✅ |
+| `cargo test --workspace` | 14 個 crate、43 個 test target（含 doc-test） | **357 passed / 0 failed / 0 ignored** ✅ |
 | REPL golden（`testcase/run_tests.sh`） | TC-01…TC-11、signal | **10 passed / 0 failed / 1 skipped** ✅ |
 | Day-rollover CI（`testcase/test_rollover.sh`） | hot→cold 自動換日 | **PASS**（5/5 checks） ✅ |
-| **合計** | | **342 個斷言測試，0 失敗** |
+| **合計** | | **367 個斷言測試，0 失敗** |
 
-> 對比上一輪（B3-2，307 tests）：新增 `gtv-ingest` **25** 個測試（17 unit + 8 integration）。
-> 早前 golden 套件因 CLI preamble 漂移 + 一個舊 golden 未更新而報 9 FAIL，已於 `f376987` 修正。
+> 對比上一輪（B3-1，332 tests）：**淨增 25 個測試**（332 → 357）——`gtv-catalog`
+> integration +1（`table_stats_track_commits`）、`gtv-engine` lib +14（`cbo` 8 +
+> `workload` 6）、`gtv-engine` integration +10（新增 `cbo_workload.rs`）。早前 golden
+> 套件因 CLI preamble 漂移 + 一個舊 golden 未更新而報 9 FAIL，已於 `f376987` 修正。
 
 ---
 
@@ -26,11 +28,11 @@
 | Crate | lib / bin | integration | 小計 |
 |---|---:|---:|---:|
 | gtv-array | 52 | – | 52 |
-| gtv-catalog | 11 | 18 | 29 |
+| gtv-catalog | 11 | 19 | 30 |
 | gtv-cli | 3 | 1 | 4 |
 | gtv-core | 39 | – | 39 |
 | gtv-delta | 7 | – | 7 |
-| gtv-engine | 63 | 26 | 89 |
+| gtv-engine | 77 | 36 | 113 |
 | gtv-index | 41 | – | 41 |
 | gtv-index-store | 3 | 14 | 17 |
 | **gtv-ingest** | **17** | **8** | **25** |
@@ -39,13 +41,13 @@
 | gtv-server | 0 | 6 | 6 |
 | gtv-storage | 13 | – | 13 |
 | gtv-udf | 4 | – | 4 |
-| **合計** | **242** | **90** | **332** |
+| **合計** | **256** | **101** | **357** |
 
 Integration 分佈：
 
-- `gtv-catalog`：`catalog.rs` 9、`crash.rs` 2、`dq.rs` 1、`embedding.rs` 6
+- `gtv-catalog`：`catalog.rs` 10、`crash.rs` 2、`dq.rs` 1、`embedding.rs` 6
 - `gtv-index-store`：`embedding.rs` 6、`store.rs` 8
-- `gtv-engine`：`ann_filter.rs` 6、`bitemporal.rs` 5、`dq.rs` 5、`embedding.rs` 5、`lineage.rs` 5
+- `gtv-engine`：`ann_filter.rs` 6、`bitemporal.rs` 5、`cbo_workload.rs` 10、`dq.rs` 5、`embedding.rs` 5、`lineage.rs` 5
 - `gtv-ingest`：`streaming.rs` 8
 - `gtv-cli`：`prod_p2_e2e.rs` 1
 - `gtv-server`：`p5_distributed.rs` 2、`smoke.rs` 4
@@ -62,6 +64,11 @@ Integration 分佈：
 | B3-2 Bitemporal | `gtv-core::bitemporal::*`＋`gtv-storage::bitemporal::*`＋`gtv-engine/tests/bitemporal.rs`＋`gtv-catalog` `snapshot_as_of` | 16 |
 | B3-3 Filter-aware ANN + rerank | `gtv-index::ann::tests::*`＋`gtv-engine/tests/ann_filter.rs` | 12 |
 | B3-4 IVF k-means 量化器 | `gtv-index::ivf::tests::*` | 13 |
+| B3-5 多模態 CBO | `gtv-catalog::table_stats_track_commits`＋`gtv-engine::cbo::tests::*`（8）＋`gtv-engine/tests/cbo_workload.rs`（routing / stats / EXPLAIN） | 19\* |
+| B3-6 Workload 隔離 | `gtv-engine::workload::tests::*`（6）＋`cbo_workload.rs`（admission / status / prometheus / mixed-load SLO） | 16\* |
+
+> \* `cbo_workload.rs` 嘅 10 個 integration tests 同時覆蓋 B3-5 同 B3-6 SQL surface，
+> 所以兩行有重疊；實際淨增為 25 個測試（見上節）。
 
 B3-1 驗收對應：
 

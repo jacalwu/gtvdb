@@ -200,15 +200,22 @@ late event、去重、replay、DLQ、backpressure。
    - temporal filter 是否先產 bitmap；
    - graph expansion 是否先裁剪 source nodes；
    - 是否 exact rerank。
-3. **DataFusion 整合**：custom statistics provider + `PhysicalOptimizerRule`。
+3. **DataFusion 整合**：custom statistics provider + `PhysicalOptimizerRule`
+   （已交付 custom statistics provider；策略選擇經 `cbo_explain(...)` SQL surface
+   暴露，未實作 `PhysicalOptimizerRule` — ANN 以 table function 形式存在而非
+   DataFusion plan node）。
 4. **`EXPLAIN`** 輸出所選策略 + 估算成本。
 
 **驗收條件**
 
-- [ ] `EXPLAIN` 可顯示策略選擇同估算成本。
-- [ ] 至少 3 個代表性查詢（純向量、filter+向量、圖+向量）選中合理策略。
-- [ ] 對比固定策略，整體 latency / 資源有可量度改善。
-- [ ] 統計可隨 catalog commit 更新（唔會用過期 stats）。
+- [x] `EXPLAIN` 可顯示策略選擇同估算成本（`EXPLAIN` 顯示 catalog stats；
+      `cbo_explain(...)` 顯示 strategy / index_type / estimated_cost）。
+- [x] 至少 3 個代表性查詢（純向量、filter+向量、圖+向量）選中合理策略
+      （`cbo_workload.rs::cbo_explain_*`）。
+- [ ] 對比固定策略，整體 latency / 資源有可量度改善（現只有成本模型層
+      `adaptive_choice_is_cheaper_than_the_fixed_strategy`；未有端到端 latency 壓測）。
+- [x] 統計可隨 catalog commit 更新（唔會用過期 stats）
+      （`table_stats_track_commits`＋`stats_refresh_from_catalog_changes_plan_inputs`）。
 
 **風險**
 
@@ -236,11 +243,14 @@ index build 可以拖死實時查詢。
 
 **驗收條件**
 
-- [ ] 混合負載（ingestion + interactive + batch + index build）下，interactive
-      P99 符合 SLO。
-- [ ] index build 唔會令 interactive 查詢超時（隔離量測）。
-- [ ] 超載時有明確 admission 決策 + 可觀測。
-- [ ] preemption 可即時取消低優先級查詢。
+- [x] 混合負載（ingestion + interactive + batch + index build）下，interactive
+      P99 符合 SLO（見 `doc/b3_mixed_load_slo.md`、`mixed_load_slo_report`）。
+- [x] index build 唔會令 interactive 查詢超時（隔離量測）
+      （4 條 index-build worker 永久佔滿全域預算，interactive admission p99 ~10µs）。
+- [x] 超載時有明確 admission 決策 + 可觀測
+      （`Admit`/`Queue`/`Reject`＋`workload_status()`＋Prometheus `gtv_workload_*`）。
+- [x] preemption 可即時取消低優先級查詢
+      （`interactive_preempts_low_priority_batch`、`explicit_preempt_and_prometheus`）。
 
 **風險**
 

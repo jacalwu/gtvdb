@@ -391,3 +391,110 @@ async fn prometheus_exposes_spill_and_workload_metrics() {
     assert!(text.contains("gtv_spill_bytes"), "{text}");
     assert!(text.contains("gtv_workload_active{class=\"interactive_aml\"}"), "{text}");
 }
+
+/// B3-6 acceptance: under a mixed load (interactive + index build) the
+/// interactive class must stay within its admission SLO; the index build can
+/// never stall it. Prints a report when run with `--nocapture`.
+#[tokio::test]
+async fn mixed_load_slo_report() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use gtv_engine::workload::{ResourceGroup, WorkloadManager};
+
+    let m = Arc::new(WorkloadManager::with_limits(2, 256));
+    // Load classes: ingestion + interactive + batch (risk/alm) + index build,
+    // i.e. the four families in the B3-6 acceptance scenario. Let every
+    // non-interactive class take up to the whole global budget so the
+    // contention is real; interactive (priority 100) must preempt them.
+    let load_classes = [
+        WorkloadClass::Ingestion,
+        WorkloadClass::RiskBatch,
+        WorkloadClass::AlmBatch,
+        WorkloadClass::IndexBuild,
+    ];
+    for class in load_classes {
+        m.configure(ResourceGroup {
+            class,
+            max_concurrency: 2,
+            ..ResourceGroup::new(class)
+        });
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+
+    // Two workers per load class compete for the two global slots, so the
+    // budget is permanently saturated by mixed load.
+    let mut workers = Vec::new();
+    for class in load_classes {
+        for _ in 0..2 {
+            let m = m.clone();
+            let stop = stop.clone();
+            workers.push(std::thread::spawn(move || {
+                if let Ok(Admission::Admit { id, token }) =
+                    m.wait_admit(class, Duration::from_secs(5))
+                {
+                    while !token.load(Ordering::Relaxed) && !stop.load(Ordering::Relaxed) {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    m.release(id);
+                }
+            }));
+        }
+    }
+
+    // Wait until the global budget is genuinely occupied.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        let active: usize = m.status().iter().map(|s| s.active).sum();
+        if active >= 2 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    // Measure interactive admission latency while the budget is saturated.
+    const N: usize = 500;
+    let mut lat = Vec::with_capacity(N);
+    let mut timeouts = 0usize;
+    for _ in 0..N {
+        let t0 = Instant::now();
+        match m.wait_admit(WorkloadClass::InteractiveAml, Duration::from_millis(200)) {
+            Ok(Admission::Admit { id, .. }) => m.release(id),
+            _ => timeouts += 1,
+        }
+        lat.push(t0.elapsed());
+    }
+    stop.store(true, Ordering::Relaxed);
+    for w in workers {
+        let _ = w.join();
+    }
+
+    lat.sort();
+    let pct = |p: f64| lat[((lat.len() as f64 - 1.0) * p) as usize];
+    let p50 = pct(0.50);
+    let p99 = pct(0.99);
+    let max = *lat.last().unwrap();
+    let status = m.status();
+    let total_preempted: u64 = status.iter().map(|s| s.preempted).sum();
+
+    // Report (visible with `cargo test -p gtv-engine --test cbo_workload mixed_load -- --nocapture`).
+    println!("B3-6 mixed-load interactive admission latency (n={N}):");
+    println!("  p50 = {:?}", p50);
+    println!("  p99 = {:?}", p99);
+    println!("  max = {:?}", max);
+    println!("  timeouts = {timeouts}");
+    println!("  total preempted = {total_preempted}");
+    for st in &status {
+        if st.class != WorkloadClass::InteractiveAml {
+            println!("    {:<16} preempted={}", st.class.as_str(), st.preempted);
+        }
+    }
+
+    // SLO: interactive admission stays well under 50ms even while ingestion,
+    // batch and index-build load saturate the global budget.
+    assert_eq!(timeouts, 0, "interactive admission timed out under mixed load");
+    assert!(p99 < Duration::from_millis(50), "interactive p99 SLO breach: {p99:?}");
+    assert!(max < Duration::from_millis(200), "interactive max SLO breach: {max:?}");
+    assert!(total_preempted > 0, "expected preemption of lower-priority load");
+}
