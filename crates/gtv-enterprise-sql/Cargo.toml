@@ -18,6 +18,7 @@ datafusion.workspace = true
 thiserror.workspace = true
 gtv-scenario = { path = "../gtv-scenario" }
 gtv-refdata = { path = "../gtv-refdata" }
+gtv-governance = { path = "../gtv-governance" }
 
 [dev-dependencies]
 tokio.workspace = true

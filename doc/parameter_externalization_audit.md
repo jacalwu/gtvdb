@@ -18,8 +18,8 @@
 |---|---|---|
 | ALM 現金流（`alm.rs`） | 🟡 | 壓力 / decay 內建 default、day-count 寫死、無 table loader |
 | IRRBB（`irrbb.rs`） | ✅ | `IrrbbConfig` + `ShockTable::from_params` + `load_irrbb_*` |
-| FTP（`ftp.rs`） | ✅ 資料層好，❌ 缺 loader | curve / policy 全部 data，但只能 Rust API 建 |
-| CRM 治理（`gtv-governance`） | ✅ 資料層好，❌ 缺 loader | `RuleSet` / `GovernedInputs` data，但只能 Rust API 建 |
+| FTP（`ftp.rs`） | ✅ | curve / policy data + `load_ftp_curves` / `load_ftp_policies` |
+| CRM 治理（`gtv-governance`） | ✅ | `RuleSet` data + `load_crm_rulesets` |
 | CRM kernel（`gtv-array` + `gtv-engine/crm.rs`） | ✅ | `CrmRatingMaps` + `load_rating_maps` + `crm_rating_map()` |
 | AML case（`gtv-governance/aml.rs`） | 🟡 | `HybridWeights::default` 寫死 |
 | CLI / SQL surface | ❌ | 冇 `alm` / `ftp` / `irrbb` 命令；`crm_alloc` 用寫死對照表 |
@@ -173,8 +173,17 @@ crm_inputs_*(...)                              # exposures / collateral / guaran
   `load_irrbb_scalars` / `load_irrbb_nmd_caps` / `load_irrbb_scenario_multipliers` /
   `load_irrbb_time_bands` / `load_shock_table`（`gtv-enterprise-sql::load`）。
 
-**仍未做**：P1（FTP / CRM 治理規則 loader）、P2（ALM 參數表 + day-count）、
-P3（CLI / SQL surface，例如 `irrbb_eve` / `ftp_price`）。
+**P1 已完成**：
+- **FTP loader**（`gtv-enterprise-sql::load`）：`load_ftp_curves`
+  （`curve_id, version, currency, effective_from, effective_to, tenor_days, zero_rate`）、
+  `load_ftp_policies`（header + liquidity / basis / optionality / behavioural 四張表；
+  unknown-policy 詳細行會報錯）。
+- **CRM 治理規則 loader**：`load_crm_rulesets`（header + collateral / guarantees /
+  wrong-way / concentration 五張表；`eligible` 接受 true/1/yes；`currencies` /
+  `jurisdictions` 逗號分隔），寫入 `gtv_governance::RuleRegistry`（版本 + effective dating）。
+
+**仍未做**：P2（ALM 參數表 + day-count）、P3（CLI / SQL surface，例如 `irrbb_eve`
+/ `ftp_price` / `crm_alloc_v2`）。
 
 ---
 

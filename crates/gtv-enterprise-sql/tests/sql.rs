@@ -367,3 +367,216 @@ fn irrbb_config_loaders_override_defaults() {
     assert_eq!(table.params("HKD").parallel_bps, 225.0);
     assert_eq!(table.params("MOP").short_bps, 375.0);
 }
+
+fn i64s(values: Vec<i64>) -> Arc<dyn Array> {
+    Arc::new(Int64Array::from(values))
+}
+
+#[test]
+fn ftp_loaders_build_catalog_and_price() {
+    use gtv_refdata::Hierarchy;
+    use gtv_scenario::{FtpCurveCatalog, FtpEngine, FtpPolicyCatalog, FtpRequest};
+
+    let curve_rows = batch(
+        Schema::new(vec![
+            Field::new("curve_id", DataType::Utf8, false),
+            Field::new("version", DataType::Int64, false),
+            Field::new("currency", DataType::Utf8, false),
+            Field::new("effective_from", DataType::Int64, false),
+            Field::new("effective_to", DataType::Int64, false),
+            Field::new("tenor_days", DataType::Int64, false),
+            Field::new("zero_rate", DataType::Float64, false),
+        ]),
+        vec![
+            utf8(vec!["USD-OIS", "USD-OIS"]),
+            i64s(vec![1, 1]),
+            utf8(vec!["USD", "USD"]),
+            i64s(vec![0, 0]),
+            i64s(vec![i64::MAX, i64::MAX]),
+            i64s(vec![0, 365]),
+            f64s(vec![0.01, 0.03]),
+        ],
+    );
+    let mut curves = FtpCurveCatalog::new();
+    assert_eq!(
+        gtv_enterprise_sql::load::load_ftp_curves(&mut curves, &[curve_rows]).unwrap(),
+        1
+    );
+    assert_eq!(curves.get("USD-OIS", 1).unwrap().zero_rate(365), 0.03);
+
+    let headers = batch(
+        Schema::new(vec![
+            Field::new("policy_id", DataType::Utf8, false),
+            Field::new("version", DataType::Int64, false),
+            Field::new("effective_from", DataType::Int64, false),
+            Field::new("effective_to", DataType::Int64, false),
+        ]),
+        vec![utf8(vec!["P1"]), i64s(vec![1]), i64s(vec![0]), i64s(vec![i64::MAX])],
+    );
+    let liquidity = batch(
+        Schema::new(vec![
+            Field::new("policy_id", DataType::Utf8, false),
+            Field::new("version", DataType::Int64, false),
+            Field::new("product", DataType::Utf8, false),
+            Field::new("tenor_days", DataType::Int64, false),
+            Field::new("spread", DataType::Float64, false),
+        ]),
+        vec![
+            utf8(vec!["P1"]),
+            i64s(vec![1]),
+            utf8(vec!["Loan"]),
+            i64s(vec![365]),
+            f64s(vec![0.015]),
+        ],
+    );
+    let basis = batch(
+        Schema::new(vec![
+            Field::new("policy_id", DataType::Utf8, false),
+            Field::new("version", DataType::Int64, false),
+            Field::new("currency", DataType::Utf8, false),
+            Field::new("tenor_days", DataType::Int64, false),
+            Field::new("spread", DataType::Float64, false),
+        ]),
+        vec![
+            utf8(vec!["P1"]),
+            i64s(vec![1]),
+            utf8(vec!["USD"]),
+            i64s(vec![365]),
+            f64s(vec![0.002]),
+        ],
+    );
+    let optionality = batch(
+        Schema::new(vec![
+            Field::new("policy_id", DataType::Utf8, false),
+            Field::new("version", DataType::Int64, false),
+            Field::new("product", DataType::Utf8, false),
+            Field::new("charge", DataType::Float64, false),
+        ]),
+        vec![utf8(vec!["P1"]), i64s(vec![1]), utf8(vec!["Loan"]), f64s(vec![0.004])],
+    );
+    let behavioural = batch(
+        Schema::new(vec![
+            Field::new("policy_id", DataType::Utf8, false),
+            Field::new("version", DataType::Int64, false),
+            Field::new("product", DataType::Utf8, false),
+            Field::new("adjustment", DataType::Float64, false),
+        ]),
+        vec![
+            utf8(vec!["P1"]),
+            i64s(vec![1]),
+            utf8(vec!["Loan"]),
+            f64s(vec![-0.001]),
+        ],
+    );
+    let mut policies = FtpPolicyCatalog::new();
+    gtv_enterprise_sql::load::load_ftp_policies(
+        &mut policies,
+        &[headers],
+        &[liquidity],
+        &[basis],
+        &[optionality],
+        &[behavioural],
+    )
+    .unwrap();
+
+    let hierarchy = Hierarchy::new();
+    let engine = FtpEngine::new(&curves, &policies, &hierarchy);
+    let b = engine
+        .price(&FtpRequest::new("USD-OIS", 1, "P1", 1, "Loan", "USD", 0, 0, 365))
+        .unwrap();
+    assert!((b.liquidity_premium - 0.015).abs() < 1e-12);
+    assert!((b.basis_spread - 0.002).abs() < 1e-12);
+    assert!((b.total_rate - 0.05).abs() < 1e-9);
+}
+
+#[test]
+fn crm_ruleset_loader_builds_registry() {
+    use gtv_governance::RuleRegistry;
+
+    let header = batch(
+        Schema::new(vec![
+            Field::new("ruleset_id", DataType::Utf8, false),
+            Field::new("version", DataType::Int64, false),
+            Field::new("effective_from", DataType::Int64, false),
+            Field::new("effective_to", DataType::Int64, false),
+        ]),
+        vec![utf8(vec!["crm"]), i64s(vec![1]), i64s(vec![0]), i64s(vec![i64::MAX])],
+    );
+    let collateral = batch(
+        Schema::new(vec![
+            Field::new("ruleset_id", DataType::Utf8, false),
+            Field::new("version", DataType::Int64, false),
+            Field::new("collateral_type", DataType::Utf8, false),
+            Field::new("priority", DataType::Float64, false),
+            Field::new("eligible", DataType::Utf8, true),
+            Field::new("haircut", DataType::Float64, true),
+            Field::new("currencies", DataType::Utf8, true),
+        ]),
+        vec![
+            utf8(vec!["crm", "crm"]),
+            i64s(vec![1, 1]),
+            utf8(vec!["cash", "equity"]),
+            f64s(vec![10.0, 5.0]),
+            Arc::new(StringArray::from(vec![Some("true"), Some("false")])) as Arc<dyn Array>,
+            Arc::new(Float64Array::from(vec![Some(0.05), Some(0.2)])) as Arc<dyn Array>,
+            Arc::new(StringArray::from(vec![Some("USD,HKD"), None])) as Arc<dyn Array>,
+        ],
+    );
+    let guarantees = batch(
+        Schema::new(vec![
+            Field::new("ruleset_id", DataType::Utf8, false),
+            Field::new("version", DataType::Int64, false),
+            Field::new("guarantor_type", DataType::Utf8, false),
+            Field::new("priority", DataType::Float64, false),
+            Field::new("jurisdictions", DataType::Utf8, true),
+        ]),
+        vec![
+            utf8(vec!["crm"]),
+            i64s(vec![1]),
+            utf8(vec!["bank"]),
+            f64s(vec![7.0]),
+            Arc::new(StringArray::from(vec![Some("HK")])) as Arc<dyn Array>,
+        ],
+    );
+    let wrong_way = batch(
+        Schema::new(vec![
+            Field::new("ruleset_id", DataType::Utf8, false),
+            Field::new("version", DataType::Int64, false),
+            Field::new("counterparty", DataType::Utf8, false),
+            Field::new("collateral_type", DataType::Utf8, false),
+        ]),
+        vec![utf8(vec!["crm"]), i64s(vec![1]), utf8(vec!["CP1"]), utf8(vec!["equity"])],
+    );
+    let concentration = batch(
+        Schema::new(vec![
+            Field::new("ruleset_id", DataType::Utf8, false),
+            Field::new("version", DataType::Int64, false),
+            Field::new("collateral_type", DataType::Utf8, false),
+            Field::new("limit", DataType::Float64, false),
+        ]),
+        vec![utf8(vec!["crm"]), i64s(vec![1]), utf8(vec!["cash"]), f64s(vec![500.0])],
+    );
+
+    let mut registry = RuleRegistry::new();
+    let n = gtv_enterprise_sql::load::load_crm_rulesets(
+        &mut registry,
+        &[header],
+        &[collateral],
+        &[guarantees],
+        &[wrong_way],
+        &[concentration],
+        0,
+    )
+    .unwrap();
+    assert_eq!(n, 1);
+    let rs = registry.resolve_as_of("crm", 0).unwrap();
+    assert_eq!(rs.collateral_rule("cash").unwrap().haircut, 0.05);
+    assert_eq!(
+        rs.collateral_rule("cash").unwrap().eligible_currencies,
+        vec!["USD".to_string(), "HKD".to_string()]
+    );
+    assert!(!rs.collateral_rule("equity").unwrap().eligible);
+    assert_eq!(rs.guarantee_rule("bank").unwrap().priority, 7.0);
+    assert!(rs.is_wrong_way("CP1", "equity"));
+    assert_eq!(rs.concentration_limit("cash"), Some(500.0));
+}

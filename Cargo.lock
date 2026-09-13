@@ -2038,6 +2038,7 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "datafusion",
+ "gtv-governance",
  "gtv-refdata",
  "gtv-scenario",
  "thiserror 2.0.20",

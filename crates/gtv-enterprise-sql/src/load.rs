@@ -13,8 +13,10 @@ use arrow::record_batch::RecordBatch;
 use datafusion::error::{DataFusionError, Result};
 use gtv_refdata::{EffectiveRange, HierarchyEdge, HierarchyKind, MasterKind, MasterRecord};
 use gtv_scenario::{
-    Dimension, IrrbbConfig, NmdCaps, NmdCategory, Scenario, ScenarioKind, ScenarioStatus, Shock,
-    ShockParams, ShockScenario, ShockTable, ShockTableVersion, TimeBand,
+    BasisSpread, BehaviouralAdjustment, Dimension, FtpCurve, FtpCurveCatalog, FtpPolicy,
+    FtpPolicyCatalog, IrrbbConfig, LiquidityPremium, NmdCaps, NmdCategory, OptionalityCharge,
+    Scenario, ScenarioKind, ScenarioStatus, Shock, ShockParams, ShockScenario, ShockTable,
+    ShockTableVersion, TimeBand,
 };
 
 use crate::registry::Registry;
@@ -245,6 +247,333 @@ pub fn load_shock_table(
         }
     }
     Ok(ShockTable::from_params(version, params))
+}
+
+// ---------------------------------------------------------------------------
+// FTP loaders
+// ---------------------------------------------------------------------------
+
+/// `ftp_curve_points(curve_id, version, currency, effective_from,
+/// effective_to, tenor_days, zero_rate)`.
+///
+/// Rows sharing `(curve_id, version, currency, effective_from, effective_to)`
+/// form one curve.
+pub fn load_ftp_curves(
+    catalog: &mut FtpCurveCatalog,
+    batches: &[RecordBatch],
+) -> Result<usize> {
+    type Key = (String, u32, String, i64, i64);
+    let mut groups: BTreeMap<Key, Vec<(i64, f64)>> = BTreeMap::new();
+    for batch in batches {
+        let ids = required_strings(batch, "curve_id")?;
+        let versions = required_i64(batch, "version")?;
+        let currencies = required_strings(batch, "currency")?;
+        let froms = required_i64(batch, "effective_from")?;
+        let tos = required_i64(batch, "effective_to")?;
+        let tenors = required_i64(batch, "tenor_days")?;
+        let rates = f64_from(column(batch, "zero_rate")?)?;
+        for i in 0..ids.len() {
+            groups
+                .entry((
+                    ids[i].clone(),
+                    versions[i] as u32,
+                    currencies[i].clone(),
+                    froms[i],
+                    tos[i],
+                ))
+                .or_default()
+                .push((tenors[i], rates[i]));
+        }
+    }
+    let n = groups.len();
+    for ((id, version, currency, from, to), tenors) in groups {
+        let curve = FtpCurve::new(id, version, currency, from, to, tenors).map_err(err)?;
+        catalog.register(curve).map_err(err)?;
+    }
+    Ok(n)
+}
+
+/// Load FTP policies from a header table plus the four component tables.
+///
+/// * headers: `policy_id, version, effective_from, effective_to`
+/// * liquidity: `policy_id, version, product, tenor_days, spread`
+/// * basis: `policy_id, version, currency, tenor_days, spread`
+/// * optionality: `policy_id, version, product, charge`
+/// * behavioural: `policy_id, version, product, adjustment`
+#[allow(clippy::too_many_arguments)]
+pub fn load_ftp_policies(
+    catalog: &mut FtpPolicyCatalog,
+    headers: &[RecordBatch],
+    liquidity: &[RecordBatch],
+    basis: &[RecordBatch],
+    optionality: &[RecordBatch],
+    behavioural: &[RecordBatch],
+) -> Result<usize> {
+    type Key = (String, u32);
+    let mut heads: BTreeMap<Key, (i64, i64)> = BTreeMap::new();
+    for batch in headers {
+        let ids = required_strings(batch, "policy_id")?;
+        let versions = required_i64(batch, "version")?;
+        let froms = required_i64(batch, "effective_from")?;
+        let tos = required_i64(batch, "effective_to")?;
+        for i in 0..ids.len() {
+            heads.insert((ids[i].clone(), versions[i] as u32), (froms[i], tos[i]));
+        }
+    }
+
+    let mut liq: BTreeMap<Key, Vec<LiquidityPremium>> = BTreeMap::new();
+    for batch in liquidity {
+        let ids = required_strings(batch, "policy_id")?;
+        let versions = required_i64(batch, "version")?;
+        let products = required_strings(batch, "product")?;
+        let tenors = required_i64(batch, "tenor_days")?;
+        let spreads = f64_from(column(batch, "spread")?)?;
+        for i in 0..ids.len() {
+            liq.entry((ids[i].clone(), versions[i] as u32))
+                .or_default()
+                .push(LiquidityPremium {
+                    product: products[i].clone(),
+                    tenor_days: tenors[i],
+                    spread: spreads[i],
+                });
+        }
+    }
+
+    let mut bas: BTreeMap<Key, Vec<BasisSpread>> = BTreeMap::new();
+    for batch in basis {
+        let ids = required_strings(batch, "policy_id")?;
+        let versions = required_i64(batch, "version")?;
+        let currencies = required_strings(batch, "currency")?;
+        let tenors = required_i64(batch, "tenor_days")?;
+        let spreads = f64_from(column(batch, "spread")?)?;
+        for i in 0..ids.len() {
+            bas.entry((ids[i].clone(), versions[i] as u32))
+                .or_default()
+                .push(BasisSpread {
+                    currency: currencies[i].clone(),
+                    tenor_days: tenors[i],
+                    spread: spreads[i],
+                });
+        }
+    }
+
+    let mut opt: BTreeMap<Key, Vec<OptionalityCharge>> = BTreeMap::new();
+    for batch in optionality {
+        let ids = required_strings(batch, "policy_id")?;
+        let versions = required_i64(batch, "version")?;
+        let products = required_strings(batch, "product")?;
+        let charges = f64_from(column(batch, "charge")?)?;
+        for i in 0..ids.len() {
+            opt.entry((ids[i].clone(), versions[i] as u32))
+                .or_default()
+                .push(OptionalityCharge {
+                    product: products[i].clone(),
+                    charge: charges[i],
+                });
+        }
+    }
+
+    let mut beh: BTreeMap<Key, Vec<BehaviouralAdjustment>> = BTreeMap::new();
+    for batch in behavioural {
+        let ids = required_strings(batch, "policy_id")?;
+        let versions = required_i64(batch, "version")?;
+        let products = required_strings(batch, "product")?;
+        let adjustments = f64_from(column(batch, "adjustment")?)?;
+        for i in 0..ids.len() {
+            beh.entry((ids[i].clone(), versions[i] as u32))
+                .or_default()
+                .push(BehaviouralAdjustment {
+                    product: products[i].clone(),
+                    adjustment: adjustments[i],
+                });
+        }
+    }
+
+    let n = heads.len();
+    for ((id, version), (from, to)) in heads {
+        let key = (id.clone(), version);
+        let mut policy = FtpPolicy::new(id, version, from, to);
+        policy.liquidity = liq.remove(&key).unwrap_or_default();
+        policy.basis = bas.remove(&key).unwrap_or_default();
+        policy.optionality = opt.remove(&key).unwrap_or_default();
+        policy.behavioural = beh.remove(&key).unwrap_or_default();
+        catalog.register(policy).map_err(err)?;
+    }
+    for name in ["liquidity", "basis", "optionality", "behavioural"] {
+        let leftover = match name {
+            "liquidity" => liq.len(),
+            "basis" => bas.len(),
+            "optionality" => opt.len(),
+            _ => beh.len(),
+        };
+        if leftover > 0 {
+            return Err(err(format!(
+                "load_ftp_policies: {name} rows reference an unknown policy header"
+            )));
+        }
+    }
+    Ok(n)
+}
+
+// ---------------------------------------------------------------------------
+// CRM governance (RuleSet) loaders
+// ---------------------------------------------------------------------------
+
+fn split_list(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Load versioned CRM rule sets from five tables:
+///
+/// * headers: `ruleset_id, version, effective_from, effective_to`
+/// * collateral: `ruleset_id, version, collateral_type, priority` +
+///   optional `eligible, haircut, fx_haircut, maturity_haircut, currencies`
+/// * guarantees: `ruleset_id, version, guarantor_type, priority` +
+///   optional `eligible, jurisdictions`
+/// * wrong-way: `ruleset_id, version, counterparty, collateral_type`
+/// * concentration: `ruleset_id, version, collateral_type, limit`
+#[allow(clippy::too_many_arguments)]
+pub fn load_crm_rulesets(
+    registry: &mut gtv_governance::RuleRegistry,
+    headers: &[RecordBatch],
+    collateral: &[RecordBatch],
+    guarantees: &[RecordBatch],
+    wrong_way: &[RecordBatch],
+    concentration: &[RecordBatch],
+    as_of: i64,
+) -> Result<usize> {
+    use gtv_governance::{CollateralRule, ConcentrationLimit, GuaranteeRule, RuleSet, WrongWayRisk};
+    type Key = (String, u32);
+    let mut heads: BTreeMap<Key, (i64, i64)> = BTreeMap::new();
+    for batch in headers {
+        let ids = required_strings(batch, "ruleset_id")?;
+        let versions = required_i64(batch, "version")?;
+        let froms = required_i64(batch, "effective_from")?;
+        let tos = required_i64(batch, "effective_to")?;
+        for i in 0..ids.len() {
+            heads.insert((ids[i].clone(), versions[i] as u32), (froms[i], tos[i]));
+        }
+    }
+
+    let eligible_of = |v: &[Option<String>], i: usize| -> bool {
+        match &v[i] {
+            None => true,
+            Some(s) => matches!(
+                s.trim().to_ascii_lowercase().as_str(),
+                "true" | "1" | "yes" | "y"
+            ),
+        }
+    };
+
+    let mut coll: BTreeMap<Key, Vec<CollateralRule>> = BTreeMap::new();
+    for batch in collateral {
+        let ids = required_strings(batch, "ruleset_id")?;
+        let versions = required_i64(batch, "version")?;
+        let types = required_strings(batch, "collateral_type")?;
+        let priorities = f64_from(column(batch, "priority")?)?;
+        let eligible = optional_strings(batch, "eligible")?;
+        let haircut = optional_f64(batch, "haircut")?;
+        let fx = optional_f64(batch, "fx_haircut")?;
+        let maturity = optional_f64(batch, "maturity_haircut")?;
+        let currencies = optional_strings(batch, "currencies")?;
+        for i in 0..ids.len() {
+            coll.entry((ids[i].clone(), versions[i] as u32))
+                .or_default()
+                .push(CollateralRule {
+                    collateral_type: types[i].clone(),
+                    eligible: eligible_of(&eligible, i),
+                    priority: priorities[i],
+                    haircut: haircut[i],
+                    fx_haircut: fx[i],
+                    maturity_haircut: maturity[i],
+                    eligible_currencies: currencies[i]
+                        .as_deref()
+                        .map(split_list)
+                        .unwrap_or_default(),
+                });
+        }
+    }
+
+    let mut guar: BTreeMap<Key, Vec<GuaranteeRule>> = BTreeMap::new();
+    for batch in guarantees {
+        let ids = required_strings(batch, "ruleset_id")?;
+        let versions = required_i64(batch, "version")?;
+        let types = required_strings(batch, "guarantor_type")?;
+        let priorities = f64_from(column(batch, "priority")?)?;
+        let eligible = optional_strings(batch, "eligible")?;
+        let jurisdictions = optional_strings(batch, "jurisdictions")?;
+        for i in 0..ids.len() {
+            guar.entry((ids[i].clone(), versions[i] as u32))
+                .or_default()
+                .push(GuaranteeRule {
+                    guarantor_type: types[i].clone(),
+                    eligible: eligible_of(&eligible, i),
+                    priority: priorities[i],
+                    eligible_jurisdictions: jurisdictions[i]
+                        .as_deref()
+                        .map(split_list)
+                        .unwrap_or_default(),
+                });
+        }
+    }
+
+    let mut ww: BTreeMap<Key, Vec<WrongWayRisk>> = BTreeMap::new();
+    for batch in wrong_way {
+        let ids = required_strings(batch, "ruleset_id")?;
+        let versions = required_i64(batch, "version")?;
+        let counterparties = required_strings(batch, "counterparty")?;
+        let types = required_strings(batch, "collateral_type")?;
+        for i in 0..ids.len() {
+            ww.entry((ids[i].clone(), versions[i] as u32))
+                .or_default()
+                .push(WrongWayRisk {
+                    counterparty: counterparties[i].clone(),
+                    collateral_type: types[i].clone(),
+                });
+        }
+    }
+
+    let mut conc: BTreeMap<Key, Vec<ConcentrationLimit>> = BTreeMap::new();
+    for batch in concentration {
+        let ids = required_strings(batch, "ruleset_id")?;
+        let versions = required_i64(batch, "version")?;
+        let types = required_strings(batch, "collateral_type")?;
+        let limits = f64_from(column(batch, "limit")?)?;
+        for i in 0..ids.len() {
+            conc.entry((ids[i].clone(), versions[i] as u32))
+                .or_default()
+                .push(ConcentrationLimit {
+                    collateral_type: types[i].clone(),
+                    limit: limits[i],
+                });
+        }
+    }
+
+    let n = heads.len();
+    for ((id, version), (from, to)) in heads {
+        let key = (id.clone(), version);
+        let mut rule =
+            RuleSet::new(id, version, EffectiveRange::new(from, to).map_err(err)?);
+        rule.collateral = coll.remove(&key).unwrap_or_default();
+        rule.guarantees = guar.remove(&key).unwrap_or_default();
+        rule.wrong_way = ww.remove(&key).unwrap_or_default();
+        rule.concentration = conc.remove(&key).unwrap_or_default();
+        registry.register(rule, as_of).map_err(err)?;
+    }
+    Ok(n)
+}
+
+/// Optional `Float64` column as `Vec<f64>` defaulting to `0.0`.
+fn optional_f64(batch: &RecordBatch, name: &str) -> Result<Vec<f64>> {
+    if has_column(batch, name) {
+        f64_from(column(batch, name)?)
+    } else {
+        Ok(vec![0.0; batch.num_rows()])
+    }
 }
 
 /// Load scenario versions from a flat table.
