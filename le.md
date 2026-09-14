@@ -485,16 +485,19 @@ le_exposure_scn(group_id, as_of, scenario_id)
 **建議次序**：LE-0 → LE-1 → LE-2 → LE-3 → LE-4 → LE-5。
 
 > **進度**：LE-0（設計定稿）、LE-1（core）、LE-2（增量索引 + 基準）、LE-3
-> （MA(BS)28 Parts I–V 報表投影）、**LE-5（IRRBB × LE 情景重估）** 已完成，實作喺
-> `crates/gtv-largeexposure`。
+> （MA(BS)28 Parts I–V 報表投影）、**LE-5（IRRBB × LE 情景重估）**、
+> **LE-6（SA-CCR 簡化版）** 已完成，實作喺 `crates/gtv-largeexposure`。
+> 餘 LE-4（config loaders + SQL/CLI surface）。
 
 ---
 
 ## 10. 待決策 / 開放問題（已全部定案）
 
-1. **Derivative 曝險** → **第一版接受 caller 提供 `default_risk`**；加 pluggable
-   `DerivativeMeasure` strategy（`le_config.derivative_measure = provided | sa_ccr`），
-   **SA-CCR 列 LE-6**（資本引擎通常已計，唔阻進度）。
+1. **Derivative 曝險** → **v1 接受 caller 提供 `default_risk`**；加 pluggable
+   `DerivativeMeasure` strategy（`le_config.derivative_measure = provided | sa_ccr`）。
+   **LE-6 已實作簡化 SA-CCR**（`gtv-largeexposure::sa_ccr`：RC + multiplier×AddOn、
+   調整名義金額 / supervisory duration / 到期因子 / hedging-set 淨額；完整 CRE52
+   maturity-bucket/correlation 聚合待補）。
 2. ~~報表基礎：combined + consolidated 一齊做，定先做一種？~~ → **兩者一齊**，以
    `le_entity.consolidation_scope` 範圍過濾；所有聚合／報表 API 收 `basis` 參數。
 3. ~~G-SIB 15% overlay：而家 encode 定留 config？~~ → **可配置**

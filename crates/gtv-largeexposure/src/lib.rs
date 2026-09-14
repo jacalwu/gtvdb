@@ -21,6 +21,7 @@ pub mod limit;
 pub mod ma_bs28;
 pub mod ranking;
 pub mod relationship;
+pub mod sa_ccr;
 pub mod scenario;
 pub mod temporal;
 
@@ -33,6 +34,10 @@ pub use limit::{LimitMetric, LimitOutcome, LimitRule, LimitSet, LimitStatus};
 pub use ma_bs28::{ma_bs28_report, MaBs28Part, MaBs28Row};
 pub use ranking::{rank_top_n, Ranked};
 pub use relationship::{GroupMap, Relationship, RelationshipKind};
+pub use sa_ccr::{
+    sa_ccr, to_exposure_event, AssetClass, DerivativeInstrument, NettingSet, SaCcrConfig,
+    SaCcrResult,
+};
 pub use scenario::{
     stress_concentration, stress_group, stress_scan, stressed_book_total, RatePosition,
     ScenarioSpec, StressResult,
