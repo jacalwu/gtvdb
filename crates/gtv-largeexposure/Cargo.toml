@@ -12,4 +12,5 @@ license.workspace = true
 
 [dependencies]
 gtv-refdata = { path = "../gtv-refdata" }
+gtv-scenario = { path = "../gtv-scenario" }
 thiserror.workspace = true

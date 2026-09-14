@@ -2101,6 +2101,7 @@ name = "gtv-largeexposure"
 version = "0.1.0"
 dependencies = [
  "gtv-refdata",
+ "gtv-scenario",
  "thiserror 2.0.20",
 ]
 

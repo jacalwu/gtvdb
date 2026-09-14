@@ -21,6 +21,7 @@ pub mod limit;
 pub mod ma_bs28;
 pub mod ranking;
 pub mod relationship;
+pub mod scenario;
 pub mod temporal;
 
 pub use concentration::{concentration, ConcentrationDimension, ConcentrationRecord};
@@ -32,4 +33,8 @@ pub use limit::{LimitMetric, LimitOutcome, LimitRule, LimitSet, LimitStatus};
 pub use ma_bs28::{ma_bs28_report, MaBs28Part, MaBs28Row};
 pub use ranking::{rank_top_n, Ranked};
 pub use relationship::{GroupMap, Relationship, RelationshipKind};
+pub use scenario::{
+    stress_concentration, stress_group, stress_scan, stressed_book_total, RatePosition,
+    ScenarioSpec, StressResult,
+};
 pub use temporal::{Fenwick, SegTree, TimeAxis};
