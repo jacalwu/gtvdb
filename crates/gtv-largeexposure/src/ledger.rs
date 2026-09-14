@@ -14,7 +14,7 @@ use thiserror::Error;
 use crate::config::LeConfig;
 use crate::entity::Entity;
 use crate::exposure::{ExposureEvent, Measure};
-use crate::relationship::{connected_party_closure, GroupMap, Relationship};
+use crate::relationship::{connected_party_closure, GroupMap, Relationship, RelationshipKind};
 use crate::temporal::{Fenwick, SegTree, TimeAxis};
 
 /// Aggregate key kind.
@@ -23,6 +23,7 @@ pub enum AggregateKind {
     Entity,
     LcGroup,
     ConnectedParty,
+    GroupAffiliate,
     Sector,
     Country,
     Rating,
@@ -34,6 +35,7 @@ impl AggregateKind {
             AggregateKind::Entity => "entity",
             AggregateKind::LcGroup => "lc_group",
             AggregateKind::ConnectedParty => "connected_party",
+            AggregateKind::GroupAffiliate => "group_affiliate",
             AggregateKind::Sector => "sector",
             AggregateKind::Country => "country",
             AggregateKind::Rating => "rating",
@@ -147,6 +149,24 @@ impl KeyIndex {
         self.seg.range_max(ia, ib)
     }
 
+    /// Maximum over `[a, b)` and the date (leftmost boundary) achieving it.
+    fn period_argmax(&mut self, a: i64, b: i64) -> Option<(f64, i64)> {
+        if self.boundaries.is_empty() {
+            return None;
+        }
+        let ia = self.boundaries.partition_point(|&x| x <= a).saturating_sub(1);
+        let ib = self.boundaries.partition_point(|&x| x < b);
+        if ib <= ia {
+            return None;
+        }
+        let (v, idx) = self.seg.range_argmax(ia, ib);
+        if idx == usize::MAX {
+            None
+        } else {
+            Some((v, self.boundaries[idx]))
+        }
+    }
+
     /// Insert/replace a contribution; rebuild only when a boundary is new.
     fn upsert(&mut self, event_id: &str, from: i64, to: i64, value: f64) {
         let new_boundary = self.boundaries.binary_search(&from).is_err()
@@ -176,6 +196,7 @@ pub struct Ledger {
     entities: BTreeMap<String, Entity>,
     groups: GroupMap,
     connected: BTreeSet<String>,
+    affiliates: BTreeSet<String>,
     events: BTreeMap<String, ExposureEvent>,
     structures: BTreeMap<AggKey, KeyIndex>,
 }
@@ -188,6 +209,7 @@ impl Ledger {
             entities: BTreeMap::new(),
             groups: GroupMap::default(),
             connected: BTreeSet::new(),
+            affiliates: BTreeSet::new(),
             events: BTreeMap::new(),
             structures: BTreeMap::new(),
         }
@@ -209,6 +231,10 @@ impl Ledger {
         &self.connected
     }
 
+    pub fn affiliates(&self) -> &BTreeSet<String> {
+        &self.affiliates
+    }
+
     pub fn events(&self) -> &BTreeMap<String, ExposureEvent> {
         &self.events
     }
@@ -222,11 +248,20 @@ impl Ledger {
             .into_iter()
             .map(|e| (e.entity_id.clone(), e))
             .collect();
+        // identity grouping + connected flags until relationships are supplied
+        self.groups = GroupMap::build(&self.entities, &[], 0, &self.cfg);
+        self.connected = connected_party_closure(&self.entities, &[], 0);
+        self.affiliates.clear();
     }
 
     pub fn set_relationships(&mut self, rels: &[Relationship], as_of: i64) {
         self.groups = GroupMap::build(&self.entities, rels, as_of, &self.cfg);
         self.connected = connected_party_closure(&self.entities, rels, as_of);
+        self.affiliates = rels
+            .iter()
+            .filter(|r| r.kind == RelationshipKind::GroupAffiliate && r.active_at(as_of))
+            .map(|r| r.child_id.clone())
+            .collect();
     }
 
     pub fn groups(&self) -> &GroupMap {
@@ -239,6 +274,9 @@ impl Ledger {
         base.push((AggregateKind::LcGroup, self.groups.group_of(&event.entity_id)));
         if self.connected.contains(&event.entity_id) {
             base.push((AggregateKind::ConnectedParty, event.entity_id.clone()));
+        }
+        if self.affiliates.contains(&event.entity_id) {
+            base.push((AggregateKind::GroupAffiliate, event.entity_id.clone()));
         }
         if let Some(e) = self.entities.get(&event.entity_id) {
             base.push((AggregateKind::Sector, e.sector().as_str().to_string()));
@@ -376,6 +414,24 @@ impl Ledger {
             })
             .map(|ki| ki.period_max(a, b))
             .unwrap_or(0.0)
+    }
+
+    /// Period maximum and the date achieving it.
+    pub fn period_argmax(
+        &mut self,
+        kind: AggregateKind,
+        id: &str,
+        measure: Measure,
+        a: i64,
+        b: i64,
+    ) -> Option<(f64, i64)> {
+        self.structures
+            .get_mut(&AggKey {
+                kind,
+                id: id.to_string(),
+                measure,
+            })
+            .and_then(|ki| ki.period_argmax(a, b))
     }
 
     /// Total book exposure (sum over all entity keys) at `date`.

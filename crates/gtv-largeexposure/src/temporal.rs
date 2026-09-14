@@ -178,6 +178,60 @@ impl SegTree {
             m
         }
     }
+
+    /// Descend to the leftmost leaf achieving this node's max.
+    fn argmax_in_node(&mut self, node: usize, nl: usize, nr: usize) -> (f64, usize) {
+        if nr - nl == 1 {
+            return (self.max[node], nl);
+        }
+        self.push(node);
+        let mid = (nl + nr) / 2;
+        if self.max[node * 2] >= self.max[node * 2 + 1] {
+            self.argmax_in_node(node * 2, nl, mid)
+        } else {
+            self.argmax_in_node(node * 2 + 1, mid, nr)
+        }
+    }
+
+    fn query_argmax(
+        &mut self,
+        node: usize,
+        nl: usize,
+        nr: usize,
+        l: usize,
+        r: usize,
+    ) -> (f64, usize) {
+        if r <= nl || nr <= l {
+            return (f64::NEG_INFINITY, usize::MAX);
+        }
+        if l <= nl && nr <= r {
+            return self.argmax_in_node(node, nl, nr);
+        }
+        self.push(node);
+        let mid = (nl + nr) / 2;
+        let a = self.query_argmax(node * 2, nl, mid, l, r);
+        let b = self.query_argmax(node * 2 + 1, mid, nr, l, r);
+        // left-most wins ties
+        if a.0 >= b.0 {
+            a
+        } else {
+            b
+        }
+    }
+
+    /// Maximum over `[l, r)` and the leftmost index achieving it.
+    pub fn range_argmax(&mut self, l: usize, r: usize) -> (f64, usize) {
+        if self.n == 0 || l >= r || l >= self.n {
+            return (0.0, usize::MAX);
+        }
+        let r = r.min(self.n);
+        let (v, i) = self.query_argmax(1, 0, self.n, l, r);
+        if v == f64::NEG_INFINITY {
+            (0.0, usize::MAX)
+        } else {
+            (v, i)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -220,6 +274,20 @@ mod tests {
         assert_eq!(s.range_max(2, 4), 5.0);
         s.range_add(0, 10, -10.0);
         assert_eq!(s.range_max(4, 5), -2.0);
+    }
+
+    #[test]
+    fn segtree_argmax_returns_leftmost_max() {
+        let mut s = SegTree::new(10);
+        s.range_add(0, 10, 1.0);
+        s.range_add(3, 5, 7.0); // index 3 and 4 have 8.0
+        let (v, i) = s.range_argmax(0, 10);
+        assert_eq!(v, 8.0);
+        assert_eq!(i, 3); // leftmost
+        let (v, i) = s.range_argmax(4, 6);
+        assert_eq!((v, i), (8.0, 4));
+        let (v, _) = s.range_argmax(6, 10);
+        assert_eq!(v, 1.0);
     }
 
     #[test]

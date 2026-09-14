@@ -484,6 +484,9 @@ le_exposure_scn(group_id, as_of, scenario_id)
 
 **建議次序**：LE-0 → LE-1 → LE-2 → LE-3 → LE-4 → LE-5。
 
+> **進度**：LE-0（設計定稿）、LE-1（core）、LE-2（增量索引 + 基準）、LE-3
+> （MA(BS)28 Parts I–V 報表投影）已完成，實作喺 `crates/gtv-largeexposure`。
+
 ---
 
 ## 10. 待決策 / 開放問題（已全部定案）
