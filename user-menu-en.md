@@ -369,6 +369,8 @@ ftp_curves_load <table>                  # FTP curve points
 ftp_policy_load <h> <liq> <basis> <opt> <beh>  # FTP policy (header + 4 component tables)
 crm_rules_load <h> <collateral> <guarantees> <wrongway> <concentration>  # governed rules
 crm_governed_load <exp> <coll> <guar> <coll_pledges> <guar_pledges>      # governed inputs
+le_entity_load <t> | le_relationship_load <t> [as_of] | le_exposure_load <t>  # MA(BS)28 Large Exposure
+le_config_load <t> | le_limit_load <t> | le_capital_load <t>              # LE params / limits / Tier 1
 ```
 
 Market/trend functions (provider is just the first argument, see §7):
@@ -402,6 +404,11 @@ irrbb_eve(currency [, regulator] [, year])   # six standardised EVE scenarios (m
 ftp_price(curve_id, cv, policy_id, pv, product, ccy, value_date, maturity_date [, booking_date])
 crm_alloc_v2(ruleset_id, version, as_of [, method])   # governed CRM allocation (greedy | lp)
 crm_explain_v2(ruleset_id, version, as_of [, method]) # allocation / exclusion / breach audit
+le_ma_bs28(part, period_start, period_end)          # MA(BS)28 Parts I-V (period-max ranking)
+le_ratio(kind, id, as_of [, measure])               # exposure ratio / status / headroom
+le_breach_scan(period_start, period_end [, top_n])  # large-exposure scan (top-N + >=10%)
+le_concentration(dimension, as_of [, measure])      # sector/country/rating/connected
+le_pre_trade_check(entity_id, amount, as_of)        # pre-trade limit check
 metrics                              # engine counters (see above)
 ```
 

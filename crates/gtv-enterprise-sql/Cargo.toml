@@ -19,6 +19,7 @@ thiserror.workspace = true
 gtv-scenario = { path = "../gtv-scenario" }
 gtv-refdata = { path = "../gtv-refdata" }
 gtv-governance = { path = "../gtv-governance" }
+gtv-largeexposure = { path = "../gtv-largeexposure" }
 
 [dev-dependencies]
 tokio.workspace = true

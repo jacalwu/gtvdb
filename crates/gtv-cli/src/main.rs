@@ -2272,6 +2272,82 @@ async fn run(
             drop(reg);
             println!("loaded {n} governed CRM exposure(s) (query via crm_alloc_v2)");
         }
+        "le_entity_load" => {
+            let table = require_arg(&tokens, 1, "le_entity_load <table>")?;
+            let batches = ctx.sql(&format!("SELECT * FROM {table}")).await?;
+            let entities = gtv_enterprise_sql::load::load_le_entities(&batches)
+                .map_err(|e| anyhow!("{e}"))?;
+            let n = entities.len();
+            let mut reg = enterprise
+                .write()
+                .map_err(|_| anyhow!("enterprise registry poisoned"))?;
+            reg.le_ledger.set_entities(entities);
+            drop(reg);
+            println!("loaded {n} LE entit(ies) from `{table}`");
+        }
+        "le_relationship_load" => {
+            let table = require_arg(&tokens, 1, "le_relationship_load <table> [as_of]")?;
+            let as_of = tokens.get(2).and_then(|t| t.parse::<i64>().ok()).unwrap_or(0);
+            let batches = ctx.sql(&format!("SELECT * FROM {table}")).await?;
+            let rels = gtv_enterprise_sql::load::load_le_relationships(&batches)
+                .map_err(|e| anyhow!("{e}"))?;
+            let n = rels.len();
+            let mut reg = enterprise
+                .write()
+                .map_err(|_| anyhow!("enterprise registry poisoned"))?;
+            reg.le_ledger.set_relationships(&rels, as_of);
+            drop(reg);
+            println!("loaded {n} LE relationship(s) from `{table}` (as_of {as_of})");
+        }
+        "le_exposure_load" => {
+            let table = require_arg(&tokens, 1, "le_exposure_load <table>")?;
+            let batches = ctx.sql(&format!("SELECT * FROM {table}")).await?;
+            let events = gtv_enterprise_sql::load::load_le_exposures(&batches)
+                .map_err(|e| anyhow!("{e}"))?;
+            let n = events.len();
+            let mut reg = enterprise
+                .write()
+                .map_err(|_| anyhow!("enterprise registry poisoned"))?;
+            reg.le_ledger.bulk_load(events).map_err(|e| anyhow!("{e}"))?;
+            drop(reg);
+            println!("loaded {n} LE exposure event(s) from `{table}` (query via le_ma_bs28/le_ratio)");
+        }
+        "le_config_load" => {
+            let table = require_arg(&tokens, 1, "le_config_load <table>")?;
+            let batches = ctx.sql(&format!("SELECT * FROM {table}")).await?;
+            let mut reg = enterprise
+                .write()
+                .map_err(|_| anyhow!("enterprise registry poisoned"))?;
+            let mut cfg = reg.le_ledger.config().clone();
+            let n = gtv_enterprise_sql::load::load_le_config(&mut cfg, &batches)
+                .map_err(|e| anyhow!("{e}"))?;
+            reg.le_ledger.set_config(cfg);
+            drop(reg);
+            println!("loaded {n} LE config override(s) from `{table}`");
+        }
+        "le_limit_load" => {
+            let table = require_arg(&tokens, 1, "le_limit_load <table>")?;
+            let batches = ctx.sql(&format!("SELECT * FROM {table}")).await?;
+            let mut reg = enterprise
+                .write()
+                .map_err(|_| anyhow!("enterprise registry poisoned"))?;
+            let n = gtv_enterprise_sql::load::load_le_limits(&mut reg.le_limits, &batches)
+                .map_err(|e| anyhow!("{e}"))?;
+            drop(reg);
+            println!("loaded {n} LE limit rule(s) from `{table}`");
+        }
+        "le_capital_load" => {
+            let table = require_arg(&tokens, 1, "le_capital_load <table>")?;
+            let batches = ctx.sql(&format!("SELECT * FROM {table}")).await?;
+            let tier1 = gtv_enterprise_sql::load::load_le_tier1(&batches)
+                .map_err(|e| anyhow!("{e}"))?;
+            let mut reg = enterprise
+                .write()
+                .map_err(|_| anyhow!("enterprise registry poisoned"))?;
+            reg.le_tier1 = tier1;
+            drop(reg);
+            println!("loaded LE Tier 1 = {tier1} from `{table}`");
+        }
         "workload" => {
             let out = ctx
                 .sql(
@@ -2761,6 +2837,8 @@ fn print_help() {
          \x20 ftp_policy_load <headers> <liquidity> <basis> <optionality> <behavioural>\n\
          \x20 crm_rules_load <header> <collateral> <guarantees> <wrongway> <concentration>\n\
          \x20 crm_governed_load <exposures> <collateral> <guarantors> <pledges> <g_pledges>\n\
+         \x20 le_entity_load <t> | le_relationship_load <t> [as_of] | le_exposure_load <t>\n\
+         \x20 le_config_load <t> | le_limit_load <t> | le_capital_load <t>  (MA(BS)28 / LE)\n\
          \x20 drop table <name>     drop a table from memory [+ persisted catalog]\n\
          \x20 remote <host:port> <sql>  execute SQL on a remote gtv-server\n\
          \x20 workload              workload admission / isolation status (per class)\n\

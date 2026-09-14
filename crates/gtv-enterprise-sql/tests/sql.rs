@@ -858,3 +858,124 @@ fn governed_inputs_loader() {
     assert_eq!(g.collateral_pledges[0].ratio, 1.0); // default when `ratio` absent
     assert_eq!(g.guarantee_pledges[0].amount, 40.0);
 }
+
+#[tokio::test]
+async fn large_exposure_sql_surface() {
+    let registry = EnterpriseRegistry::handle();
+    {
+        let entity_batch = batch(
+            Schema::new(vec![
+                Field::new("entity_id", DataType::Utf8, false),
+                Field::new("entity_type", DataType::Utf8, false),
+                Field::new("economic_sector", DataType::Utf8, true),
+                Field::new("country_code", DataType::Utf8, true),
+                Field::new("is_connected", DataType::Utf8, true),
+                Field::new("connected_paragraph", DataType::Utf8, true),
+            ]),
+            vec![
+                utf8(vec!["A", "B"]),
+                utf8(vec!["corporate", "corporate"]),
+                Arc::new(StringArray::from(vec![Some("banks"), Some("others")]))
+                    as Arc<dyn Array>,
+                Arc::new(StringArray::from(vec![Some("HK"), Some("HK")])) as Arc<dyn Array>,
+                Arc::new(StringArray::from(vec![Some("false"), Some("true")]))
+                    as Arc<dyn Array>,
+                Arc::new(StringArray::from(vec![None, Some("rule_85(1)(a)")]))
+                    as Arc<dyn Array>,
+            ],
+        );
+        let rel_batch = batch(
+            Schema::new(vec![
+                Field::new("parent_id", DataType::Utf8, false),
+                Field::new("child_id", DataType::Utf8, false),
+                Field::new("relation", DataType::Utf8, false),
+                Field::new("ownership_pct", DataType::Float64, false),
+                Field::new("valid_from", DataType::Int64, false),
+            ]),
+            vec![
+                utf8(vec!["A"]),
+                utf8(vec!["C"]),
+                utf8(vec!["control"]),
+                f64s(vec![0.6]),
+                i64s(vec![0]),
+            ],
+        );
+        let exp_batch = batch(
+            Schema::new(vec![
+                Field::new("event_id", DataType::Utf8, false),
+                Field::new("entity_id", DataType::Utf8, false),
+                Field::new("business_from", DataType::Int64, false),
+                Field::new("business_to", DataType::Int64, false),
+                Field::new("on_balance", DataType::Float64, false),
+            ]),
+            vec![
+                utf8(vec!["e1", "e2", "e3"]),
+                utf8(vec!["A", "C", "B"]),
+                i64s(vec![0, 0, 0]),
+                i64s(vec![400, 400, 400]),
+                f64s(vec![300.0, 100.0, 80.0]),
+            ],
+        );
+
+        let mut reg = registry.write().unwrap();
+        let entities = gtv_enterprise_sql::load::load_le_entities(&[entity_batch]).unwrap();
+        reg.le_ledger.set_entities(entities);
+        let rels = gtv_enterprise_sql::load::load_le_relationships(&[rel_batch]).unwrap();
+        reg.le_ledger.set_relationships(&rels, 0);
+        let events = gtv_enterprise_sql::load::load_le_exposures(&[exp_batch]).unwrap();
+        reg.le_ledger.bulk_load(events).unwrap();
+        reg.le_tier1 = 1000.0;
+    }
+    let ctx = SessionContext::new();
+    gtv_enterprise_sql::register(&ctx, registry).unwrap();
+
+    // Part II: LC group A (A+C) = 400, standalone B = 80
+    let rows = ctx
+        .sql("SELECT lc_group_id, maximum_exposure FROM le_ma_bs28('II', 0, 400) ORDER BY rank")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(string_col(&rows, 0), vec!["A", "B"]);
+    assert_eq!(f64_col(&rows, 1), vec![400.0, 80.0]);
+
+    // ratio: A breaches the 25% limit
+    let ratio = ctx
+        .sql("SELECT status, ratio FROM le_ratio('lc_group','A',100)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(string_col(&ratio, 0), vec!["breach"]);
+    assert_eq!(f64_col(&ratio, 1), vec![0.4]);
+
+    // sector concentration: banks 300, others (C + B) 180
+    let conc = ctx
+        .sql("SELECT key, exposure FROM le_concentration('sector',100) ORDER BY exposure DESC")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(string_col(&conc, 0), vec!["banks", "others"]);
+    assert_eq!(f64_col(&conc, 1), vec![300.0, 180.0]);
+
+    // pre-trade: +500 on A -> group 900, ratio 0.9, breach
+    let pre = ctx
+        .sql("SELECT group_projected, breached FROM le_pre_trade_check('A',500,100)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(f64_col(&pre, 0), vec![900.0]);
+    let breached = pre[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<arrow::array::BooleanArray>()
+        .unwrap()
+        .value(0);
+    assert!(breached);
+}

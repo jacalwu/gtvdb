@@ -66,6 +66,7 @@ pub enum LedgerError {
 
 /// Compressed per-key index: boundaries + Fenwick + segment tree + the
 /// contributions that define the boundaries.
+#[derive(Debug)]
 struct KeyIndex {
     boundaries: Vec<i64>,
     fenwick: Fenwick,
@@ -190,6 +191,7 @@ impl KeyIndex {
 }
 
 /// An event-sourced exposure ledger with incremental (suffix) recomputation.
+#[derive(Debug)]
 pub struct Ledger {
     cfg: LeConfig,
     axis: TimeAxis,
@@ -217,6 +219,12 @@ impl Ledger {
 
     pub fn config(&self) -> &LeConfig {
         &self.cfg
+    }
+
+    /// Replace the configuration (applies to subsequent queries; callers are
+    /// responsible for rebuilding limits that derive from it).
+    pub fn set_config(&mut self, cfg: LeConfig) {
+        self.cfg = cfg;
     }
 
     pub fn axis(&self) -> TimeAxis {
@@ -335,9 +343,6 @@ impl Ledger {
         if self.events.contains_key(&event.event_id) {
             return Err(LedgerError::Duplicate(event.event_id));
         }
-        if self.axis.index(event.business_from).is_none() {
-            return Err(LedgerError::OutOfAxis);
-        }
         self.insert_event(&event);
         self.events.insert(event.event_id.clone(), event);
         Ok(())
@@ -364,9 +369,6 @@ impl Ledger {
         for event in events {
             if self.events.contains_key(&event.event_id) {
                 return Err(LedgerError::Duplicate(event.event_id));
-            }
-            if self.axis.index(event.business_from).is_none() {
-                return Err(LedgerError::OutOfAxis);
             }
             for (key, value) in self.key_values(&event) {
                 pending.entry(key).or_default().insert(

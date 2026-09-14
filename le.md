@@ -484,10 +484,9 @@ le_exposure_scn(group_id, as_of, scenario_id)
 
 **建議次序**：LE-0 → LE-1 → LE-2 → LE-3 → LE-4 → LE-5。
 
-> **進度**：LE-0（設計定稿）、LE-1（core）、LE-2（增量索引 + 基準）、LE-3
-> （MA(BS)28 Parts I–V 報表投影）、**LE-5（IRRBB × LE 情景重估）**、
-> **LE-6（SA-CCR 簡化版）** 已完成，實作喺 `crates/gtv-largeexposure`。
-> 餘 LE-4（config loaders + SQL/CLI surface）。
+> **進度**：**LE-0 至 LE-6 全部完成**（設計、core、增量索引、MA(BS)28 報表投影、
+> config loaders + SQL/CLI surface、IRRBB × LE 情景、SA-CCR），實作喺
+> `crates/gtv-largeexposure` + `gtv-enterprise-sql`。
 
 ---
 

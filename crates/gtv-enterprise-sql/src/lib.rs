@@ -16,10 +16,15 @@
 //! never modified: the composition root (CLI / server) owns the registry and
 //! calls these two functions.
 
+pub mod le_udf;
 pub mod load;
 pub mod registry;
 pub mod udf;
 
+pub use le_udf::{
+    LeBreachScanTableFunction, LeConcentrationTableFunction, LeMaBs28TableFunction,
+    LePreTradeTableFunction, LeRatioTableFunction,
+};
 pub use registry::{EnterpriseRegistry, Registry};
 pub use udf::{
     CrmAllocV2TableFunction, CrmExplainV2TableFunction, FtpPriceTableFunction, HierarchyDirection,
@@ -76,6 +81,26 @@ pub fn register(session: &SessionContext, registry: Registry) -> Result<()> {
     session.register_udtf(
         "crm_explain_v2",
         Arc::new(CrmExplainV2TableFunction::new(registry.clone())),
+    );
+    session.register_udtf(
+        "le_ma_bs28",
+        Arc::new(LeMaBs28TableFunction::new(registry.clone())),
+    );
+    session.register_udtf(
+        "le_ratio",
+        Arc::new(LeRatioTableFunction::new(registry.clone())),
+    );
+    session.register_udtf(
+        "le_breach_scan",
+        Arc::new(LeBreachScanTableFunction::new(registry.clone())),
+    );
+    session.register_udtf(
+        "le_concentration",
+        Arc::new(LeConcentrationTableFunction::new(registry.clone())),
+    );
+    session.register_udtf(
+        "le_pre_trade_check",
+        Arc::new(LePreTradeTableFunction::new(registry.clone())),
     );
     session.register_udf(datafusion::logical_expr::ScalarUDF::from(
         RefdataGetUdf::new(registry),

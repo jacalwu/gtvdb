@@ -364,6 +364,8 @@ ftp_curves_load <table>                  # FTP curve 點（curve_id, version, �
 ftp_policy_load <h> <liq> <basis> <opt> <beh>  # FTP policy（header + 四張組件表）
 crm_rules_load <h> <collateral> <guarantees> <wrongway> <concentration>  # 治理規則集
 crm_governed_load <exp> <coll> <guar> <coll_pledges> <guar_pledges>      # governed 輸入
+le_entity_load <t> | le_relationship_load <t> [as_of] | le_exposure_load <t>  # MA(BS)28 Large Exposure
+le_config_load <t> | le_limit_load <t> | le_capital_load <t>              # LE 參數 / 限額 / Tier 1
 ```
 
 行情/趨勢分析函數（provider 只是第一個參數，見 §7）：
@@ -396,6 +398,11 @@ irrbb_eve(currency [, regulator] [, year])     # 六大標準化 EVE 情景 ΔE�
 ftp_price(curve_id, cv, policy_id, pv, product, ccy, value_date, maturity_date [, booking_date])  # FTP 定價
 crm_alloc_v2(ruleset_id, version, as_of [, method])   # governed CRM 分配（greedy | lp）
 crm_explain_v2(ruleset_id, version, as_of [, method]) # 分配 / 排除 / 集中度審計
+le_ma_bs28(part, period_start, period_end)          # MA(BS)28 Parts I–V 報表（期內最大排名）
+le_ratio(kind, id, as_of [, measure])               # 曝險比率 / 狀態 / headroom
+le_breach_scan(period_start, period_end [, top_n])  # 大額曝險掃描（20 大 + ≥10%）
+le_concentration(dimension, as_of [, measure])      # sector/country/rating/connected 集中度
+le_pre_trade_check(entity_id, amount, as_of)        # 交易前限額檢查
 metrics                                        # 引擎計數器
 ```
 

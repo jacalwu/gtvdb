@@ -2040,6 +2040,7 @@ dependencies = [
  "arrow",
  "datafusion",
  "gtv-governance",
+ "gtv-largeexposure",
  "gtv-refdata",
  "gtv-scenario",
  "thiserror 2.0.20",

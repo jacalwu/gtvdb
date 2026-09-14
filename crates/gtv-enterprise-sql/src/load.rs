@@ -15,6 +15,10 @@ use gtv_governance::{
     CollateralPledge, Exposure, GovernedCollateral, GovernedGuarantor, GovernedInputs,
     GuaranteePledge,
 };
+use gtv_largeexposure::{
+    Entity, EntityKind, EventKind, ExposureEvent, ExposureMeasure, LeConfig, LimitMetric, LimitRule,
+    LimitSet, Relationship, RelationshipKind, Scope,
+};
 use gtv_refdata::{EffectiveRange, HierarchyEdge, HierarchyKind, MasterKind, MasterRecord};
 use gtv_scenario::{
     AlmCell, AlmConfig, BasisSpread, BehaviouralAdjustment, CashflowType, DayCount, Dimension,
@@ -975,4 +979,231 @@ pub fn load_master(
         }
     }
     Ok(added)
+}
+
+// ---------------------------------------------------------------------------
+// Large Exposure (MA(BS)28) loaders
+// ---------------------------------------------------------------------------
+
+fn truthy(v: &Option<String>) -> bool {
+    v.as_deref().is_some_and(|s| {
+        matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "true" | "1" | "yes" | "y" | "t"
+        )
+    })
+}
+
+/// `le_entity(entity_id, entity_type?, economic_sector?, country_code?,
+/// rating_grade?, is_connected?, connected_paragraph?, scope?, is_g_sib?)`.
+pub fn load_le_entities(batches: &[RecordBatch]) -> Result<Vec<Entity>> {
+    let mut out = Vec::new();
+    for batch in batches {
+        let ids = required_strings(batch, "entity_id")?;
+        let kinds = optional_strings(batch, "entity_type")?;
+        let sectors = optional_strings(batch, "economic_sector")?;
+        let countries = optional_strings(batch, "country_code")?;
+        let ratings = optional_strings(batch, "rating_grade")?;
+        let connected = optional_strings(batch, "is_connected")?;
+        let paragraphs = optional_strings(batch, "connected_paragraph")?;
+        let scopes = optional_strings(batch, "scope")?;
+        let gsib = optional_strings(batch, "is_g_sib")?;
+        for i in 0..ids.len() {
+            let kind = kinds[i]
+                .as_deref()
+                .and_then(EntityKind::parse)
+                .unwrap_or(EntityKind::Corporate);
+            let mut e = Entity::new(ids[i].clone(), kind);
+            e.economic_sector = sectors[i].clone();
+            e.country_code = countries[i].clone();
+            e.rating_grade = ratings[i].clone();
+            e.is_connected = truthy(&connected[i]);
+            e.connected_paragraph = paragraphs[i].clone();
+            e.scope = scopes[i]
+                .as_deref()
+                .and_then(Scope::parse)
+                .unwrap_or(Scope::Both);
+            e.is_g_sib = truthy(&gsib[i]);
+            out.push(e);
+        }
+    }
+    Ok(out)
+}
+
+/// `le_relationship(parent_id, child_id, relation, ownership_pct?,
+/// valid_from, valid_to?)`.
+pub fn load_le_relationships(batches: &[RecordBatch]) -> Result<Vec<Relationship>> {
+    let mut out = Vec::new();
+    for batch in batches {
+        let parents = required_strings(batch, "parent_id")?;
+        let children = required_strings(batch, "child_id")?;
+        let relations = required_strings(batch, "relation")?;
+        let pcts = optional_f64(batch, "ownership_pct")?;
+        let froms = required_i64(batch, "valid_from")?;
+        let tos = optional_i64(batch, "valid_to", i64::MAX)?;
+        for i in 0..parents.len() {
+            let kind = RelationshipKind::parse(&relations[i]).ok_or_else(|| {
+                err(format!("le_relationship: unknown relation `{}`", relations[i]))
+            })?;
+            out.push(Relationship::new(
+                parents[i].clone(),
+                children[i].clone(),
+                kind,
+                pcts[i],
+                EffectiveRange::new(froms[i], tos[i]).map_err(err)?,
+            ));
+        }
+    }
+    Ok(out)
+}
+
+/// `le_exposure(event_id, entity_id, business_from, business_to?,
+/// on_balance?, trading_book?, off_balance?, default_risk?, additional_risk?,
+/// indirect?, crm_reduction?, currency?, net_short?, exempt?,
+/// exemption_provision?, deduction?, kind?, ref_event_id?, system_from?)`.
+pub fn load_le_exposures(batches: &[RecordBatch]) -> Result<Vec<ExposureEvent>> {
+    let mut out = Vec::new();
+    for batch in batches {
+        let ids = required_strings(batch, "event_id")?;
+        let entities = required_strings(batch, "entity_id")?;
+        let froms = required_i64(batch, "business_from")?;
+        let tos = optional_i64(batch, "business_to", i64::MAX)?;
+        let on_balance = optional_f64(batch, "on_balance")?;
+        let trading = optional_f64(batch, "trading_book")?;
+        let off_balance = optional_f64(batch, "off_balance")?;
+        let default_risk = optional_f64(batch, "default_risk")?;
+        let additional = optional_f64(batch, "additional_risk")?;
+        let indirect = optional_f64(batch, "indirect")?;
+        let crm = optional_f64(batch, "crm_reduction")?;
+        let currencies = optional_strings(batch, "currency")?;
+        let net_short = optional_strings(batch, "net_short")?;
+        let exempt = optional_strings(batch, "exempt")?;
+        let provisions = optional_strings(batch, "exemption_provision")?;
+        let deductions = optional_f64(batch, "deduction")?;
+        let kinds = optional_strings(batch, "kind")?;
+        let refs = optional_strings(batch, "ref_event_id")?;
+        let systems = optional_i64(batch, "system_from", 0)?;
+        for i in 0..ids.len() {
+            let measure = ExposureMeasure::zero()
+                .on_balance(on_balance[i])
+                .trading_book(trading[i])
+                .off_balance(off_balance[i])
+                .default_risk(default_risk[i])
+                .additional_risk(additional[i])
+                .indirect(indirect[i]);
+            let mut e = ExposureEvent::new(ids[i].clone(), entities[i].clone(), measure, froms[i], tos[i]);
+            e.crm_reduction = crm[i];
+            e.currency = currencies[i].clone().unwrap_or_else(|| "HKD".to_string());
+            e.net_short = truthy(&net_short[i]);
+            e.exempt = truthy(&exempt[i]);
+            e.exemption_provision = provisions[i].clone();
+            e.deduction = deductions[i];
+            e.kind = kinds[i]
+                .as_deref()
+                .and_then(EventKind::parse)
+                .unwrap_or(EventKind::Orig);
+            e.ref_event_id = refs[i].clone();
+            e.system_from = systems[i];
+            out.push(e);
+        }
+    }
+    Ok(out)
+}
+
+/// `le_config(key, value)` — override scalar Large Exposure parameters.
+pub fn load_le_config(config: &mut LeConfig, batches: &[RecordBatch]) -> Result<usize> {
+    let mut n = 0;
+    for batch in batches {
+        let keys = required_strings(batch, "key")?;
+        let values = required_strings(batch, "value")?;
+        for i in 0..keys.len() {
+            let raw = values[i].trim();
+            match keys[i].as_str() {
+                "control_threshold" => config.control_threshold = parse_f64(raw)?,
+                "include_economic_dependence" => {
+                    config.include_economic_dependence = matches!(
+                        raw.to_ascii_lowercase().as_str(),
+                        "true" | "1" | "yes" | "y"
+                    )
+                }
+                "report_currency" => config.report_currency = raw.to_string(),
+                "tier1_source" => {
+                    config.tier1_source = gtv_largeexposure::Tier1Source::parse(raw)
+                        .ok_or_else(|| err(format!("unknown tier1_source `{raw}`")))?
+                }
+                "default_top_n" => config.default_top_n = parse_i64(raw)? as usize,
+                "warn_ratio" => config.warn_ratio = parse_f64(raw)?,
+                "limit_ratio" => config.limit_ratio = parse_f64(raw)?,
+                "g_sib_limit" => config.g_sib_limit = parse_f64(raw)?,
+                "report_threshold" => config.report_threshold = parse_f64(raw)?,
+                "connected_report_threshold" => {
+                    config.connected_report_threshold = parse_f64(raw)?
+                }
+                "derivative_measure" => {
+                    config.derivative_measure = gtv_largeexposure::DerivativeMeasure::parse(raw)
+                        .ok_or_else(|| err(format!("unknown derivative_measure `{raw}`")))?
+                }
+                other => return Err(err(format!("load_le_config: unknown key `{other}`"))),
+            }
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
+/// `le_limit(limit_id, metric, limit_ratio, key?, report_threshold?,
+/// warn_ratio?, top_n?, applied_to?)`.
+pub fn load_le_limits(limits: &mut LimitSet, batches: &[RecordBatch]) -> Result<usize> {
+    let mut n = 0;
+    for batch in batches {
+        let ids = required_strings(batch, "limit_id")?;
+        let metrics = required_strings(batch, "metric")?;
+        let ratios = f64_from(column(batch, "limit_ratio")?)?;
+        let keys = optional_strings(batch, "key")?;
+        let reports = optional_f64(batch, "report_threshold")?;
+        let warns = optional_f64(batch, "warn_ratio")?;
+        let tops = optional_i64(batch, "top_n", 0)?;
+        let applied = optional_strings(batch, "applied_to")?;
+        for i in 0..ids.len() {
+            let metric = LimitMetric::parse(&metrics[i]).ok_or_else(|| {
+                err(format!("le_limit: unknown metric `{}`", metrics[i]))
+            })?;
+            let mut rule = LimitRule::new(ids[i].clone(), metric, ratios[i]);
+            if let Some(k) = &keys[i] {
+                rule = rule.with_key(k.clone());
+            }
+            if reports[i] > 0.0 {
+                rule = rule.with_report_threshold(reports[i]);
+            }
+            if warns[i] > 0.0 {
+                rule = rule.with_warn_ratio(warns[i]);
+            }
+            if tops[i] > 0 {
+                rule = rule.with_top_n(tops[i] as usize);
+            }
+            if let Some(a) = &applied[i] {
+                rule.applied_to = a.clone();
+            }
+            limits.add(rule);
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
+/// `le_capital(tier1 [, as_of])` — the Tier 1 denominator (latest row wins).
+pub fn load_le_tier1(batches: &[RecordBatch]) -> Result<f64> {
+    let mut best: Option<(i64, f64)> = None;
+    for batch in batches {
+        let tier1 = f64_from(column(batch, "tier1")?)?;
+        let as_of = optional_i64(batch, "as_of", 0)?;
+        for i in 0..tier1.len() {
+            let candidate = (as_of[i], tier1[i]);
+            if best.is_none_or(|(d, _)| as_of[i] >= d) {
+                best = Some(candidate);
+            }
+        }
+    }
+    best.map(|(_, v)| v)
+        .ok_or_else(|| err("le_capital: no rows"))
 }

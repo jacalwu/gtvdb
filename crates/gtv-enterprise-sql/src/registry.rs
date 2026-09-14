@@ -3,6 +3,7 @@
 use std::sync::{Arc, RwLock};
 
 use gtv_governance::{GovernedInputs, RuleRegistry};
+use gtv_largeexposure::{LeConfig, Ledger, LimitSet, TimeAxis};
 use gtv_refdata::{Hierarchy, MasterData, ReferenceData};
 use gtv_scenario::{
     AlmCube, DiscountCurve, FtpCurveCatalog, FtpPolicyCatalog, IrrbbConfig, ScenarioCatalog,
@@ -30,6 +31,13 @@ pub struct EnterpriseRegistry {
     // --- CRM governance ---
     pub crm_rules: RuleRegistry,
     pub governed: GovernedInputs,
+    // --- Large Exposure (MA(BS)28) ---
+    pub le_ledger: Ledger,
+    pub le_limits: LimitSet,
+    /// Tier 1 capital denominator (reporting currency).
+    pub le_tier1: f64,
+    /// Base risk-free curve for IRRBB × LE scenarios.
+    pub le_curve: Option<DiscountCurve>,
 }
 
 impl Default for EnterpriseRegistry {
@@ -47,6 +55,10 @@ impl Default for EnterpriseRegistry {
             ftp_policies: FtpPolicyCatalog::new(),
             crm_rules: RuleRegistry::new(),
             governed: GovernedInputs::new(),
+            le_ledger: Ledger::new(LeConfig::default(), TimeAxis::new(0, 1)),
+            le_limits: LimitSet::regulatory_defaults(&LeConfig::default()),
+            le_tier1: 0.0,
+            le_curve: None,
         }
     }
 }
