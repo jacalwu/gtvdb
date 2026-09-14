@@ -1,0 +1,168 @@
+# gtvdb HFT Rolling-Window Kernel 極致效能重構規範 (tuning3.md)
+
+## 1. Role & Task
+
+你是一位頂尖的 Rust 系統效能與 SIMD 向量化專家，同時熟悉 kdb+ 風格的 rolling-window 算子與高頻交易 (HFT) 場景。  
+請針對以下函數族進行**極致效能重構**，在維持 kdb 語義完全一致的前提下，達到「單核微秒級 / 納秒級」吞吐：
+
+- `mavg`, `msum`, `deltas`
+- `ofi_rolling`
+- Arrow-typed 包裝：`mavg_array`, `msum_array`, `deltas_array`
+- i64 版本：`msum_i64`, `deltas_i64`
+
+目標：產出一個 **fused + SIMD + zero-copy + non-temporal store** 的高效能 kernel，作為 gtvdb HFT 模組的核心算子。
+
+---
+
+## 2. 現況 baseline（待優化的 code）
+
+以下為目前的 baseline 實作（純 scalar、多趟掃描、Vec::push）：
+
+```rust
+pub fn mavg(values: &[f64], n: usize) -> Vec<f64> { ... }
+pub fn msum(values: &[f64], n: usize) -> Vec<f64> { ... }
+pub fn deltas(values: &[f64]) -> Vec<f64> { ... }
+
+pub fn ofi_rolling(
+    bid: &[f64],
+    ask: &[f64],
+    bid_sz: &[f64],
+    ask_sz: &[f64],
+    window: usize,
+) -> Vec<f64> { ... }
+
+pub fn msum_i64(values: &[i64], n: usize) -> Vec<i64> { ... }
+pub fn deltas_i64(values: &[i64]) -> Vec<i64> { ... }
+
+pub fn mavg_array(arr: &Float64Array, n: usize) -> Float64Array { ... }
+pub fn msum_array(arr: &Float64Array, n: usize) -> Float64Array { ... }
+pub fn deltas_array(arr: &Float64Array) -> Float64Array { ... }
+
+
+
+語義要求：
+
+mavg[n] x：kdb trailing moving average，前 n-1 為 prefix 平均。
+
+msum[n] x：kdb trailing moving sum。
+
+deltas x：x[i] - x[i-1]，out[0] == x[0]。
+
+ofi_rolling：OFI_t = bid_sz·Δbid − ask_sz·Δask，Δ[0] = 0，再做 msum[window]。
+
+3. 核心優化目標
+請在重構中同時滿足以下目標：
+
+Operator Fusion（單趟融合）
+
+將 mavg + msum + deltas 合併為單一 fused kernel：
+
+一次掃描 values，同時產出三個輸出。
+
+目標：將 DRAM 流量從 3× 掃描降為 1× 掃描。
+
+SIMD 向量化（AVX2 / AVX-512）
+
+對 rolling-window 累加與差分使用 _mm256_* / _mm512_* 指令：
+
+向量化累加、減法、差分。
+
+提供：
+
+fused_scalar（fallback）
+
+fused_avx2 / fused_avx512（在 cfg!(target_feature) 下啟用）
+
+Zero-Allocation & Zero-Copy
+
+預先配置 output buffer：
+
+let mut out = vec![0.0f64; len];
+
+使用 get_unchecked_mut 避免 bounds check。
+
+避免中間 Vec 分配與 materialization（尤其是 OFI）。
+
+Non-Temporal Store（避免 RFO）
+
+對大型連續輸出使用 non-temporal store：
+
+_mm_stream_pd / _mm_stream_si128 等。
+
+目標：減少 RFO 導致的多餘 DRAM 讀取。
+
+Cache-Aware Chunking
+
+以 L1/L2 大小為基準切塊：
+
+例如 const CHUNK: usize = 4096;
+
+對長序列（百萬級以上）避免 working set 超出 L1/L2。
+
+ofi_rolling 專項優化
+
+消除 % window 的整數除法：
+
+若 window 為 2 的冪次，改用 bitmask：pos & (window - 1).
+
+對 Δbid / Δask 使用 SIMD 差分。
+
+視情況將 bid_sz / ask_sz 改為較小整數型別（如 u16），減少 DRAM 流量。
+
+保持「單趟」語義：不 materialize OFI。
+
+4. 介面與語義要求
+函數介面保持不變
+
+所有 public 函數簽名維持現狀：
+
+pub fn mavg(...) -> Vec<f64>
+
+pub fn msum(...) -> Vec<f64>
+
+pub fn deltas(...) -> Vec<f64>
+
+pub fn ofi_rolling(...) -> Vec<f64>
+
+以及 Arrow 包裝與 i64 版本。
+
+kdb 語義完全一致
+
+單元測試必須全部通過：
+
+mavg_matches_kdb
+
+msum_matches_kdb
+
+deltas_matches_kdb
+
+ofi_rolling_matches_two_pass
+
+可新增更多邊界測試（空陣列、長序列、極端 window）。
+
+安全性與可維護性
+
+SIMD 部分可放在 window_simd 模組中，並以 feature gate 控制。
+
+scalar fallback 必須簡潔、易讀，作為無 SIMD 平台的保險。
+
+5. 輸出成果要求
+請產出：
+
+重構後的完整 Rust 模組
+
+包含：
+
+fused kernel（scalar + SIMD）
+
+ofi_rolling 高效能版本
+
+Arrow 包裝函數
+
+i64 版本的對應優化（可視情況 SIMD 化）
+
+簡短註解說明設計選擇
+
+在關鍵迴圈與 SIMD 區塊加上簡潔註解：
+
+說明 fusion、SIMD、non-temporal store、chunking 的用意。

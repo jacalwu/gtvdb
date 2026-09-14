@@ -1,0 +1,637 @@
+Storage Design
+本文件為 gtvdb 的磁碟存儲設計規格，目標是達到 kdb 等級的極致讀寫性能，同時保留 Graph、Temporal、Columnar、In‑Memory 的單引擎一致性。內容以可直接在 Rust 中實作的資料結構、檔案格式、IO 流程與操作 API 為主，並包含 recovery、並發與 benchmark 建議。
+
+設計目標與原則
+單一記憶體模型  
+所有 in‑memory 結構（Arrow RecordBatch、Temporal‑CSR、Vector arrays）能直接對應到磁碟格式，支援 zero‑copy mmap 或極低成本序列化。
+
+讀優先、順序寫  
+寫入採順序 append（WAL + delta），讀取以 columnar block + zone map 為主，最大化掃描效率並最小化隨機 IO。
+
+時間分區化  
+以時間為第一級分區，支援快速 time‑range pruning 與 time‑travel。
+
+可映射 CSR  
+Graph 邊表以 CSR 分檔存放，能直接 mmap 成為 in‑memory CSR，支援零拷貝 traversal。
+
+向量索引側車  
+向量索引（Flat / IVF / HNSW）以 sidecar 檔案存放，支援快速載入與增量合併。
+
+可恢復性與原子性  
+WAL 可重放，metadata 原子更新，flush/compaction 支援 crash‑safe 操作。
+
+可擴展性  
+本地單節點優化為主，未來在 metadata 層擴展為分散式目錄與分片，不改變本地格式。
+
+物理佈局與檔案格式
+目錄範例
+Code
+/data/
+  /table=trades/partition=2024-09-01/
+    meta.json
+    wal.log
+    delta.arrow
+    blocks/
+      block_0001.col
+      block_0002.col
+    edges.csr/
+      row_ptr.bin
+      col_idx.bin
+      edge_ts.col
+    vectors.idx/
+      flat.f32
+      flat.ids
+      ivf.centroids
+      ivf.postings
+檔案類型總覽
+meta.json：分區級 metadata（schema version、block list、zone maps、compaction state、checksums）。
+
+wal.log：append‑only binary log，記錄操作序列（op_type, table, partition, txn_id, payload）。順序寫入，定期切檔。
+
+delta.arrow：in‑memory delta 的持久化快照（Arrow IPC），用於快速恢復與 crash 後重建。
+
+block_.col*：列式 block，固定大小（建議 64MB），內含多個 column 的原始 bytes 或 Arrow‑compatible chunk。每個 block 附帶 header（min/max per column、row_count、offsets、checksum）。
+
+edges.csr/：CSR 分檔
+
+row_ptr.bin：連續 u64 array（row pointer）
+
+col_idx.bin：連續 u32/u64 array（neighbor ids）
+
+edge_ts.col：對應 timestamp column（Arrow 或 raw u64）
+
+vectors.idx/：向量索引 sidecar
+
+Flat: flat.f32（連續 f32 vectors），flat.ids（u64 ids）
+
+IVF: ivf.centroids（centroid vectors），ivf.postings（posting lists，連續 id arrays）
+
+Block header 範例
+text
+struct BlockHeader {
+  u32 magic;
+  u16 version;
+  u64 block_id;
+  u64 row_count;
+  u64 byte_size;
+  // per-column metadata: min,max,offset
+  // checksum
+}
+寫入路徑 WAL Delta Flush Compaction
+寫入高階流程
+接收寫入請求（insert/update/delete）
+
+同步 append 到 WAL（順序寫，fsync 策略可配置）
+
+apply 到 in‑memory DeltaBuffer（Arrow RecordBatch 或自家 columnar buffer）
+
+回應 client（可選同步或異步 commit）
+
+背景 flush：當 delta 達到閾值或時間到，觸發 flush → 產生新的 block 並更新 meta.json
+
+WAL 格式建議
+Record = [txn_id:u64][op:u8][table_id:u32][partition_id:u32][payload_len:u32][payload_bytes]
+
+payload：列式序列化（列名→values）或 Arrow IPC chunk。
+
+切檔策略：當 wal.log > 256MB 或每 N 秒切檔；切檔時產生 wal.log.1、wal.log.2，並在成功 flush 對應 delta 後刪除已 replay 的 wal 範圍。
+
+DeltaBuffer 設計
+每個 table/partition 一個 DeltaBuffer，內含多個列的可寫 buffer（SoA），並維護 row_count。
+
+使用 preallocated pages、SIMD‑aligned buffers、可選的整數壓縮（u16/u32）以降低記憶體帶寬。
+
+定期將 delta 序列化為 delta.arrow 作為快速恢復點。
+
+Flush 與 Compaction 流程
+Flush 步驟：
+
+將 DeltaBuffer 排序（若需要按 timestamp 或主鍵）
+
+切分為固定大小 block（例如 64MB）
+
+為每個 block 計算 zone map（per column min/max）、row_count、checksum
+
+寫入 block_*.col（先寫 temp 檔，寫完後原子 rename）
+
+更新 meta.json（原子寫入或使用 write‑ahead meta）
+
+刪除或截斷 WAL 中已包含的記錄
+
+Compaction：
+
+類似 LSM compaction，但目標為讀優化：合併多個小 block 成大 block，合併 zone map，重建 bloom filter，並做刪除/更新的物理清理。
+
+分為 minor（合併小 block）與 major（重寫整個 partition）。
+
+讀取路徑 與 索引策略
+Metadata 與 Pruning
+meta.json 保存每個 block 的 zone map（每列 min/max）、row_count、offset、bloom filter 指標。
+
+Query flow：
+
+解析 predicate（time range、symbol、id）
+
+partition pruning（time）定位 candidate partitions
+
+block level zone map + bloom 篩掉不命中的 block
+
+對剩餘 block 採用 zero‑copy mmap 或直接 memory map + pointer arithmetic 讀取需要的列
+
+在 memory 層用 bitmask 做 predicate filter 與 operator fusion
+
+Zero‑copy 與 mmap 策略
+對冷 block 使用 mmap，對熱 block 使用 madvise(MADV_WILLNEED) 與 prefetch。
+
+block 內 column 以連續 bytes 存放，header 提供 offsets，讀取端直接建立 Arrow ArrayData 指向 mmap memory。
+
+可變長字串或 dictionary encoded column 提供 sidecar offset table 以支援 direct pointer。
+
+Bloom Bitmask Zone Map
+Zone map：每 block 每列儲存 min/max，支援 range pruning。
+
+Bloom filter：對高基數列（symbol、id）建立 bloom，快速排除不存在的 block。
+
+Bitmask：在 in‑memory 運算中使用 bitmask（u8/u64 位元陣列）做批次過濾與向量化運算。
+
+Vector Search 整合
+Flat scan：對小規模或精確查詢，直接 mmap flat.f32 並用 SIMD 做 top‑K。
+
+IVF：先用 centroids 篩選 candidate posting lists，再在 posting lists 上做精確 top‑K。
+
+Sidecar metadata：每 posting list 附帶 block id / offset，能直接定位到原始 row id 與 column 值。
+
+Graph Temporal 存儲整合 CSR on disk
+CSR 分檔格式
+row_ptr.bin：u64 array，長度 = num_nodes + 1
+
+col_idx.bin：u32/u64 array，連續 neighbor ids
+
+edge_ts.col：對應 timestamp column（Arrow 或 raw u64）
+
+edge_attr.col：可選屬性列（weight、type），以 columnar block 存放
+
+時間分區化 與 版本
+以 valid_from 或 event time 做分區（例如 daily/hourly），每個分區有獨立 CSR 檔案。
+
+查詢時先選擇時間分區，再在 CSR 中用 edge_ts 做篩選以支援 time‑travel。
+
+新邊先寫入 delta CSR（appendable adjacency lists），定期合併到主 CSR（compaction）。
+
+mmap 與 traversal
+最近分區在啟動時 mmap，提供零拷貝 traversal。
+
+冷分區按需 mmap，載入後放入 LRU cache。
+
+提供 edge_slices(node_id, time_range) -> &[EdgeSlice]，EdgeSlice 直接指向 mmap memory，避免 allocation。
+
+實作細節 API 與 Rust 範例結構
+meta.json schema 範例
+json
+{
+  "partition": "2024-09-01",
+  "schema_version": 3,
+  "blocks": [
+    {
+      "id": 1,
+      "file": "blocks/block_0001.col",
+      "row_count": 123456,
+      "byte_size": 67108864,
+      "zone_map": {
+        "ts": [1693526400000, 1693612799000],
+        "price": [10.5, 99.9]
+      },
+      "bloom": {
+        "symbol": { "offset": 12345, "len": 8192 }
+      },
+      "checksum": "sha256:..."
+    }
+  ],
+  "wal_files": ["wal.log", "wal.log.1"],
+  "version": 42
+}
+Rust 結構建議
+rust
+pub struct BlockHeader {
+  pub magic: u32,
+  pub version: u16,
+  pub block_id: u64,
+  pub row_count: u64,
+  pub byte_size: u64,
+  // offsets and per-column metadata stored separately
+}
+
+pub struct DeltaBuffer {
+  pub columns: HashMap<String, WritableColumn>,
+  pub row_count: usize,
+}
+
+pub struct PartitionMeta {
+  pub blocks: Vec<BlockMeta>,
+  pub wal_files: Vec<String>,
+  pub version: u64,
+}
+
+pub struct BlockMeta {
+  pub id: u64,
+  pub row_count: u64,
+  pub offsets: HashMap<String, u64>,
+  pub zone_map: HashMap<String, (Scalar, Scalar)>,
+  pub bloom_offset: Option<u64>,
+}
+WAL replay 與 flush 原子性
+meta.json 原子更新：寫入 temp file → fsync → rename。
+
+WAL replay：啟動時先 replay 最近未 flush 的 wal，然後載入 delta.arrow。
+
+Flush 兩階段 commit：寫 block temp → fsync → rename → 更新 meta → fsync meta → 刪除 wal 範圍。
+
+並發與鎖策略
+partition‑level concurrency：每 partition 一把輕量鎖（RwLock），讀多寫少情況下讀不阻塞。
+
+background workers：flush、compaction、index build 在獨立 thread pool 執行，使用 channel 與 backpressure 控制。
+
+traversal API 返回引用型 slice，避免分配。
+
+測試 Benchmark 與目標指標
+測試項目
+WAL 順序寫入吞吐（append throughput）
+
+Cold mmap load time（首次 mmap 並建立 Arrow view）
+
+Hot scan throughput（columnar scan throughput）
+
+CSR traversal latency（time‑travel traversal）
+
+Vector search latency（Flat / IVF top‑K）
+
+Benchmark 目標
+WAL 順序寫入吞吐 ≥ 1 GB/s（視硬體）
+
+Columnar scan throughput 接近 DRAM 帶寬（memory bound）
+
+CSR traversal latency 符合現有 TC3 結果（ms 級）
+
+Vector top‑K 在 100k–1M 規模下達到單查詢低毫秒級
+
+測試方法
+建立可重現的 TC1–TC15 benchmark binary（hft_bench），輸出 CSV/Markdown 結果。
+
+在不同硬體（NVMe、SATA、RAM）與不同 fsync 策略下測試吞吐與延遲 tradeoff。
+
+使用 perf / VTune / flamegraph 定位 CPU 與 memory bottleneck。
+
+漸進實作路線與優先順序
+定義 block binary format 與 meta.json schema
+
+實作 WAL + DeltaBuffer + simple flush（無 compaction）
+
+實作 block level zone map pruning + mmap zero‑copy read
+
+實作 CSR 分檔與 mmap traversal
+
+加入 compaction、bloom filter、IVF sidecar
+
+優化：SIMD top‑K、operator fusion、non‑temporal store、prefetch hints
+
+擴展：metadata sharding 與分散式目錄
+
+風險 與 權衡
+格式穩定性：一旦格式確定，升級成本高，建議設計 versioned header 與向後相容策略。
+
+記憶體 vs IO tradeoff：為了極速讀取會增加 mmap 常駐頁面，需設計 LRU 與 memory budget 控制。
+
+寫入延遲 vs durability：fsync 策略可配置，測試不同場景下的吞吐與延遲平衡。
+
+分散式延伸：本地單節點優化後，分散式需在 metadata 層做 shard/replica 設計，不應改變本地格式。
+
+下一步交付項目
+我可以把本檔案直接轉成 docs/storage_design.md 並提交到 repo，並同時附上下列任一項目（選一項即可）：
+
+A. WAL + DeltaBuffer 的 Rust 範例程式碼（可編譯、包含 WAL append、replay、簡單 flush）
+
+B. block header 與 meta.json 的 JSON Schema 檔（可用於驗證與工具）
+
+C. 一個最小可運行的 flush + mmap demo（Rust pseudo code，展示從 delta flush 到 mmap 讀取的 end‑to‑end）
+
+我已準備好把 docs/storage_design.md 放入你的 repo，請選擇要同時附帶哪一項交付物。
+
+請提交md到 repo
+提交 docs/storage_design.md 到 GitHub 的完整步驟與檔案內容
+下面我已把要放進 repo 的 完整 Markdown 檔案內容 準備好，並附上一組可直接在本地執行的 Git 指令（包含分支、commit 訊息與推送），你只需在專案根目錄執行即可把檔案提交到你的 GitHub repo。
+
+建議分支與 commit 訊息
+分支名稱：feature/storage-design-docs
+
+commit 訊息：docs: add storage_design.md (disk format, WAL, delta, CSR, mmap)
+
+在本地建立檔案並提交（在 repo 根目錄執行）
+bash
+git checkout -b feature/storage-design-docs
+mkdir -p docs
+cat > docs/storage_design.md <<'MD'
+# Storage Design
+
+本文件為 **gtvdb** 的磁碟存儲設計規格，目標是達到 **kdb 等級的極致讀寫性能**，同時保留 **Graph、Temporal、Columnar、In‑Memory** 的單引擎一致性。內容以可直接在 Rust 中實作的資料結構、檔案格式、IO 流程與操作 API 為主，並包含 recovery、並發與 benchmark 建議。
+
+---
+
+## 設計目標與原則
+
+- **單一記憶體模型**  
+  所有 in‑memory 結構（Arrow RecordBatch、Temporal‑CSR、Vector arrays）能直接對應到磁碟格式，支援 zero‑copy `mmap` 或極低成本序列化。
+
+- **讀優先、順序寫**  
+  寫入採順序 append（WAL + delta），讀取以 columnar block + zone map 為主，最大化掃描效率並最小化隨機 IO。
+
+- **時間分區化**  
+  以時間為第一級分區，支援快速 time‑range pruning 與 time‑travel。
+
+- **可映射 CSR**  
+  Graph 邊表以 CSR 分檔存放，能直接 `mmap` 成為 in‑memory CSR，支援零拷貝 traversal。
+
+- **向量索引側車**  
+  向量索引（Flat / IVF / HNSW）以 sidecar 檔案存放，支援快速載入與增量合併。
+
+- **可恢復性與原子性**  
+  WAL 可重放，metadata 原子更新，flush/compaction 支援 crash‑safe 操作。
+
+- **可擴展性**  
+  本地單節點優化為主，未來在 metadata 層擴展為分散式目錄與分片，不改變本地格式。
+
+---
+
+## 物理佈局與檔案格式
+
+### 目錄範例
+/data/
+/table=trades/partition=2024-09-01/
+meta.json
+wal.log
+delta.arrow
+blocks/
+block_0001.col
+block_0002.col
+edges.csr/
+row_ptr.bin
+col_idx.bin
+edge_ts.col
+vectors.idx/
+flat.f32
+flat.ids
+ivf.centroids
+ivf.postings
+
+Code
+
+### 檔案類型總覽
+- **meta.json**：分區級 metadata（schema version、block list、zone maps、compaction state、checksums）。  
+- **wal.log**：append‑only binary log，記錄操作序列（op_type, table, partition, txn_id, payload）。順序寫入，定期切檔。  
+- **delta.arrow**：in‑memory delta 的持久化快照（Arrow IPC），用於快速恢復與 crash 後重建。  
+- **block_*.col**：列式 block，固定大小（建議 64MB），內含多個 column 的原始 bytes 或 Arrow‑compatible chunk。每個 block 附帶 header（min/max per column、row_count、offsets、checksum）。  
+- **edges.csr/**：CSR 分檔  
+  - `row_ptr.bin`：連續 u64 array（row pointer）  
+  - `col_idx.bin`：連續 u32/u64 array（neighbor ids）  
+  - `edge_ts.col`：對應 timestamp column（Arrow 或 raw u64）  
+- **vectors.idx/**：向量索引 sidecar  
+  - Flat: `flat.f32`（連續 f32 vectors），`flat.ids`（u64 ids）  
+  - IVF: `ivf.centroids`（centroid vectors），`ivf.postings`（posting lists，連續 id arrays）
+
+### Block header 範例
+```text
+struct BlockHeader {
+  u32 magic;
+  u16 version;
+  u64 block_id;
+  u64 row_count;
+  u64 byte_size;
+  // per-column metadata: min,max,offset
+  // checksum
+}
+寫入路徑 WAL Delta Flush Compaction
+寫入高階流程
+接收寫入請求（insert/update/delete）
+
+同步 append 到 WAL（順序寫，fsync 策略可配置）
+
+apply 到 in‑memory DeltaBuffer（Arrow RecordBatch 或自家 columnar buffer）
+
+回應 client（可選同步或異步 commit）
+
+背景 flush：當 delta 達到閾值或時間到，觸發 flush → 產生新的 block 並更新 meta.json
+
+WAL 格式建議
+Record = [txn_id:u64][op:u8][table_id:u32][partition_id:u32][payload_len:u32][payload_bytes]
+
+payload：列式序列化（列名→values）或 Arrow IPC chunk。
+
+切檔策略：當 wal.log > 256MB 或每 N 秒切檔；切檔時產生 wal.log.1、wal.log.2，並在成功 flush 對應 delta 後刪除已 replay 的 wal 範圍。
+
+DeltaBuffer 設計
+每個 table/partition 一個 DeltaBuffer，內含多個列的可寫 buffer（SoA），並維護 row_count。
+
+使用 preallocated pages、SIMD‑aligned buffers、可選的整數壓縮（u16/u32）以降低記憶體帶寬。
+
+定期將 delta 序列化為 delta.arrow 作為快速恢復點。
+
+Flush 與 Compaction 流程
+Flush 步驟：
+
+將 DeltaBuffer 排序（若需要按 timestamp 或主鍵）
+
+切分為固定大小 block（例如 64MB）
+
+為每個 block 計算 zone map（per column min/max）、row_count、checksum
+
+寫入 block_*.col（先寫 temp 檔，寫完後原子 rename）
+
+更新 meta.json（原子寫入或使用 write‑ahead meta）
+
+刪除或截斷 WAL 中已包含的記錄
+
+Compaction：
+
+類似 LSM compaction，但目標為讀優化：合併多個小 block 成大 block，合併 zone map，重建 bloom filter，並做刪除/更新的物理清理。
+
+分為 minor（合併小 block）與 major（重寫整個 partition）。
+
+讀取路徑 與 索引策略
+Metadata 與 Pruning
+meta.json 保存每個 block 的 zone map（每列 min/max）、row_count、offset、bloom filter 指標。
+
+Query flow：
+
+解析 predicate（time range、symbol、id）
+
+partition pruning（time）定位 candidate partitions
+
+block level zone map + bloom 篩掉不命中的 block
+
+對剩餘 block 採用 zero‑copy mmap 或直接 memory map + pointer arithmetic 讀取需要的列
+
+在 memory 層用 bitmask 做 predicate filter 與 operator fusion
+
+Zero‑copy 與 mmap 策略
+對冷 block 使用 mmap，對熱 block 使用 madvise(MADV_WILLNEED) 與 prefetch。
+
+block 內 column 以連續 bytes 存放，header 提供 offsets，讀取端直接建立 Arrow ArrayData 指向 mmap memory。
+
+可變長字串或 dictionary encoded column提供 sidecar offset table 以支援 direct pointer。
+
+Bloom Bitmask Zone Map
+Zone map：每 block 每列儲存 min/max，支援 range pruning。
+
+Bloom filter：對高基數列（symbol、id）建立 bloom，快速排除不存在的 block。
+
+Bitmask：在 in‑memory 運算中使用 bitmask（u8/u64 位元陣列）做批次過濾與向量化運算。
+
+Vector Search 整合
+Flat scan：對小規模或精確查詢，直接 mmap flat.f32 並用 SIMD 做 top‑K。
+
+IVF：先用 centroids 篩選 candidate posting lists，再在 posting lists 上做精確 top‑K。
+
+Sidecar metadata：每 posting list 附帶 block id / offset，能直接定位到原始 row id 與 column 值。
+
+Graph Temporal 存儲整合 CSR on disk
+CSR 分檔格式
+row_ptr.bin：u64 array，長度 = num_nodes + 1
+
+col_idx.bin：u32/u64 array，連續 neighbor ids
+
+edge_ts.col：對應 timestamp column（Arrow 或 raw u64）
+
+edge_attr.col：可選屬性列（weight、type），以 columnar block 存放
+
+時間分區化 與 版本
+以 valid_from 或 event time 做分區（例如 daily/hourly），每個分區有獨立 CSR 檔案。
+
+查詢時先選擇時間分區，再在 CSR 中用 edge_ts 做篩選以支援 time‑travel。
+
+新邊先寫入 delta CSR（appendable adjacency lists），定期合併到主 CSR（compaction）。
+
+mmap 與 traversal
+最近分區在啟動時 mmap，提供零拷貝 traversal。
+
+冷分區按需 mmap，載入後放入 LRU cache。
+
+提供 edge_slices(node_id, time_range) -> &[EdgeSlice]，EdgeSlice 直接指向 mmap memory，避免 allocation。
+
+實作細節 API 與 Rust 範例結構
+meta.json schema 範例
+json
+{
+  "partition": "2024-09-01",
+  "schema_version": 3,
+  "blocks": [
+    {
+      "id": 1,
+      "file": "blocks/block_0001.col",
+      "row_count": 123456,
+      "byte_size": 67108864,
+      "zone_map": {
+        "ts": [1693526400000, 1693612799000],
+        "price": [10.5, 99.9]
+      },
+      "bloom": {
+        "symbol": { "offset": 12345, "len": 8192 }
+      },
+      "checksum": "sha256:..."
+    }
+  ],
+  "wal_files": ["wal.log", "wal.log.1"],
+  "version": 42
+}
+Rust 結構建議
+rust
+pub struct BlockHeader {
+  pub magic: u32,
+  pub version: u16,
+  pub block_id: u64,
+  pub row_count: u64,
+  pub byte_size: u64,
+  // offsets and per-column metadata stored separately
+}
+
+pub struct DeltaBuffer {
+  pub columns: HashMap<String, WritableColumn>,
+  pub row_count: usize,
+}
+
+pub struct PartitionMeta {
+  pub blocks: Vec<BlockMeta>,
+  pub wal_files: Vec<String>,
+  pub version: u64,
+}
+
+pub struct BlockMeta {
+  pub id: u64,
+  pub row_count: u64,
+  pub offsets: HashMap<String, u64>,
+  pub zone_map: HashMap<String, (Scalar, Scalar)>,
+  pub bloom_offset: Option<u64>,
+}
+WAL replay 與 flush 原子性
+meta.json 原子更新：寫入 temp file → fsync → rename。
+
+WAL replay：啟動時先 replay 最近未 flush 的 wal，然後載入 delta.arrow。
+
+Flush 兩階段 commit：寫 block temp → fsync → rename → 更新 meta → fsync meta → 刪除 wal 範圍。
+
+並發與鎖策略
+partition‑level concurrency：每 partition 一把輕量鎖（RwLock），讀多寫少情況下讀不阻塞。
+
+background workers：flush、compaction、index build 在獨立 thread pool 執行，使用 channel 與 backpressure 控制。
+
+traversal API 返回引用型 slice，避免分配。
+
+測試 Benchmark 與目標指標
+測試項目
+WAL 順序寫入吞吐（append throughput）
+
+Cold mmap load time（首次 mmap 並建立 Arrow view）
+
+Hot scan throughput（columnar scan throughput）
+
+CSR traversal latency（time‑travel traversal）
+
+Vector search latency（Flat / IVF top‑K）
+
+Benchmark 目標
+WAL 順序寫入吞吐 ≥ 1 GB/s（視硬體）
+
+Columnar scan throughput 接近 DRAM 帶寬（memory bound）
+
+CSR traversal latency 符合現有 TC3 結果（ms 級）
+
+Vector top‑K 在 100k–1M 規模下達到單查詢低毫秒級
+
+測試方法
+建立可重現的 TC1–TC15 benchmark binary（hft_bench），輸出 CSV/Markdown 結果。
+
+在不同硬體（NVMe、SATA、RAM）與不同 fsync 策略下測試吞吐與延遲 tradeoff。
+
+使用 perf / VTune / flamegraph 定位 CPU 與 memory bottleneck。
+
+漸進實作路線與優先順序
+定義 block binary format 與 meta.json schema
+
+實作 WAL + DeltaBuffer + simple flush（無 compaction）
+
+實作 block level zone map pruning + mmap zero‑copy read
+
+實作 CSR 分檔與 mmap traversal
+
+加入 compaction、bloom filter、IVF sidecar
+
+優化：SIMD top‑K、operator fusion、non‑temporal store、prefetch hints
+
+擴展：metadata sharding 與分散式目錄
+
+風險 與 權衡
+格式穩定性：一旦格式確定，升級成本高，建議設計 versioned header 與向後相容策略。
+
+記憶體 vs IO tradeoff：為了極速讀取會增加 mmap 常駐頁面，需設計 LRU 與 memory budget 控制。
+
+寫入延遲 vs durability：fsync 策略可配置，測試不同場景下的吞吐與延遲平衡。
+
+分散式延伸：本地單節點優化後，分散式需在 metadata 層做 shard/replica 設計，不應改變本地格式。

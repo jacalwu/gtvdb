@@ -14,3 +14,8 @@
 *.swp
 # Windows download artifacts (browser ADS sidecars)
 *:Zone.Identifier
+
+# scratch / duplicated notes
+/1.md
+# personal shell helper (unset auth token)
+/uns.sh
