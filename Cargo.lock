@@ -2097,6 +2097,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "gtv-largeexposure"
+version = "0.1.0"
+dependencies = [
+ "gtv-refdata",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "gtv-pattern"
 version = "0.1.0"
 dependencies = [

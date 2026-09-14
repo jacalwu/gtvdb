@@ -1,0 +1,15 @@
+[package]
+name = "gtv-largeexposure"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# prod_p5 LE-1/LE-2: Large Exposure / Concentration engine (MA(BS)28).
+#
+# Enterprise-batch crate: it depends on gtv-refdata for effective dating but the
+# analysis-engine kernel must never depend on it (see doc/large_exposure_review.md,
+# testcase/check_boundary.sh).
+
+[dependencies]
+gtv-refdata = { path = "../gtv-refdata" }
+thiserror.workspace = true

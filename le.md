@@ -346,6 +346,12 @@ intragroup）計 `projected_ratio`，回傳 `breached_limits` + `headroom`。
 | 關係重組 | `O(log² n)` + touched keys |
 | 增量更新 Top-N | 只 touched keys，`O(|K| log N)` |
 
+> **實測（release，本機；`gtv-largeexposure` LE-1/LE-2）**：D=3650 日、N=100k
+> 事件、G=5000 對手、M=2000 更正：build 1.6s、增量更正 103ms、期內 max（全 entity）
+> 5.3ms、naive 全量重算 4.56s → **44× 加速**。每鍵**坐標壓縮**（依該鍵事件邊界
+> 建 Fenwick/SegTree）令記憶體 O(events) 而非 O(keys × days)；bottleneck 由 57s/2.9GB
+> 降到 1.6s/O(N)。
+
 ---
 
 ## 6. Rust API（crate `gtv-largeexposure`）

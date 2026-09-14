@@ -34,7 +34,7 @@ composition_roots=(
 # enterprise-batch crates (prod_p4)
 enterprise_crates=(
   gtv-scenario gtv-refdata gtv-governance gtv-observe gtv-security gtv-ops
-  gtv-enterprise-sql
+  gtv-enterprise-sql gtv-largeexposure
 )
 
 fail=0
