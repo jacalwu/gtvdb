@@ -13,6 +13,7 @@ use datafusion::logical_expr::{
 };
 use datafusion::scalar::ScalarValue;
 use gtv_refdata::{HierarchyKind, MasterKind};
+use gtv_scenario::{AlmFilter, FtpEngine, FtpRequest, Regulator};
 
 use crate::registry::Registry;
 
@@ -454,5 +455,208 @@ impl ScalarUDFImpl for RefdataGetUdf {
             });
         }
         Ok(ColumnarValue::Array(opt_strings(&out)))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// irrbb_eve(currency [, regulator] [, reporting_year])
+// ---------------------------------------------------------------------------
+
+/// `irrbb_eve(currency [, regulator] [, reporting_year])` — the six standardised
+/// EVE scenarios over the loaded `alm_cube`, using the configured
+/// [`gtv_scenario::IrrbbConfig`], base curve and shock table (override or the
+/// regulator/year default).
+#[derive(Debug)]
+pub struct IrrbbEveTableFunction {
+    registry: Registry,
+}
+
+impl IrrbbEveTableFunction {
+    pub fn new(registry: Registry) -> Self {
+        Self { registry }
+    }
+
+    fn schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("scenario", DataType::Utf8, false),
+            Field::new("delta_eve", DataType::Float64, false),
+        ]))
+    }
+}
+
+impl TableFunctionImpl for IrrbbEveTableFunction {
+    fn call_with_args(&self, args: TableFunctionArgs) -> Result<Arc<dyn TableProvider>> {
+        let usage = "irrbb_eve(currency [, regulator] [, reporting_year])";
+        let exprs = args.exprs();
+        let currency = literal_string(exprs.first().ok_or_else(|| {
+            DataFusionError::Execution(format!("{usage}: missing `currency`"))
+        })?)?;
+        let regulator = match exprs.get(1) {
+            Some(e) => {
+                let raw = literal_string(e)?;
+                Regulator::parse(&raw).ok_or_else(|| {
+                    DataFusionError::Execution(format!("{usage}: unknown regulator `{raw}`"))
+                })?
+            }
+            None => Regulator::Hkma,
+        };
+        let year = match exprs.get(2) {
+            Some(e) => literal_i64(e)? as i32,
+            None => 2026,
+        };
+
+        let (config, cube, curve, table) = {
+            let reg = self.registry.read().map_err(|_| poisoned("irrbb_eve"))?;
+            let curve = reg.irrbb_base_curve.clone().ok_or_else(|| {
+                DataFusionError::Execution(
+                    "irrbb_eve: no base curve loaded (run `irrbb_curve_load <table>`)".into(),
+                )
+            })?;
+            let table = reg
+                .irrbb_shock_override
+                .clone()
+                .unwrap_or_else(|| regulator.shock_table(year));
+            (
+                reg.irrbb_config.clone(),
+                reg.alm_cube.clone(),
+                curve,
+                table,
+            )
+        };
+
+        let result = gtv_scenario::standardised_irrbb_with(
+            &config,
+            &cube,
+            &AlmFilter::default(),
+            gtv_scenario::curve_zero(&curve),
+            &table,
+            &currency,
+            0.0,
+        )
+        .map_err(|e| DataFusionError::Execution(format!("irrbb_eve: {e}")))?;
+
+        let scenarios: Vec<String> = result
+            .per_scenario
+            .iter()
+            .map(|r| r.scenario.as_str().to_string())
+            .collect();
+        let deltas: Vec<f64> = result.per_scenario.iter().map(|r| r.delta_eve).collect();
+        let schema = Self::schema();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                strings(&scenarios),
+                Arc::new(Float64Array::from(deltas)) as ArrayRef,
+            ],
+        )?;
+        Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ftp_price(...)
+// ---------------------------------------------------------------------------
+
+/// `ftp_price(curve_id, curve_version, policy_id, policy_version, product,
+/// currency, value_date, maturity_date [, booking_date])` — one row with the
+/// itemised FTP build-up.
+#[derive(Debug)]
+pub struct FtpPriceTableFunction {
+    registry: Registry,
+}
+
+impl FtpPriceTableFunction {
+    pub fn new(registry: Registry) -> Self {
+        Self { registry }
+    }
+
+    fn schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("curve_id", DataType::Utf8, false),
+            Field::new("curve_version", DataType::UInt32, false),
+            Field::new("policy_id", DataType::Utf8, false),
+            Field::new("policy_version", DataType::UInt32, false),
+            Field::new("product", DataType::Utf8, false),
+            Field::new("currency", DataType::Utf8, false),
+            Field::new("tenor_days", DataType::Int64, false),
+            Field::new("base_rate", DataType::Float64, false),
+            Field::new("liquidity_premium", DataType::Float64, false),
+            Field::new("basis_spread", DataType::Float64, false),
+            Field::new("optionality_charge", DataType::Float64, false),
+            Field::new("behavioural_adjustment", DataType::Float64, false),
+            Field::new("total_rate", DataType::Float64, false),
+            Field::new("product_chain", DataType::Utf8, false),
+        ]))
+    }
+}
+
+impl TableFunctionImpl for FtpPriceTableFunction {
+    fn call_with_args(&self, args: TableFunctionArgs) -> Result<Arc<dyn TableProvider>> {
+        let usage = "ftp_price(curve_id, curve_version, policy_id, policy_version, product, \
+                     currency, value_date, maturity_date [, booking_date])";
+        let exprs = args.exprs();
+        let arg = |i: usize| -> Result<&datafusion::logical_expr::Expr> {
+            exprs.get(i).ok_or_else(|| {
+                DataFusionError::Execution(format!("{usage}: missing argument #{i}"))
+            })
+        };
+        let curve_id = literal_string(arg(0)?)?;
+        let curve_version = literal_i64(arg(1)?)? as u32;
+        let policy_id = literal_string(arg(2)?)?;
+        let policy_version = literal_i64(arg(3)?)? as u32;
+        let product = literal_string(arg(4)?)?;
+        let currency = literal_string(arg(5)?)?;
+        let value_date = literal_i64(arg(6)?)?;
+        let maturity_date = literal_i64(arg(7)?)?;
+        let booking_date = match exprs.get(8) {
+            Some(e) => literal_i64(e)?,
+            None => value_date,
+        };
+
+        let (curves, policies, hierarchy) = {
+            let reg = self.registry.read().map_err(|_| poisoned("ftp_price"))?;
+            (
+                reg.ftp_curves.clone(),
+                reg.ftp_policies.clone(),
+                reg.hierarchy.clone(),
+            )
+        };
+        let engine = FtpEngine::new(&curves, &policies, &hierarchy);
+        let b = engine
+            .price(&FtpRequest::new(
+                curve_id,
+                curve_version,
+                policy_id,
+                policy_version,
+                product,
+                currency,
+                booking_date,
+                value_date,
+                maturity_date,
+            ))
+            .map_err(|e| DataFusionError::Execution(format!("ftp_price: {e}")))?;
+
+        let chain = b.product_chain.join(",");
+        let schema = Self::schema();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                strings(std::slice::from_ref(&b.curve_id)),
+                Arc::new(UInt32Array::from(vec![b.curve_version])) as ArrayRef,
+                strings(std::slice::from_ref(&b.policy_id)),
+                Arc::new(UInt32Array::from(vec![b.policy_version])) as ArrayRef,
+                strings(std::slice::from_ref(&b.product)),
+                strings(std::slice::from_ref(&b.currency)),
+                Arc::new(Int64Array::from(vec![b.tenor_days])) as ArrayRef,
+                Arc::new(Float64Array::from(vec![b.base_rate])) as ArrayRef,
+                Arc::new(Float64Array::from(vec![b.liquidity_premium])) as ArrayRef,
+                Arc::new(Float64Array::from(vec![b.basis_spread])) as ArrayRef,
+                Arc::new(Float64Array::from(vec![b.optionality_charge])) as ArrayRef,
+                Arc::new(Float64Array::from(vec![b.behavioural_adjustment])) as ArrayRef,
+                Arc::new(Float64Array::from(vec![b.total_rate])) as ArrayRef,
+                strings(&[chain]),
+            ],
+        )?;
+        Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
     }
 }

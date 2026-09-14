@@ -2089,6 +2089,138 @@ async fn run(
             ctx.set_crm_rating_maps(maps).map_err(|e| anyhow!("{e}"))?;
             println!("loaded CRM rating maps from `{table}` (inspect with crm_rating_map())");
         }
+        // --- config-driven ALM / IRRBB / FTP surfaces -----------------------
+        "alm_load" => {
+            let table = require_arg(&tokens, 1, "alm_load <table>")?;
+            let batches = ctx.sql(&format!("SELECT * FROM {table}")).await?;
+            let cells =
+                gtv_enterprise_sql::load::load_alm_cells(&batches).map_err(|e| anyhow!("{e}"))?;
+            let n = cells.len();
+            let mut reg = enterprise
+                .write()
+                .map_err(|_| anyhow!("enterprise registry poisoned"))?;
+            reg.alm_cube = gtv_scenario::AlmCube::from_cells(cells);
+            drop(reg);
+            println!("loaded {n} ALM cell(s) from `{table}` (query via irrbb_eve(...))");
+        }
+        "irrbb_curve_load" => {
+            let table = require_arg(&tokens, 1, "irrbb_curve_load <table>")?;
+            let batches = ctx.sql(&format!("SELECT * FROM {table}")).await?;
+            let curve = gtv_enterprise_sql::load::load_discount_curve(&batches)
+                .map_err(|e| anyhow!("{e}"))?;
+            let mut reg = enterprise
+                .write()
+                .map_err(|_| anyhow!("enterprise registry poisoned"))?;
+            reg.irrbb_base_curve = Some(curve);
+            drop(reg);
+            println!("loaded IRRBB base curve from `{table}`");
+        }
+        "irrbb_params_load" => {
+            let table = require_arg(&tokens, 1, "irrbb_params_load <table>")?;
+            let batches = ctx.sql(&format!("SELECT * FROM {table}")).await?;
+            let mut reg = enterprise
+                .write()
+                .map_err(|_| anyhow!("enterprise registry poisoned"))?;
+            let n = gtv_enterprise_sql::load::load_irrbb_scalars(&mut reg.irrbb_config, &batches)
+                .map_err(|e| anyhow!("{e}"))?;
+            drop(reg);
+            println!("loaded {n} IRRBB scalar override(s) from `{table}`");
+        }
+        "irrbb_nmd_load" => {
+            let table = require_arg(&tokens, 1, "irrbb_nmd_load <table>")?;
+            let batches = ctx.sql(&format!("SELECT * FROM {table}")).await?;
+            let mut reg = enterprise
+                .write()
+                .map_err(|_| anyhow!("enterprise registry poisoned"))?;
+            let n = gtv_enterprise_sql::load::load_irrbb_nmd_caps(&mut reg.irrbb_config, &batches)
+                .map_err(|e| anyhow!("{e}"))?;
+            drop(reg);
+            println!("loaded {n} IRRBB NMD cap override(s) from `{table}`");
+        }
+        "irrbb_mult_load" => {
+            let table = require_arg(&tokens, 1, "irrbb_mult_load <table>")?;
+            let batches = ctx.sql(&format!("SELECT * FROM {table}")).await?;
+            let mut reg = enterprise
+                .write()
+                .map_err(|_| anyhow!("enterprise registry poisoned"))?;
+            let n = gtv_enterprise_sql::load::load_irrbb_scenario_multipliers(
+                &mut reg.irrbb_config,
+                &batches,
+            )
+            .map_err(|e| anyhow!("{e}"))?;
+            drop(reg);
+            println!("loaded {n} IRRBB scenario multiplier override(s) from `{table}`");
+        }
+        "irrbb_bands_load" => {
+            let table = require_arg(&tokens, 1, "irrbb_bands_load <table>")?;
+            let batches = ctx.sql(&format!("SELECT * FROM {table}")).await?;
+            let mut reg = enterprise
+                .write()
+                .map_err(|_| anyhow!("enterprise registry poisoned"))?;
+            let n = gtv_enterprise_sql::load::load_irrbb_time_bands(&mut reg.irrbb_config, &batches)
+                .map_err(|e| anyhow!("{e}"))?;
+            drop(reg);
+            println!("loaded {n} IRRBB time band(s) from `{table}`");
+        }
+        "irrbb_shocks_load" => {
+            let table = require_arg(&tokens, 1, "irrbb_shocks_load <table> [recalibrated|current]")?;
+            let version = match tokens.get(2).copied().unwrap_or("recalibrated") {
+                "recalibrated" | "2026" => gtv_scenario::ShockTableVersion::Recalibrated2026,
+                "current" | "2018" => gtv_scenario::ShockTableVersion::Current2018,
+                other => {
+                    return Err(anyhow!(
+                        "unknown shock-table version `{other}` (recalibrated | current)"
+                    ))
+                }
+            };
+            let batches = ctx.sql(&format!("SELECT * FROM {table}")).await?;
+            let shock = gtv_enterprise_sql::load::load_shock_table(version, &batches)
+                .map_err(|e| anyhow!("{e}"))?;
+            let mut reg = enterprise
+                .write()
+                .map_err(|_| anyhow!("enterprise registry poisoned"))?;
+            reg.irrbb_shock_override = Some(shock);
+            drop(reg);
+            println!("loaded IRRBB shock table from `{table}`");
+        }
+        "ftp_curves_load" => {
+            let table = require_arg(&tokens, 1, "ftp_curves_load <table>")?;
+            let batches = ctx.sql(&format!("SELECT * FROM {table}")).await?;
+            let mut reg = enterprise
+                .write()
+                .map_err(|_| anyhow!("enterprise registry poisoned"))?;
+            let n = gtv_enterprise_sql::load::load_ftp_curves(&mut reg.ftp_curves, &batches)
+                .map_err(|e| anyhow!("{e}"))?;
+            drop(reg);
+            println!("loaded {n} FTP curve(s) from `{table}`");
+        }
+        "ftp_policy_load" => {
+            let usage = "ftp_policy_load <headers> <liquidity> <basis> <optionality> <behavioural>";
+            let headers = require_arg(&tokens, 1, usage)?;
+            let liquidity = require_arg(&tokens, 2, usage)?;
+            let basis = require_arg(&tokens, 3, usage)?;
+            let optionality = require_arg(&tokens, 4, usage)?;
+            let behavioural = require_arg(&tokens, 5, usage)?;
+            let hb = ctx.sql(&format!("SELECT * FROM {headers}")).await?;
+            let lb = ctx.sql(&format!("SELECT * FROM {liquidity}")).await?;
+            let bb = ctx.sql(&format!("SELECT * FROM {basis}")).await?;
+            let ob = ctx.sql(&format!("SELECT * FROM {optionality}")).await?;
+            let behb = ctx.sql(&format!("SELECT * FROM {behavioural}")).await?;
+            let mut reg = enterprise
+                .write()
+                .map_err(|_| anyhow!("enterprise registry poisoned"))?;
+            let n = gtv_enterprise_sql::load::load_ftp_policies(
+                &mut reg.ftp_policies,
+                &hb,
+                &lb,
+                &bb,
+                &ob,
+                &behb,
+            )
+            .map_err(|e| anyhow!("{e}"))?;
+            drop(reg);
+            println!("loaded {n} FTP policy/policies (query via ftp_price(...))");
+        }
         "workload" => {
             let out = ctx
                 .sql(
@@ -2570,6 +2702,12 @@ fn print_help() {
          \x20 refdata_load <table>  load effective-dated reference values\n\
          \x20 master_load <kind> <table>  load master data for master_get(...)\n\
          \x20 crm_rating_load <table>  load CRM rating maps (map_name, key, value) for crm_alloc\n\
+         \x20 alm_load <table>  load ALM cube rows (query via irrbb_eve)\n\
+         \x20 irrbb_curve_load <t>  base risk-free curve (tenor_days, zero_rate [, day_count])\n\
+         \x20 irrbb_params_load <t> | irrbb_nmd_load <t> | irrbb_mult_load <t> | irrbb_bands_load <t>\n\
+         \x20 irrbb_shocks_load <t> [recalibrated|current]  shock-table override\n\
+         \x20 ftp_curves_load <t>  load FTP curves; ftp_price(...) prices them\n\
+         \x20 ftp_policy_load <headers> <liquidity> <basis> <optionality> <behavioural>\n\
          \x20 drop table <name>     drop a table from memory [+ persisted catalog]\n\
          \x20 remote <host:port> <sql>  execute SQL on a remote gtv-server\n\
          \x20 workload              workload admission / isolation status (per class)\n\

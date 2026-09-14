@@ -1982,6 +1982,7 @@ dependencies = [
  "gtv-index-store",
  "gtv-pattern",
  "gtv-proto",
+ "gtv-scenario",
  "gtv-storage",
  "gtv-udf",
  "rayon",

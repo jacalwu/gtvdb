@@ -669,6 +669,28 @@ pub fn load_alm_cells(batches: &[RecordBatch]) -> Result<Vec<AlmCell>> {
     Ok(out)
 }
 
+/// `irrbb_curve_points(tenor_days, zero_rate [, day_count])` — a base
+/// risk-free zero curve for the standardised EVE.
+pub fn load_discount_curve(batches: &[RecordBatch]) -> Result<gtv_scenario::DiscountCurve> {
+    let mut points = Vec::new();
+    let mut day_count = DayCount::Act365;
+    for batch in batches {
+        let tenors = required_i64(batch, "tenor_days")?;
+        let rates = f64_from(column(batch, "zero_rate")?)?;
+        if has_column(batch, "day_count") {
+            let dcs = required_strings(batch, "day_count")?;
+            if let Some(first) = dcs.first() {
+                day_count = DayCount::parse(first)
+                    .ok_or_else(|| err(format!("unknown day_count `{first}`")))?;
+            }
+        }
+        for i in 0..tenors.len() {
+            points.push((tenors[i], rates[i]));
+        }
+    }
+    gtv_scenario::DiscountCurve::from_zero_rates_dc(points, day_count).map_err(err)
+}
+
 fn parse_f64(raw: &str) -> Result<f64> {
     raw.parse::<f64>()
         .map_err(|_| err(format!("expected a number, got `{raw}`")))

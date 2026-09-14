@@ -358,6 +358,15 @@ hierarchy_load <kind> <table>            # load effective-dated hierarchy edges
 refdata_load <table>                     # load effective-dated reference values
 master_load <kind> <table>               # load master data for master_get(...)
 crm_rating_load <table>                  # load CRM rating maps (map_name, key, value)
+alm_load <table>                         # load ALM cube rows (query via irrbb_eve)
+irrbb_curve_load <table>                 # base risk-free curve (tenor_days, zero_rate [, day_count])
+irrbb_params_load <table>                # IRRBB scalars (floor / vol_bump / formula coeffs ...)
+irrbb_nmd_load <table>                   # NMD caps (category, core_ratio_cap, maturity_cap_years)
+irrbb_mult_load <table>                  # scenario multipliers (scenario, cpr_gamma, tdrr_u)
+irrbb_bands_load <table>                 # time bands (label, start_years, end_years, midpoint_years)
+irrbb_shocks_load <table> [recalibrated|current]  # shock-table override
+ftp_curves_load <table>                  # FTP curve points
+ftp_policy_load <h> <liq> <basis> <opt> <beh>  # FTP policy (header + 4 component tables)
 ```
 
 Market/trend functions (provider is just the first argument, see §7):
@@ -387,6 +396,8 @@ hierarchy_descendants(kind, node, as_of)    # effective-dated descendants
 refdata_get(domain, key, as_of)      # effective-dated reference value
 master_get(kind, id, as_of)          # master attributes (one row each)
 crm_rating_map()                     # CRM rating / type maps (map_name, key, value)
+irrbb_eve(currency [, regulator] [, year])   # six standardised EVE scenarios (max = risk measure)
+ftp_price(curve_id, cv, policy_id, pv, product, ccy, value_date, maturity_date [, booking_date])
 metrics                              # engine counters (see above)
 ```
 

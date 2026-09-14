@@ -22,8 +22,8 @@ pub mod udf;
 
 pub use registry::{EnterpriseRegistry, Registry};
 pub use udf::{
-    HierarchyDirection, HierarchyTableFunction, MasterGetTableFunction, RefdataGetUdf,
-    ResolveScenarioTableFunction,
+    FtpPriceTableFunction, HierarchyDirection, HierarchyTableFunction, IrrbbEveTableFunction,
+    MasterGetTableFunction, RefdataGetUdf, ResolveScenarioTableFunction,
 };
 
 // Re-export the domain identifiers callers need, so composition roots only
@@ -59,6 +59,14 @@ pub fn register(session: &SessionContext, registry: Registry) -> Result<()> {
     session.register_udtf(
         "master_get",
         Arc::new(MasterGetTableFunction::new(registry.clone())),
+    );
+    session.register_udtf(
+        "irrbb_eve",
+        Arc::new(IrrbbEveTableFunction::new(registry.clone())),
+    );
+    session.register_udtf(
+        "ftp_price",
+        Arc::new(FtpPriceTableFunction::new(registry.clone())),
     );
     session.register_udf(datafusion::logical_expr::ScalarUDF::from(
         RefdataGetUdf::new(registry),

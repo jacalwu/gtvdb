@@ -22,7 +22,7 @@
 | CRM 治理（`gtv-governance`） | ✅ | `RuleSet` data + `load_crm_rulesets` |
 | CRM kernel（`gtv-array` + `gtv-engine/crm.rs`） | ✅ | `CrmRatingMaps` + `load_rating_maps` + `crm_rating_map()` |
 | AML case（`gtv-governance/aml.rs`） | 🟡 | `HybridWeights::default` 寫死 |
-| CLI / SQL surface | ❌ | 冇 `alm` / `ftp` / `irrbb` 命令；`crm_alloc` 用寫死對照表 |
+| CLI / SQL surface | 🟡 | IRRBB `irrbb_eve` + FTP `ftp_price` + 配置 load 命令已上；governed CRM `crm_alloc_v2` 未接 |
 
 ---
 
@@ -182,7 +182,17 @@ crm_inputs_*(...)                              # exposures / collateral / guaran
   wrong-way / concentration 五張表；`eligible` 接受 true/1/yes；`currencies` /
   `jurisdictions` 逗號分隔），寫入 `gtv_governance::RuleRegistry`（版本 + effective dating）。
 
-**仍未做**：P3（CLI / SQL surface，例如 `irrbb_eve` / `ftp_price` / `crm_alloc_v2`）。
+**P3 已完成（IRRBB / FTP）**：
+- SQL surface（`gtv-enterprise-sql::register`）：`irrbb_eve(currency [, regulator]
+  [, reporting_year])`（六大情景 ΔE，max = 風險值）、`ftp_price(curve_id, cv,
+  policy_id, pv, product, ccy, value_date, maturity_date [, booking_date])`。
+- CLI load 命令：`alm_load`、`irrbb_curve_load`、`irrbb_params_load`、
+  `irrbb_nmd_load`、`irrbb_mult_load`、`irrbb_bands_load`、`irrbb_shocks_load`、
+  `ftp_curves_load`、`ftp_policy_load`。
+- 已以 REPL + 整合測試驗證。
+
+**仍未做**：governed CRM `crm_alloc_v2`（需將 `GovernedInputs` /
+`crm_rules_load` 接上 SQL surface）。
 
 **P2 已完成**：
 - **ALM 參數外部化**：`gtv_scenario::alm::{AlmConfig, DayCount}`（day-count ACT/365、

@@ -740,6 +740,14 @@ impl Regulator {
         }
     }
 
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "hkma" | "hk" | "hong kong" => Some(Regulator::Hkma),
+            "mas" | "sg" | "singapore" => Some(Regulator::Mas),
+            _ => None,
+        }
+    }
+
     /// The specified-shock table for a reporting year.
     ///
     /// Both HKMA and MAS follow the BCBS d578 recalibration timetable

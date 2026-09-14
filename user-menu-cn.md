@@ -353,6 +353,15 @@ hierarchy_load <kind> <table>            # 載入 effective-dated hierarchy 邊
 refdata_load <table>                     # 載入 effective-dated reference 值
 master_load <kind> <table>               # 載入 master data（master_get）
 crm_rating_load <table>                  # 載入 CRM 評級對照表（map_name, key, value）
+alm_load <table>                         # 載入 ALM cube（可用 irrbb_eve 查）
+irrbb_curve_load <table>                 # 風險無關基準曲線（tenor_days, zero_rate [, day_count]）
+irrbb_params_load <table>                # IRRBB 純量參數（floor / vol_bump / 公式係數 …）
+irrbb_nmd_load <table>                   # NMD caps（category, core_ratio_cap, maturity_cap_years）
+irrbb_mult_load <table>                  # 情景乘數（scenario, cpr_gamma, tdrr_u）
+irrbb_bands_load <table>                 # 時間帶（label, start_years, end_years, midpoint_years）
+irrbb_shocks_load <table> [recalibrated|current]  # shock 表 override
+ftp_curves_load <table>                  # FTP curve 點（curve_id, version, …, tenor_days, zero_rate）
+ftp_policy_load <h> <liq> <basis> <opt> <beh>  # FTP policy（header + 四張組件表）
 ```
 
 行情/趨勢分析函數（provider 只是第一個參數，見 §7）：
@@ -381,6 +390,8 @@ hierarchy_descendants(kind, node, as_of)       # 生效日期階層後代
 refdata_get(domain, key, as_of)                # effective-dated reference 值
 master_get(kind, id, as_of)                    # master 屬性（每 attribute 一行）
 crm_rating_map()                               # CRM 評級 / 類型對照表（map_name, key, value）
+irrbb_eve(currency [, regulator] [, year])     # 六大標準化 EVE 情景 ΔE（max = 風險值）
+ftp_price(curve_id, cv, policy_id, pv, product, ccy, value_date, maturity_date [, booking_date])  # FTP 定價
 metrics                                        # 引擎計數器
 ```
 

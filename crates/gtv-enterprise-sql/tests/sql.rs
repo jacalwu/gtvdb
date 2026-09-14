@@ -644,3 +644,88 @@ fn alm_config_and_cells_loaders() {
     assert_eq!(cf[2], 100.0); // 3M band (repricing 90d)
     assert_eq!(cf[5], 5.0); // 1Y band (coupon 365d)
 }
+
+#[tokio::test]
+async fn irrbb_eve_and_ftp_price_sql_surfaces() {
+    use gtv_scenario::{
+        AlmCell, AlmCube, BasisSpread, BehaviouralAdjustment, CashflowType, DiscountCurve, FtpCurve,
+        FtpCurveCatalog, FtpPolicy, FtpPolicyCatalog, LiquidityPremium, OptionalityCharge,
+    };
+
+    let registry = EnterpriseRegistry::handle();
+    {
+        let mut reg = registry.write().unwrap();
+        let mut cube = AlmCube::new();
+        cube.push(
+            AlmCell::new("base", "LE1", "HKD", "Loan", 365, CashflowType::Principal, 1000.0)
+                .with_repricing(365),
+        );
+        reg.alm_cube = cube;
+        reg.irrbb_base_curve = Some(DiscountCurve::flat(0.03));
+
+        let mut curves = FtpCurveCatalog::new();
+        curves
+            .register(FtpCurve::new("USD-OIS", 1, "USD", 0, i64::MAX, vec![(0, 0.01), (365, 0.03)]).unwrap())
+            .unwrap();
+        reg.ftp_curves = curves;
+        let mut policies = FtpPolicyCatalog::new();
+        policies
+            .register(
+                FtpPolicy::new("P1", 1, 0, i64::MAX)
+                    .with_liquidity(vec![LiquidityPremium {
+                        product: "Loan".into(),
+                        tenor_days: 365,
+                        spread: 0.015,
+                    }])
+                    .with_basis(vec![BasisSpread {
+                        currency: "USD".into(),
+                        tenor_days: 365,
+                        spread: 0.002,
+                    }])
+                    .with_optionality(vec![OptionalityCharge {
+                        product: "Loan".into(),
+                        charge: 0.004,
+                    }])
+                    .with_behavioural(vec![BehaviouralAdjustment {
+                        product: "Loan".into(),
+                        adjustment: -0.001,
+                    }]),
+            )
+            .unwrap();
+        reg.ftp_policies = policies;
+    }
+    let ctx = SessionContext::new();
+    gtv_enterprise_sql::register(&ctx, registry).unwrap();
+
+    let ev = ctx
+        .sql("SELECT scenario, delta_eve FROM irrbb_eve('HKD') ORDER BY scenario")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(ev.iter().map(|b| b.num_rows()).sum::<usize>(), 6);
+    let names = string_col(&ev, 0);
+    let deltas = f64_col(&ev, 1);
+    let up = deltas[names.iter().position(|n| n == "parallel_up").unwrap()];
+    assert!(up > 0.0, "a parallel-up shock is an EVE loss on a net asset position");
+
+    let fp = ctx
+        .sql("SELECT total_rate, product_chain FROM ftp_price('USD-OIS',1,'P1',1,'Loan','USD',0,365)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert!((f64_col(&fp, 0)[0] - 0.05).abs() < 1e-9);
+    assert_eq!(string_col(&fp, 1), vec!["Loan"]);
+
+    // unknown regulator is rejected
+    let err = ctx
+        .sql("SELECT * FROM irrbb_eve('HKD', 'XYZ')")
+        .await
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+    assert!(err.contains("unknown regulator"), "got: {err}");
+}

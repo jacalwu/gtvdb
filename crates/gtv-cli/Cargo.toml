@@ -25,6 +25,7 @@ gtv-pattern = { path = "../gtv-pattern" }
 gtv-udf = { path = "../gtv-udf" }
 gtv-proto = { path = "../gtv-proto" }
 gtv-enterprise-sql = { path = "../gtv-enterprise-sql" }
+gtv-scenario = { path = "../gtv-scenario" }
 arrow.workspace = true
 anyhow.workspace = true
 rustyline.workspace = true
