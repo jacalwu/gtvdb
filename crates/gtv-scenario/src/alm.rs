@@ -401,15 +401,57 @@ impl AlmCube {
 // Curve / stress / assumption helpers
 // ---------------------------------------------------------------------------
 
+/// Day-count convention used to convert between days and year fractions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DayCount {
+    /// Actual/365 (fixed).
+    Act365,
+    /// Actual/360.
+    Act360,
+}
+
+impl DayCount {
+    pub fn days_per_year(self) -> f64 {
+        match self {
+            DayCount::Act365 => 365.0,
+            DayCount::Act360 => 360.0,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DayCount::Act365 => "act/365",
+            DayCount::Act360 => "act/360",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().replace([' ', '-', '_', '/'], "").as_str() {
+            "act365" | "actual365" | "a365" => Some(DayCount::Act365),
+            "act360" | "actual360" | "a360" => Some(DayCount::Act360),
+            _ => None,
+        }
+    }
+}
+
 /// Continuously-compounded zero curve, piecewise-linear in `(days, rate)` with
 /// flat extrapolation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DiscountCurve {
     points: Vec<(i64, f64)>,
+    day_count: DayCount,
 }
 
 impl DiscountCurve {
-    pub fn from_zero_rates(mut points: Vec<(i64, f64)>) -> Result<Self, AlmError> {
+    pub fn from_zero_rates(points: Vec<(i64, f64)>) -> Result<Self, AlmError> {
+        Self::from_zero_rates_dc(points, DayCount::Act365)
+    }
+
+    /// Build a curve with an explicit day-count convention.
+    pub fn from_zero_rates_dc(
+        mut points: Vec<(i64, f64)>,
+        day_count: DayCount,
+    ) -> Result<Self, AlmError> {
         if points.is_empty() {
             return Err(AlmError::EmptyCurve);
         }
@@ -422,14 +464,19 @@ impl DiscountCurve {
                 return Err(AlmError::DuplicateTenor(w[0].0));
             }
         }
-        Ok(Self { points })
+        Ok(Self { points, day_count })
     }
 
-    /// Flat curve at `rate` for all tenors.
+    /// Flat curve at `rate` for all tenors (ACT/365).
     pub fn flat(rate: f64) -> Self {
         Self {
             points: vec![(0, rate)],
+            day_count: DayCount::Act365,
         }
+    }
+
+    pub fn day_count(&self) -> DayCount {
+        self.day_count
     }
 
     /// The `(days, zero rate)` grid points (ascending tenors).
@@ -439,7 +486,12 @@ impl DiscountCurve {
 
     /// Discount factor at `t_years`.
     pub fn df_years(&self, t_years: f64) -> f64 {
-        self.df((t_years * 365.0).round() as i64)
+        self.df((t_years * self.day_count.days_per_year()).round() as i64)
+    }
+
+    /// Zero rate at `t_years`.
+    pub fn zero_rate_years(&self, t_years: f64) -> f64 {
+        self.zero_rate((t_years * self.day_count.days_per_year()).round() as i64)
     }
 
     /// Zero rate at `days` (flat extrapolation at both ends).
@@ -464,10 +516,11 @@ impl DiscountCurve {
         last.1
     }
 
-    /// Discount factor at `days` using ACT/365 continuous compounding.
+    /// Discount factor at `days` using the curve's day count and continuous
+    /// compounding.
     pub fn df(&self, days: i64) -> f64 {
         let days = days.max(0);
-        E.powf(-self.zero_rate(days) * days as f64 / 365.0)
+        E.powf(-self.zero_rate(days) * days as f64 / self.day_count.days_per_year())
     }
 }
 
@@ -520,12 +573,21 @@ impl DepositDecay {
 
     /// Geometric survival profile: `(1 - monthly_runoff)^periods`, monthly.
     pub fn from_monthly_runoff(monthly_runoff: f64, periods: usize) -> Self {
+        Self::from_monthly_runoff_with(monthly_runoff, periods, 30)
+    }
+
+    /// Geometric survival profile with an explicit period length in days.
+    pub fn from_monthly_runoff_with(
+        monthly_runoff: f64,
+        periods: usize,
+        period_days: i64,
+    ) -> Self {
         let survival = (0..periods)
             .map(|i| (1.0 - monthly_runoff).powi(i as i32 + 1))
             .collect();
         Self {
             survival,
-            period_days: 30,
+            period_days,
         }
     }
 }
@@ -582,6 +644,40 @@ impl FxTable {
             return 1.0 / *r;
         }
         1.0
+    }
+}
+
+/// Configurable ALM conventions and defaults.
+///
+/// `Default` reproduces the previously hardcoded values (ACT/365, the 10%
+/// deposit-runoff stress, 30-day decay periods) and can be overridden from a
+/// configuration table via `load_alm_config`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlmConfig {
+    pub day_count: DayCount,
+    pub liquidity_stress: LiquidityStress,
+    pub deposit_decay_period_days: i64,
+}
+
+impl Default for AlmConfig {
+    fn default() -> Self {
+        Self {
+            day_count: DayCount::Act365,
+            liquidity_stress: LiquidityStress::default(),
+            deposit_decay_period_days: 30,
+        }
+    }
+}
+
+impl AlmConfig {
+    /// Build a discount curve honouring the configured day count.
+    pub fn curve(&self, points: Vec<(i64, f64)>) -> Result<DiscountCurve, AlmError> {
+        DiscountCurve::from_zero_rates_dc(points, self.day_count)
+    }
+
+    /// Deposit-decay schedule using the configured period length.
+    pub fn deposit_decay(&self, monthly_runoff: f64, periods: usize) -> DepositDecay {
+        DepositDecay::from_monthly_runoff_with(monthly_runoff, periods, self.deposit_decay_period_days)
     }
 }
 
@@ -807,5 +903,40 @@ mod tests {
             DiscountCurve::from_zero_rates(vec![(0, 0.01), (0, 0.02)]),
             Err(AlmError::DuplicateTenor(0))
         ));
+    }
+
+    #[test]
+    fn alm_config_defaults_and_day_count() {
+        let c = AlmConfig::default();
+        assert_eq!(c.day_count, DayCount::Act365);
+        assert_eq!(c.liquidity_stress.deposit_runoff, 0.10);
+        assert_eq!(c.deposit_decay_period_days, 30);
+        assert_eq!(DayCount::parse("ACT/360"), Some(DayCount::Act360));
+        assert_eq!(DayCount::parse("act_365"), Some(DayCount::Act365));
+
+        // ACT/360 discounts slightly more than ACT/365 at the same zero rate.
+        let points = vec![(0i64, 0.05), (365, 0.05)];
+        let act365 =
+            DiscountCurve::from_zero_rates_dc(points.clone(), DayCount::Act365).unwrap();
+        let act360 = DiscountCurve::from_zero_rates_dc(points, DayCount::Act360).unwrap();
+        assert!(act360.df(365) < act365.df(365));
+        assert_eq!(act365.day_count(), DayCount::Act365);
+        assert!((act365.zero_rate_years(1.0) - 0.05).abs() < 1e-12);
+
+        // config-built curve honours the configured day count
+        let cfg = AlmConfig {
+            day_count: DayCount::Act360,
+            ..Default::default()
+        };
+        let curve = cfg.curve(vec![(0, 0.05), (360, 0.05)]).unwrap();
+        assert_eq!(curve.day_count(), DayCount::Act360);
+
+        // deposit-decay period is configurable
+        assert_eq!(cfg.deposit_decay(0.1, 3).period_days, 30);
+        let cfg2 = AlmConfig {
+            deposit_decay_period_days: 91,
+            ..Default::default()
+        };
+        assert_eq!(cfg2.deposit_decay(0.1, 3).period_days, 91);
     }
 }

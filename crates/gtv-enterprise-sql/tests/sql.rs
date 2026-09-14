@@ -580,3 +580,67 @@ fn crm_ruleset_loader_builds_registry() {
     assert!(rs.is_wrong_way("CP1", "equity"));
     assert_eq!(rs.concentration_limit("cash"), Some(500.0));
 }
+
+#[test]
+fn alm_config_and_cells_loaders() {
+    use gtv_scenario::{AlmConfig, AlmCube, AlmFilter, CashflowType, DayCount};
+
+    let mut config = AlmConfig::default();
+    let params = batch(
+        Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("value", DataType::Utf8, false),
+        ]),
+        vec![
+            utf8(vec![
+                "day_count",
+                "deposit_runoff",
+                "deposit_decay_period_days",
+            ]),
+            utf8(vec!["act/360", "0.25", "91"]),
+        ],
+    );
+    let n = gtv_enterprise_sql::load::load_alm_config(&mut config, &[params]).unwrap();
+    assert_eq!(n, 3);
+    assert_eq!(config.day_count, DayCount::Act360);
+    assert_eq!(config.liquidity_stress.deposit_runoff, 0.25);
+    assert_eq!(config.deposit_decay_period_days, 91);
+
+    let cells = batch(
+        Schema::new(vec![
+            Field::new("scenario_id", DataType::Utf8, false),
+            Field::new("legal_entity", DataType::Utf8, false),
+            Field::new("currency", DataType::Utf8, false),
+            Field::new("product", DataType::Utf8, false),
+            Field::new("time_bucket", DataType::Int64, false),
+            Field::new("cashflow_type", DataType::Utf8, false),
+            Field::new("amount", DataType::Float64, false),
+            Field::new("repricing_date", DataType::Int64, true),
+            Field::new("assumption_version", DataType::Utf8, true),
+        ]),
+        vec![
+            utf8(vec!["base", "base"]),
+            utf8(vec!["LE1", "LE1"]),
+            utf8(vec!["HKD", "HKD"]),
+            utf8(vec!["Loan", "Loan"]),
+            i64s(vec![365, 365]),
+            utf8(vec!["principal", "interest"]),
+            f64s(vec![100.0, 5.0]),
+            Arc::new(Int64Array::from(vec![Some(90i64), None])) as Arc<dyn Array>,
+            Arc::new(StringArray::from(vec![Some("v1"), None])) as Arc<dyn Array>,
+        ],
+    );
+    let rows = gtv_enterprise_sql::load::load_alm_cells(&[cells]).unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].cashflow_type, CashflowType::Principal);
+    assert_eq!(rows[0].repricing_date, 90);
+    assert_eq!(rows[1].repricing_date, 365); // defaults to time_bucket
+    assert_eq!(rows[0].behavioural_assumption_version, "v1");
+
+    // slotting: principal by repricing date, coupon by cash-flow date
+    let cube = AlmCube::from_cells(rows);
+    let bands = gtv_scenario::standard_time_bands();
+    let cf = gtv_scenario::cube_bands(&cube, &bands, &AlmFilter::default());
+    assert_eq!(cf[2], 100.0); // 3M band (repricing 90d)
+    assert_eq!(cf[5], 5.0); // 1Y band (coupon 365d)
+}

@@ -13,10 +13,10 @@ use arrow::record_batch::RecordBatch;
 use datafusion::error::{DataFusionError, Result};
 use gtv_refdata::{EffectiveRange, HierarchyEdge, HierarchyKind, MasterKind, MasterRecord};
 use gtv_scenario::{
-    BasisSpread, BehaviouralAdjustment, Dimension, FtpCurve, FtpCurveCatalog, FtpPolicy,
-    FtpPolicyCatalog, IrrbbConfig, LiquidityPremium, NmdCaps, NmdCategory, OptionalityCharge,
-    Scenario, ScenarioKind, ScenarioStatus, Shock, ShockParams, ShockScenario, ShockTable,
-    ShockTableVersion, TimeBand,
+    AlmCell, AlmConfig, BasisSpread, BehaviouralAdjustment, CashflowType, DayCount, Dimension,
+    FtpCurve, FtpCurveCatalog, FtpPolicy, FtpPolicyCatalog, IrrbbConfig, LiquidityPremium, NmdCaps,
+    NmdCategory, OptionalityCharge, Scenario, ScenarioKind, ScenarioStatus, Shock, ShockParams,
+    ShockScenario, ShockTable, ShockTableVersion, TimeBand,
 };
 
 use crate::registry::Registry;
@@ -574,6 +574,109 @@ fn optional_f64(batch: &RecordBatch, name: &str) -> Result<Vec<f64>> {
     } else {
         Ok(vec![0.0; batch.num_rows()])
     }
+}
+
+// ---------------------------------------------------------------------------
+// ALM loaders
+// ---------------------------------------------------------------------------
+
+/// `alm_params(key, value)` — override ALM conventions and default assumptions.
+/// Recognised keys: `day_count` (`act/365` | `act/360`), `deposit_runoff`,
+/// `wholesale_outflow`, `inflow_haircut`, `deposit_decay_period_days`.
+pub fn load_alm_config(config: &mut AlmConfig, batches: &[RecordBatch]) -> Result<usize> {
+    let mut n = 0;
+    for batch in batches {
+        let keys = required_strings(batch, "key")?;
+        let values = required_strings(batch, "value")?;
+        for i in 0..keys.len() {
+            let raw = values[i].trim();
+            match keys[i].as_str() {
+                "day_count" => {
+                    config.day_count = DayCount::parse(raw).ok_or_else(|| {
+                        err(format!("load_alm_config: unknown day_count `{raw}`"))
+                    })?;
+                }
+                "deposit_runoff" => config.liquidity_stress.deposit_runoff = parse_f64(raw)?,
+                "wholesale_outflow" => {
+                    config.liquidity_stress.wholesale_outflow = parse_f64(raw)?
+                }
+                "inflow_haircut" => config.liquidity_stress.inflow_haircut = parse_f64(raw)?,
+                "deposit_decay_period_days" => {
+                    config.deposit_decay_period_days = parse_i64(raw)?
+                }
+                other => return Err(err(format!("load_alm_config: unknown key `{other}`"))),
+            }
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
+/// Load `AlmCell` rows. Required columns: `scenario_id, legal_entity, currency,
+/// product, time_bucket, cashflow_type, amount`. Optional: `as_of_date`,
+/// `discount_factor`, `repricing_date` (default `time_bucket`),
+/// `assumption_version`.
+pub fn load_alm_cells(batches: &[RecordBatch]) -> Result<Vec<AlmCell>> {
+    let mut out = Vec::new();
+    for batch in batches {
+        let scenarios = required_strings(batch, "scenario_id")?;
+        let legal = required_strings(batch, "legal_entity")?;
+        let currencies = required_strings(batch, "currency")?;
+        let products = required_strings(batch, "product")?;
+        let buckets = required_i64(batch, "time_bucket")?;
+        let types = required_strings(batch, "cashflow_type")?;
+        let amounts = f64_from(column(batch, "amount")?)?;
+        let as_of = optional_i64(batch, "as_of_date", 0)?;
+        let repricing = if has_column(batch, "repricing_date") {
+            i64_from(column(batch, "repricing_date")?)?
+        } else {
+            vec![None; batch.num_rows()]
+        };
+        let dfs = if has_column(batch, "discount_factor") {
+            Some(f64_from(column(batch, "discount_factor")?)?)
+        } else {
+            None
+        };
+        let versions = optional_strings(batch, "assumption_version")?;
+        for i in 0..batch.num_rows() {
+            let cashflow_type = CashflowType::parse(&types[i]).ok_or_else(|| {
+                err(format!(
+                    "load_alm_cells: unknown cashflow_type `{}`",
+                    types[i]
+                ))
+            })?;
+            let mut cell = AlmCell::new(
+                scenarios[i].clone(),
+                legal[i].clone(),
+                currencies[i].clone(),
+                products[i].clone(),
+                buckets[i],
+                cashflow_type,
+                amounts[i],
+            );
+            cell.as_of_date = as_of[i];
+            cell.repricing_date = repricing[i].unwrap_or(buckets[i]);
+            if let Some(dfs) = &dfs {
+                if dfs[i].is_finite() {
+                    cell.discount_factor = Some(dfs[i]);
+                }
+            }
+            cell.behavioural_assumption_version =
+                versions[i].clone().unwrap_or_default();
+            out.push(cell);
+        }
+    }
+    Ok(out)
+}
+
+fn parse_f64(raw: &str) -> Result<f64> {
+    raw.parse::<f64>()
+        .map_err(|_| err(format!("expected a number, got `{raw}`")))
+}
+
+fn parse_i64(raw: &str) -> Result<i64> {
+    raw.parse::<i64>()
+        .map_err(|_| err(format!("expected an integer, got `{raw}`")))
 }
 
 /// Load scenario versions from a flat table.

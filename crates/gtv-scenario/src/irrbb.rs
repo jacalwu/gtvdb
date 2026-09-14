@@ -716,7 +716,7 @@ pub fn tdrr_with(config: &IrrbbConfig, scenario: ShockScenario, baseline_tdrr: f
 
 /// Convenience: the current risk-free zero rate from a [`DiscountCurve`].
 pub fn curve_zero(curve: &DiscountCurve) -> impl Fn(f64) -> f64 + '_ {
-    move |t_years: f64| curve.zero_rate((t_years * 365.0).round() as i64)
+    move |t_years: f64| curve.zero_rate_years(t_years)
 }
 
 // ---------------------------------------------------------------------------
@@ -1277,7 +1277,7 @@ pub fn shift_curve(
         .points()
         .iter()
         .map(|(days, rate)| {
-            let t = *days as f64 / 365.0;
+            let t = *days as f64 / base.day_count().days_per_year();
             (*days, post_shock_rate(*rate, scenario, params, t, floor))
         })
         .collect();
@@ -1295,7 +1295,7 @@ pub fn shift_curve_with(
         .points()
         .iter()
         .map(|(days, rate)| {
-            let t = *days as f64 / 365.0;
+            let t = *days as f64 / base.day_count().days_per_year();
             (*days, post_shock_rate_with(config, *rate, scenario, params, t))
         })
         .collect();

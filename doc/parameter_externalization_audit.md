@@ -16,7 +16,7 @@
 
 | 模組 | 參數外部化程度 | 主要問題 |
 |---|---|---|
-| ALM 現金流（`alm.rs`） | 🟡 | 壓力 / decay 內建 default、day-count 寫死、無 table loader |
+| ALM 現金流（`alm.rs`） | ✅ | `AlmConfig`（day-count / stress / decay）+ `load_alm_config` / `load_alm_cells` |
 | IRRBB（`irrbb.rs`） | ✅ | `IrrbbConfig` + `ShockTable::from_params` + `load_irrbb_*` |
 | FTP（`ftp.rs`） | ✅ | curve / policy data + `load_ftp_curves` / `load_ftp_policies` |
 | CRM 治理（`gtv-governance`） | ✅ | `RuleSet` data + `load_crm_rulesets` |
@@ -32,12 +32,12 @@
 
 | 參數 | 位置 | 狀態 | 建議 |
 |---|---|---|---|
-| `LiquidityStress` default：`deposit_runoff=0.10`、`wholesale_outflow=0.0`、`inflow_haircut=0.0` | `impl Default` L485–491 | 🟡 值可傳入，default 寫死 | 改由 `alm_stress_params` table 提供 |
-| `DepositDecay::from_monthly_runoff` `period_days=30` | L522–529 | 🟡 | `deposit_decay_params` table |
-| `DiscountCurve` day-count `ACT/365`（`/365.0`、`×365.0`） | L470、L442 | 🟡 | `day_count` 參數化（ACT/365、ACT/360、30/360） |
-| `PrepaymentModel` smm / shift | L532+ | ✅ 由 caller 傳入 | 加 default 表 |
+| `LiquidityStress` default：`deposit_runoff=0.10`、`wholesale_outflow=0.0`、`inflow_haircut=0.0` | `AlmConfig::default` | ✅ `AlmConfig::liquidity_stress` + `load_alm_config` | — |
+| `DepositDecay` `period_days=30` | `AlmConfig::deposit_decay_period_days` | ✅ `from_monthly_runoff_with` + `AlmConfig::deposit_decay` | — |
+| `DiscountCurve` day-count `ACT/365` | `DayCount` | ✅ `DayCount{Act365,Act360}` + `from_zero_rates_dc` | — |
+| `PrepaymentModel` smm / shift | — | ✅ 由 caller 傳入 | 可加 default（未做） |
 | `AlmCell` / `AlmCube` 全部數值 | — | ✅ 由資料提供 | — |
-| ALM table loader | — | ❌ 冇 | 新增 `load_alm_cells` / `load_alm_params` |
+| ALM table loader | — | ✅ `load_alm_config` / `load_alm_cells` | — |
 
 ### 2.2 IRRBB（`crates/gtv-scenario/src/irrbb.rs`）
 
@@ -182,8 +182,16 @@ crm_inputs_*(...)                              # exposures / collateral / guaran
   wrong-way / concentration 五張表；`eligible` 接受 true/1/yes；`currencies` /
   `jurisdictions` 逗號分隔），寫入 `gtv_governance::RuleRegistry`（版本 + effective dating）。
 
-**仍未做**：P2（ALM 參數表 + day-count）、P3（CLI / SQL surface，例如 `irrbb_eve`
-/ `ftp_price` / `crm_alloc_v2`）。
+**仍未做**：P3（CLI / SQL surface，例如 `irrbb_eve` / `ftp_price` / `crm_alloc_v2`）。
+
+**P2 已完成**：
+- **ALM 參數外部化**：`gtv_scenario::alm::{AlmConfig, DayCount}`（day-count ACT/365、
+  ACT/360；`LiquidityStress` default；deposit-decay period），`DiscountCurve::from_zero_rates_dc`
+  / `zero_rate_years` / `day_count`，`AlmConfig::{curve, deposit_decay}`。
+- **ALM loader**：`load_alm_config`（`alm_params(key, value)`）、`load_alm_cells`
+  （cube 行：scenario / legal_entity / currency / product / time_bucket /
+  cashflow_type / amount / as_of_date / discount_factor / repricing_date /
+  assumption_version）。
 
 ---
 

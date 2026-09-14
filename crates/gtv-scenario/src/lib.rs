@@ -17,8 +17,8 @@ pub mod irrbb;
 pub mod scenario;
 
 pub use alm::{
-    AlmCell, AlmCube, AlmError, AlmFilter, CashflowType, DepositDecay, DiscountCurve, FxTable,
-    LiquidityStress, PrepaymentModel,
+    AlmCell, AlmConfig, AlmCube, AlmError, AlmFilter, CashflowType, DayCount, DepositDecay,
+    DiscountCurve, FxTable, LiquidityStress, PrepaymentModel,
 };
 pub use catalog::ScenarioCatalog;
 pub use ftp::{
