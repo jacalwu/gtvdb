@@ -11,6 +11,10 @@ use arrow::compute::cast;
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 use datafusion::error::{DataFusionError, Result};
+use gtv_governance::{
+    CollateralPledge, Exposure, GovernedCollateral, GovernedGuarantor, GovernedInputs,
+    GuaranteePledge,
+};
 use gtv_refdata::{EffectiveRange, HierarchyEdge, HierarchyKind, MasterKind, MasterRecord};
 use gtv_scenario::{
     AlmCell, AlmConfig, BasisSpread, BehaviouralAdjustment, CashflowType, DayCount, Dimension,
@@ -444,7 +448,6 @@ pub fn load_crm_rulesets(
     guarantees: &[RecordBatch],
     wrong_way: &[RecordBatch],
     concentration: &[RecordBatch],
-    as_of: i64,
 ) -> Result<usize> {
     use gtv_governance::{CollateralRule, ConcentrationLimit, GuaranteeRule, RuleSet, WrongWayRisk};
     type Key = (String, u32);
@@ -562,9 +565,114 @@ pub fn load_crm_rulesets(
         rule.guarantees = guar.remove(&key).unwrap_or_default();
         rule.wrong_way = ww.remove(&key).unwrap_or_default();
         rule.concentration = conc.remove(&key).unwrap_or_default();
-        registry.register(rule, as_of).map_err(err)?;
+        // Validate against the rule set's own effective start (always inside
+        // its range), so rule sets effective in the future can still be loaded.
+        registry.register(rule, from).map_err(err)?;
     }
     Ok(n)
+}
+
+/// Load [`GovernedInputs`] (exposures, collateral, guarantors and pledges):
+///
+/// * exposures: `loan_id, counterparty, exposure, currency` + optional
+///   `priority, maturity_days, netting_set`
+/// * collateral: `col_id, collateral_type, value, currency` + optional
+///   `maturity_days`
+/// * guarantors: `guarantor_id, guarantor_type, capacity, jurisdiction`
+/// * collateral pledges: `col_id, loan_id` + optional `ratio` (default 1.0)
+/// * guarantee pledges: `guarantor_id, loan_id` + optional `amount` (default 0)
+pub fn load_governed_inputs(
+    exposures: &[RecordBatch],
+    collateral: &[RecordBatch],
+    guarantors: &[RecordBatch],
+    collateral_pledges: &[RecordBatch],
+    guarantee_pledges: &[RecordBatch],
+) -> Result<GovernedInputs> {
+    let mut out = GovernedInputs::new();
+    for batch in exposures {
+        let ids = required_i64(batch, "loan_id")?;
+        let counterparties = required_strings(batch, "counterparty")?;
+        let exposure = f64_from(column(batch, "exposure")?)?;
+        let currencies = required_strings(batch, "currency")?;
+        let priorities = optional_f64(batch, "priority")?;
+        let maturities = optional_i64(batch, "maturity_days", 0)?;
+        let netting = optional_strings(batch, "netting_set")?;
+        for i in 0..ids.len() {
+            let mut e = Exposure::new(
+                ids[i] as u64,
+                counterparties[i].clone(),
+                exposure[i],
+                currencies[i].clone(),
+            )
+            .with_priority(priorities[i])
+            .with_maturity(maturities[i]);
+            if let Some(ns) = &netting[i] {
+                e = e.with_netting_set(ns.clone());
+            }
+            out.exposures.push(e);
+        }
+    }
+    for batch in collateral {
+        let ids = required_i64(batch, "col_id")?;
+        let types = required_strings(batch, "collateral_type")?;
+        let value = f64_from(column(batch, "value")?)?;
+        let currencies = required_strings(batch, "currency")?;
+        let maturities = optional_i64(batch, "maturity_days", 0)?;
+        for i in 0..ids.len() {
+            out.collaterals.push(
+                GovernedCollateral::new(
+                    ids[i] as u64,
+                    types[i].clone(),
+                    value[i],
+                    currencies[i].clone(),
+                )
+                .with_maturity(maturities[i]),
+            );
+        }
+    }
+    for batch in guarantors {
+        let ids = required_i64(batch, "guarantor_id")?;
+        let types = required_strings(batch, "guarantor_type")?;
+        let capacity = f64_from(column(batch, "capacity")?)?;
+        let jurisdictions = required_strings(batch, "jurisdiction")?;
+        for i in 0..ids.len() {
+            out.guarantors.push(GovernedGuarantor::new(
+                ids[i] as u64,
+                types[i].clone(),
+                capacity[i],
+                jurisdictions[i].clone(),
+            ));
+        }
+    }
+    for batch in collateral_pledges {
+        let cols = required_i64(batch, "col_id")?;
+        let loans = required_i64(batch, "loan_id")?;
+        let ratios = if has_column(batch, "ratio") {
+            f64_from(column(batch, "ratio")?)?
+        } else {
+            vec![1.0; batch.num_rows()]
+        };
+        for i in 0..cols.len() {
+            out.collateral_pledges.push(CollateralPledge {
+                col_id: cols[i] as u64,
+                loan_id: loans[i] as u64,
+                ratio: ratios[i],
+            });
+        }
+    }
+    for batch in guarantee_pledges {
+        let guars = required_i64(batch, "guarantor_id")?;
+        let loans = required_i64(batch, "loan_id")?;
+        let amounts = optional_f64(batch, "amount")?;
+        for i in 0..guars.len() {
+            out.guarantee_pledges.push(GuaranteePledge {
+                guarantor_id: guars[i] as u64,
+                loan_id: loans[i] as u64,
+                amount: amounts[i],
+            });
+        }
+    }
+    Ok(out)
 }
 
 /// Optional `Float64` column as `Vec<f64>` defaulting to `0.0`.

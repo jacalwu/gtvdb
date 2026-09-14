@@ -2,7 +2,9 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, Float64Array, Int64Array, StringArray, UInt32Array};
+use arrow::array::{
+    Array, ArrayRef, Float64Array, Int64Array, StringArray, UInt32Array, UInt64Array,
+};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use datafusion::catalog::{TableFunctionArgs, TableFunctionImpl};
@@ -13,6 +15,7 @@ use datafusion::logical_expr::{
 };
 use datafusion::scalar::ScalarValue;
 use gtv_refdata::{HierarchyKind, MasterKind};
+use gtv_governance::AllocationMethod;
 use gtv_scenario::{AlmFilter, FtpEngine, FtpRequest, Regulator};
 
 use crate::registry::Registry;
@@ -655,6 +658,196 @@ impl TableFunctionImpl for FtpPriceTableFunction {
                 Arc::new(Float64Array::from(vec![b.behavioural_adjustment])) as ArrayRef,
                 Arc::new(Float64Array::from(vec![b.total_rate])) as ArrayRef,
                 strings(&[chain]),
+            ],
+        )?;
+        Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// crm_alloc_v2 / crm_explain_v2 (governed CRM)
+// ---------------------------------------------------------------------------
+
+fn resolve_rules(
+    registry: &Registry,
+    ruleset_id: &str,
+    version: i64,
+    as_of: i64,
+    what: &str,
+) -> Result<(gtv_governance::RuleSet, gtv_governance::GovernedInputs)> {
+    let reg = registry.read().map_err(|_| poisoned(what))?;
+    let rules = if version > 0 {
+        reg.crm_rules.get(ruleset_id, version as u32).cloned()
+    } else {
+        reg.crm_rules.resolve_as_of(ruleset_id, as_of).ok().cloned()
+    };
+    let rules = rules.ok_or_else(|| {
+        DataFusionError::Execution(format!(
+            "{what}: rule set `{ruleset_id}` v{version} not found (run `crm_rules_load ...`)"
+        ))
+    })?;
+    Ok((rules, reg.governed.clone()))
+}
+
+fn parse_method(exprs: &[datafusion::logical_expr::Expr], usage: &str) -> Result<AllocationMethod> {
+    match exprs.get(3) {
+        Some(e) => match literal_string(e)?.to_ascii_lowercase().as_str() {
+            "greedy" => Ok(AllocationMethod::Greedy),
+            "lp" => Ok(AllocationMethod::Lp),
+            other => Err(DataFusionError::Execution(format!(
+                "{usage}: unknown method `{other}`"
+            ))),
+        },
+        None => Ok(AllocationMethod::Greedy),
+    }
+}
+
+/// `crm_alloc_v2(ruleset_id, version, as_of [, method])` — governed CRM
+/// allocation (`greedy` | `lp`) over the loaded `GovernedInputs`.
+#[derive(Debug)]
+pub struct CrmAllocV2TableFunction {
+    registry: Registry,
+}
+
+impl CrmAllocV2TableFunction {
+    pub fn new(registry: Registry) -> Self {
+        Self { registry }
+    }
+
+    fn schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("loan_id", DataType::UInt64, false),
+            Field::new("exposure", DataType::Float64, false),
+            Field::new("collateral_cover", DataType::Float64, false),
+            Field::new("guarantee_cover", DataType::Float64, false),
+            Field::new("net_exposure", DataType::Float64, false),
+        ]))
+    }
+}
+
+impl TableFunctionImpl for CrmAllocV2TableFunction {
+    fn call_with_args(&self, args: TableFunctionArgs) -> Result<Arc<dyn TableProvider>> {
+        let usage = "crm_alloc_v2(ruleset_id, version, as_of [, method])";
+        let exprs = args.exprs();
+        let ruleset_id = literal_string(exprs.first().ok_or_else(|| {
+            DataFusionError::Execution(format!("{usage}: missing `ruleset_id`"))
+        })?)?;
+        let version = literal_i64(exprs.get(1).ok_or_else(|| {
+            DataFusionError::Execution(format!("{usage}: missing `version`"))
+        })?)?;
+        let as_of = literal_i64(exprs.get(2).ok_or_else(|| {
+            DataFusionError::Execution(format!("{usage}: missing `as_of`"))
+        })?)?;
+        let method = parse_method(exprs, usage)?;
+
+        let (rules, governed) =
+            resolve_rules(&self.registry, &ruleset_id, version, as_of, "crm_alloc_v2")?;
+        let result = governed
+            .allocate(method, &rules, as_of)
+            .map_err(|e| DataFusionError::Execution(format!("crm_alloc_v2: {e}")))?;
+
+        let r = &result.result;
+        let schema = Self::schema();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(r.loan_id.clone())) as ArrayRef,
+                Arc::new(Float64Array::from(r.exposure.clone())) as ArrayRef,
+                Arc::new(Float64Array::from(r.collateral_cover.clone())) as ArrayRef,
+                Arc::new(Float64Array::from(r.guarantee_cover.clone())) as ArrayRef,
+                Arc::new(Float64Array::from(r.net_exposure.clone())) as ArrayRef,
+            ],
+        )?;
+        Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
+    }
+}
+
+/// `crm_explain_v2(ruleset_id, version, as_of [, method])` — the governed
+/// allocation audit: one row per allocation / exclusion / concentration breach.
+#[derive(Debug)]
+pub struct CrmExplainV2TableFunction {
+    registry: Registry,
+}
+
+impl CrmExplainV2TableFunction {
+    pub fn new(registry: Registry) -> Self {
+        Self { registry }
+    }
+
+    fn schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("note_kind", DataType::Utf8, false),
+            Field::new("source_kind", DataType::Utf8, false),
+            Field::new("source_id", DataType::Int64, false),
+            Field::new("loan_id", DataType::Int64, false),
+            Field::new("amount", DataType::Float64, false),
+            Field::new("detail", DataType::Utf8, false),
+        ]))
+    }
+}
+
+impl TableFunctionImpl for CrmExplainV2TableFunction {
+    fn call_with_args(&self, args: TableFunctionArgs) -> Result<Arc<dyn TableProvider>> {
+        let usage = "crm_explain_v2(ruleset_id, version, as_of [, method])";
+        let exprs = args.exprs();
+        let ruleset_id = literal_string(exprs.first().ok_or_else(|| {
+            DataFusionError::Execution(format!("{usage}: missing `ruleset_id`"))
+        })?)?;
+        let version = literal_i64(exprs.get(1).ok_or_else(|| {
+            DataFusionError::Execution(format!("{usage}: missing `version`"))
+        })?)?;
+        let as_of = literal_i64(exprs.get(2).ok_or_else(|| {
+            DataFusionError::Execution(format!("{usage}: missing `as_of`"))
+        })?)?;
+        let method = parse_method(exprs, usage)?;
+
+        let (rules, governed) =
+            resolve_rules(&self.registry, &ruleset_id, version, as_of, "crm_explain_v2")?;
+        let result = governed
+            .allocate(method, &rules, as_of)
+            .map_err(|e| DataFusionError::Execution(format!("crm_explain_v2: {e}")))?;
+
+        let mut note_kind = Vec::new();
+        let mut source_kind = Vec::new();
+        let mut source_id = Vec::new();
+        let mut loan_id = Vec::new();
+        let mut amount = Vec::new();
+        let mut detail = Vec::new();
+        for a in &result.result.allocations {
+            note_kind.push("allocation".to_string());
+            source_kind.push(format!("{:?}", a.source_kind).to_ascii_lowercase());
+            source_id.push(a.source_id as i64);
+            loan_id.push(a.loan_id as i64);
+            amount.push(a.amount);
+            detail.push(format!("stage={:?}", a.stage).to_ascii_lowercase());
+        }
+        for e in &result.exclusions {
+            note_kind.push("exclusion".to_string());
+            source_kind.push("collateral".to_string());
+            source_id.push(-1);
+            loan_id.push(-1);
+            amount.push(0.0);
+            detail.push(format!("{e:?}"));
+        }
+        for b in &result.concentration_breaches {
+            note_kind.push("breach".to_string());
+            source_kind.push("collateral".to_string());
+            source_id.push(-1);
+            loan_id.push(-1);
+            amount.push(b.allowed);
+            detail.push(format!("{} requested {:.6}", b.collateral_type, b.requested));
+        }
+
+        let schema = Self::schema();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                strings(&note_kind),
+                strings(&source_kind),
+                Arc::new(Int64Array::from(source_id)) as ArrayRef,
+                Arc::new(Int64Array::from(loan_id)) as ArrayRef,
+                Arc::new(Float64Array::from(amount)) as ArrayRef,
+                strings(&detail),
             ],
         )?;
         Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))

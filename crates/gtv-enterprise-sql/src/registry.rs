@@ -2,7 +2,7 @@
 
 use std::sync::{Arc, RwLock};
 
-use gtv_governance::RuleRegistry;
+use gtv_governance::{GovernedInputs, RuleRegistry};
 use gtv_refdata::{Hierarchy, MasterData, ReferenceData};
 use gtv_scenario::{
     AlmCube, DiscountCurve, FtpCurveCatalog, FtpPolicyCatalog, IrrbbConfig, ScenarioCatalog,
@@ -29,6 +29,7 @@ pub struct EnterpriseRegistry {
     pub ftp_policies: FtpPolicyCatalog,
     // --- CRM governance ---
     pub crm_rules: RuleRegistry,
+    pub governed: GovernedInputs,
 }
 
 impl Default for EnterpriseRegistry {
@@ -45,6 +46,7 @@ impl Default for EnterpriseRegistry {
             ftp_curves: FtpCurveCatalog::new(),
             ftp_policies: FtpPolicyCatalog::new(),
             crm_rules: RuleRegistry::new(),
+            governed: GovernedInputs::new(),
         }
     }
 }

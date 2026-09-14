@@ -565,7 +565,6 @@ fn crm_ruleset_loader_builds_registry() {
         &[guarantees],
         &[wrong_way],
         &[concentration],
-        0,
     )
     .unwrap();
     assert_eq!(n, 1);
@@ -728,4 +727,134 @@ async fn irrbb_eve_and_ftp_price_sql_surfaces() {
         .map(|e| e.to_string())
         .unwrap_or_default();
     assert!(err.contains("unknown regulator"), "got: {err}");
+}
+
+#[tokio::test]
+async fn governed_crm_sql_surface() {
+    use gtv_governance::{
+        CollateralPledge, CollateralRule, Exposure, GovernedCollateral, GovernedInputs, RuleSet,
+    };
+    use gtv_refdata::EffectiveRange;
+
+    let registry = EnterpriseRegistry::handle();
+    {
+        let mut reg = registry.write().unwrap();
+        let rules = RuleSet::new("crm", 1, EffectiveRange::from_now_on(0))
+            .with_collateral(vec![CollateralRule::new("cash", 10.0, 0.05)]);
+        reg.crm_rules.register(rules, 0).unwrap();
+        let mut g = GovernedInputs::new();
+        g.exposures.push(Exposure::new(1, "CP1", 100.0, "USD"));
+        g.collaterals
+            .push(GovernedCollateral::new(10, "cash", 100.0, "USD"));
+        g.collateral_pledges.push(CollateralPledge {
+            col_id: 10,
+            loan_id: 1,
+            ratio: 1.0,
+        });
+        reg.governed = g;
+    }
+    let ctx = SessionContext::new();
+    gtv_enterprise_sql::register(&ctx, registry).unwrap();
+
+    let r = ctx
+        .sql("SELECT loan_id, exposure, collateral_cover, net_exposure FROM crm_alloc_v2('crm',1,0)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(f64_col(&r, 1)[0], 100.0);
+    assert_eq!(f64_col(&r, 2)[0], 95.0); // 100 * (1 - 0.05 haircut)
+    assert_eq!(f64_col(&r, 3)[0], 5.0);
+
+    let ex = ctx
+        .sql("SELECT note_kind FROM crm_explain_v2('crm',1,0)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(string_col(&ex, 0), vec!["allocation"]);
+
+    // an unknown rule set is rejected
+    let err = async {
+        let df = ctx.sql("SELECT * FROM crm_alloc_v2('ghost',1,0)").await?;
+        df.collect().await
+    }
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("not found"), "got: {err}");
+}
+
+#[test]
+fn governed_inputs_loader() {
+    let exposures = batch(
+        Schema::new(vec![
+            Field::new("loan_id", DataType::Int64, false),
+            Field::new("counterparty", DataType::Utf8, false),
+            Field::new("exposure", DataType::Float64, false),
+            Field::new("currency", DataType::Utf8, false),
+            Field::new("priority", DataType::Float64, true),
+        ]),
+        vec![
+            i64s(vec![1]),
+            utf8(vec!["CP1"]),
+            f64s(vec![100.0]),
+            utf8(vec!["USD"]),
+            Arc::new(Float64Array::from(vec![Some(2.0)])) as Arc<dyn Array>,
+        ],
+    );
+    let collateral = batch(
+        Schema::new(vec![
+            Field::new("col_id", DataType::Int64, false),
+            Field::new("collateral_type", DataType::Utf8, false),
+            Field::new("value", DataType::Float64, false),
+            Field::new("currency", DataType::Utf8, false),
+        ]),
+        vec![i64s(vec![10]), utf8(vec!["cash"]), f64s(vec![100.0]), utf8(vec!["USD"])],
+    );
+    let guarantors = batch(
+        Schema::new(vec![
+            Field::new("guarantor_id", DataType::Int64, false),
+            Field::new("guarantor_type", DataType::Utf8, false),
+            Field::new("capacity", DataType::Float64, false),
+            Field::new("jurisdiction", DataType::Utf8, false),
+        ]),
+        vec![i64s(vec![20]), utf8(vec!["bank"]), f64s(vec![50.0]), utf8(vec!["HK"])],
+    );
+    let coll_pledges = batch(
+        Schema::new(vec![
+            Field::new("col_id", DataType::Int64, false),
+            Field::new("loan_id", DataType::Int64, false),
+        ]),
+        vec![i64s(vec![10]), i64s(vec![1])],
+    );
+    let guar_pledges = batch(
+        Schema::new(vec![
+            Field::new("guarantor_id", DataType::Int64, false),
+            Field::new("loan_id", DataType::Int64, false),
+            Field::new("amount", DataType::Float64, true),
+        ]),
+        vec![
+            i64s(vec![20]),
+            i64s(vec![1]),
+            Arc::new(Float64Array::from(vec![Some(40.0)])) as Arc<dyn Array>,
+        ],
+    );
+
+    let g = gtv_enterprise_sql::load::load_governed_inputs(
+        &[exposures],
+        &[collateral],
+        &[guarantors],
+        &[coll_pledges],
+        &[guar_pledges],
+    )
+    .unwrap();
+    assert_eq!(g.exposures.len(), 1);
+    assert_eq!(g.exposures[0].priority, 2.0);
+    assert_eq!(g.collaterals[0].col_id, 10);
+    assert_eq!(g.guarantors[0].capacity, 50.0);
+    assert_eq!(g.collateral_pledges[0].ratio, 1.0); // default when `ratio` absent
+    assert_eq!(g.guarantee_pledges[0].amount, 40.0);
 }

@@ -362,6 +362,8 @@ irrbb_bands_load <table>                 # 時間帶（label, start_years, end_y
 irrbb_shocks_load <table> [recalibrated|current]  # shock 表 override
 ftp_curves_load <table>                  # FTP curve 點（curve_id, version, …, tenor_days, zero_rate）
 ftp_policy_load <h> <liq> <basis> <opt> <beh>  # FTP policy（header + 四張組件表）
+crm_rules_load <h> <collateral> <guarantees> <wrongway> <concentration>  # 治理規則集
+crm_governed_load <exp> <coll> <guar> <coll_pledges> <guar_pledges>      # governed 輸入
 ```
 
 行情/趨勢分析函數（provider 只是第一個參數，見 §7）：
@@ -392,6 +394,8 @@ master_get(kind, id, as_of)                    # master 屬性（每 attribute �
 crm_rating_map()                               # CRM 評級 / 類型對照表（map_name, key, value）
 irrbb_eve(currency [, regulator] [, year])     # 六大標準化 EVE 情景 ΔE（max = 風險值）
 ftp_price(curve_id, cv, policy_id, pv, product, ccy, value_date, maturity_date [, booking_date])  # FTP 定價
+crm_alloc_v2(ruleset_id, version, as_of [, method])   # governed CRM 分配（greedy | lp）
+crm_explain_v2(ruleset_id, version, as_of [, method]) # 分配 / 排除 / 集中度審計
 metrics                                        # 引擎計數器
 ```
 

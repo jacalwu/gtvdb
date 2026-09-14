@@ -2221,6 +2221,57 @@ async fn run(
             drop(reg);
             println!("loaded {n} FTP policy/policies (query via ftp_price(...))");
         }
+        "crm_rules_load" => {
+            let usage = "crm_rules_load <header> <collateral> <guarantees> <wrongway> <concentration>";
+            let header = require_arg(&tokens, 1, usage)?;
+            let collateral = require_arg(&tokens, 2, usage)?;
+            let guarantees = require_arg(&tokens, 3, usage)?;
+            let wrongway = require_arg(&tokens, 4, usage)?;
+            let concentration = require_arg(&tokens, 5, usage)?;
+            let hb = ctx.sql(&format!("SELECT * FROM {header}")).await?;
+            let cb = ctx.sql(&format!("SELECT * FROM {collateral}")).await?;
+            let gb = ctx.sql(&format!("SELECT * FROM {guarantees}")).await?;
+            let wb = ctx.sql(&format!("SELECT * FROM {wrongway}")).await?;
+            let kb = ctx.sql(&format!("SELECT * FROM {concentration}")).await?;
+            let mut reg = enterprise
+                .write()
+                .map_err(|_| anyhow!("enterprise registry poisoned"))?;
+            let n = gtv_enterprise_sql::load::load_crm_rulesets(
+                &mut reg.crm_rules,
+                &hb,
+                &cb,
+                &gb,
+                &wb,
+                &kb,
+            )
+            .map_err(|e| anyhow!("{e}"))?;
+            drop(reg);
+            println!("loaded {n} governed CRM rule set(s) from `{header}` (query via crm_alloc_v2)");
+        }
+        "crm_governed_load" => {
+            let usage =
+                "crm_governed_load <exposures> <collateral> <guarantors> <coll_pledges> <guar_pledges>";
+            let exposures = require_arg(&tokens, 1, usage)?;
+            let collateral = require_arg(&tokens, 2, usage)?;
+            let guarantors = require_arg(&tokens, 3, usage)?;
+            let coll_pledges = require_arg(&tokens, 4, usage)?;
+            let guar_pledges = require_arg(&tokens, 5, usage)?;
+            let eb = ctx.sql(&format!("SELECT * FROM {exposures}")).await?;
+            let cb = ctx.sql(&format!("SELECT * FROM {collateral}")).await?;
+            let gb = ctx.sql(&format!("SELECT * FROM {guarantors}")).await?;
+            let cpb = ctx.sql(&format!("SELECT * FROM {coll_pledges}")).await?;
+            let gpb = ctx.sql(&format!("SELECT * FROM {guar_pledges}")).await?;
+            let governed =
+                gtv_enterprise_sql::load::load_governed_inputs(&eb, &cb, &gb, &cpb, &gpb)
+                    .map_err(|e| anyhow!("{e}"))?;
+            let n = governed.exposures.len();
+            let mut reg = enterprise
+                .write()
+                .map_err(|_| anyhow!("enterprise registry poisoned"))?;
+            reg.governed = governed;
+            drop(reg);
+            println!("loaded {n} governed CRM exposure(s) (query via crm_alloc_v2)");
+        }
         "workload" => {
             let out = ctx
                 .sql(
@@ -2708,6 +2759,8 @@ fn print_help() {
          \x20 irrbb_shocks_load <t> [recalibrated|current]  shock-table override\n\
          \x20 ftp_curves_load <t>  load FTP curves; ftp_price(...) prices them\n\
          \x20 ftp_policy_load <headers> <liquidity> <basis> <optionality> <behavioural>\n\
+         \x20 crm_rules_load <header> <collateral> <guarantees> <wrongway> <concentration>\n\
+         \x20 crm_governed_load <exposures> <collateral> <guarantors> <pledges> <g_pledges>\n\
          \x20 drop table <name>     drop a table from memory [+ persisted catalog]\n\
          \x20 remote <host:port> <sql>  execute SQL on a remote gtv-server\n\
          \x20 workload              workload admission / isolation status (per class)\n\

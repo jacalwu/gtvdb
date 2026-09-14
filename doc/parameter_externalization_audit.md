@@ -22,7 +22,7 @@
 | CRM 治理（`gtv-governance`） | ✅ | `RuleSet` data + `load_crm_rulesets` |
 | CRM kernel（`gtv-array` + `gtv-engine/crm.rs`） | ✅ | `CrmRatingMaps` + `load_rating_maps` + `crm_rating_map()` |
 | AML case（`gtv-governance/aml.rs`） | 🟡 | `HybridWeights::default` 寫死 |
-| CLI / SQL surface | 🟡 | IRRBB `irrbb_eve` + FTP `ftp_price` + 配置 load 命令已上；governed CRM `crm_alloc_v2` 未接 |
+| CLI / SQL surface | ✅ | `irrbb_eve` / `ftp_price` / `crm_alloc_v2` / `crm_explain_v2` + 配置 load 命令 |
 
 ---
 
@@ -191,8 +191,15 @@ crm_inputs_*(...)                              # exposures / collateral / guaran
   `ftp_curves_load`、`ftp_policy_load`。
 - 已以 REPL + 整合測試驗證。
 
-**仍未做**：governed CRM `crm_alloc_v2`（需將 `GovernedInputs` /
-`crm_rules_load` 接上 SQL surface）。
+**P3b 已完成（governed CRM）**：
+- Loader `load_governed_inputs`（exposures / collateral / guarantors / pledges）。
+- SQL `crm_alloc_v2(ruleset_id, version, as_of [, method])`（per-loan
+  collateral / guarantee cover / net exposure）、`crm_explain_v2(...)`（allocation /
+  exclusion / concentration-breach 審計）。
+- CLI `crm_rules_load`、`crm_governed_load`。
+- 已以 REPL + 整合測試驗證（100 曝光、cash 100 × (1−5%) = 95 覆蓋、net 5）。
+
+**仍未做**：無。
 
 **P2 已完成**：
 - **ALM 參數外部化**：`gtv_scenario::alm::{AlmConfig, DayCount}`（day-count ACT/365、

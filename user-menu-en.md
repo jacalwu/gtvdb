@@ -367,6 +367,8 @@ irrbb_bands_load <table>                 # time bands (label, start_years, end_y
 irrbb_shocks_load <table> [recalibrated|current]  # shock-table override
 ftp_curves_load <table>                  # FTP curve points
 ftp_policy_load <h> <liq> <basis> <opt> <beh>  # FTP policy (header + 4 component tables)
+crm_rules_load <h> <collateral> <guarantees> <wrongway> <concentration>  # governed rules
+crm_governed_load <exp> <coll> <guar> <coll_pledges> <guar_pledges>      # governed inputs
 ```
 
 Market/trend functions (provider is just the first argument, see §7):
@@ -398,6 +400,8 @@ master_get(kind, id, as_of)          # master attributes (one row each)
 crm_rating_map()                     # CRM rating / type maps (map_name, key, value)
 irrbb_eve(currency [, regulator] [, year])   # six standardised EVE scenarios (max = risk measure)
 ftp_price(curve_id, cv, policy_id, pv, product, ccy, value_date, maturity_date [, booking_date])
+crm_alloc_v2(ruleset_id, version, as_of [, method])   # governed CRM allocation (greedy | lp)
+crm_explain_v2(ruleset_id, version, as_of [, method]) # allocation / exclusion / breach audit
 metrics                              # engine counters (see above)
 ```
 
