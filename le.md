@@ -95,7 +95,9 @@
 CREATE TABLE le_entity (
   entity_id        STRING,
   entity_type      STRING,   -- bank, corporate, sovereign, FI, SPV, individual
-  economic_sector  STRING,   -- banks | NBFIs | others（Part II col 13）
+  economic_sector  STRING,   -- banks | NBFIs | others（Part II col 13；可選 le_sector_map 自動對映）
+  consolidation_scope STRING,-- combined | consolidated | both（報表基礎）
+  is_g_sib         BOOL,     -- G-SIB 15% overlay 適用
   country_code     STRING,
   rating_provider  STRING,
   rating_grade     STRING,
@@ -186,6 +188,13 @@ CREATE TABLE le_config (
   value            STRING,   -- 解析為 f64 / bool / string / i64
   effective_from   BIGINT, effective_to BIGINT,
   PRIMARY KEY (scope, key, effective_from)
+);
+
+-- 可選：曝險類別 → 經濟行業對映（方便自動化；空則用 entity.economic_sector）
+CREATE TABLE le_sector_map (
+  exposure_class   STRING,   -- BCR STC/IRB 曝險類別
+  economic_sector  STRING,   -- banks | NBFIs | others
+  PRIMARY KEY (exposure_class)
 );
 
 -- OBS credit conversion factors（可配置）
@@ -471,16 +480,20 @@ le_exposure_scn(group_id, as_of, scenario_id)
 
 ---
 
-## 10. 待決策 / 開放問題
+## 10. 待決策 / 開放問題（已全部定案）
 
-1. **Derivative 曝險**：第一版接受 caller 提供 `default_risk`，定要實作 SA-CCR？
-2. **報表基礎**：`combined` + `consolidated` 兩份一齊做，定先做一種？
-3. ~~G-SIB 15% overlay：而家 encode 定留 config？~~ → **已決：可配置**
-   （`le_config.g_sib_limit`，default `0.15`；只喺 entity 標記為 `g_sib=true` 且對手亦
-   為 G-SIB 時以較嚴者為準）。
-4. **限額集合**：除 25% 外，要唔要 encode BELR 其他限額（例如對 connected parties of
-   directors / 特定資產）？
-5. **經濟行業分類**：第一版用 `le_entity.economic_sector`，定要連 BCR STC/IRB 曝險類別？
+1. **Derivative 曝險** → **第一版接受 caller 提供 `default_risk`**；加 pluggable
+   `DerivativeMeasure` strategy（`le_config.derivative_measure = provided | sa_ccr`），
+   **SA-CCR 列 LE-6**（資本引擎通常已計，唔阻進度）。
+2. ~~報表基礎：combined + consolidated 一齊做，定先做一種？~~ → **兩者一齊**，以
+   `le_entity.consolidation_scope` 範圍過濾；所有聚合／報表 API 收 `basis` 參數。
+3. ~~G-SIB 15% overlay：而家 encode 定留 config？~~ → **可配置**
+   （`le_config.g_sib_limit`，default `0.15`；只喺 AI 與對手皆為 G-SIB 時適用）。
+4. ~~限額集合：除 25% 外要唔要 encode 其他 BELR 限額？~~ → **通用 data-driven 限額
+   引擎**：出廠預設核心（25% / G-SIB 15% / connected party / intragroup）；其餘（directors
+   connected、特定資產、sector/country/internal）由 `le_limit_set` 加行，**唔改 code**。
+5. ~~經濟行業分類？~~ → **第一版用 `le_entity.economic_sector`（banks/NBFIs/others）**
+   ＋可選 `le_sector_map`；**BCR STC/IRB 整合延後**（capital engine 關注點）。
 6. ~~`top_n`：固定 20~~ → **已決：`top_n` 可配置**（`le_limit_set.top_n`，
    否則 `le_config.default_top_n`；`le_ma_bs28` / `le_breach_scan` 可逐次 override）。
 7. **SA-CCR / CCF / FX** 全部可配置：CCF 走 `le_ccf`，FX 走 `le_fx`，derivative
